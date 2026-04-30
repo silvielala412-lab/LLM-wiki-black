@@ -13,6 +13,7 @@ export function WebSearchSection({ draft, setDraft }: Props) {
   const options = [
     { value: "none" as const, label: "Disabled" },
     { value: "tavily" as const, label: "Tavily" },
+    { value: "perplexity" as const, label: "Perplexity (Sonar)" },
   ]
 
   return (

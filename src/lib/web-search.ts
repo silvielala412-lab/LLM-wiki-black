@@ -14,12 +14,14 @@ export async function webSearch(
   maxResults: number = 10,
 ): Promise<WebSearchResult[]> {
   if (config.provider === "none" || !config.apiKey) {
-    throw new Error("Web search not configured. Add a Tavily API key in Settings.")
+    throw new Error("Web search not configured. Add a search API key in Settings.")
   }
 
   switch (config.provider) {
     case "tavily":
       return tavilySearch(query, config.apiKey, maxResults)
+    case "perplexity":
+      return perplexitySearch(query, config.apiKey, maxResults)
     default:
       throw new Error(`Unknown search provider: ${config.provider}`)
   }
@@ -69,4 +71,78 @@ async function tavilySearch(
     snippet: r.content ?? "",
     source: new URL(r.url).hostname.replace("www.", ""),
   }))
+}
+
+async function perplexitySearch(
+  query: string,
+  apiKey: string,
+  maxResults: number,
+): Promise<WebSearchResult[]> {
+  const httpFetch = await getHttpFetch()
+  let response: Response
+  try {
+    response = await httpFetch("https://api.perplexity.ai/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: "sonar",
+        messages: [
+          {
+            role: "system",
+            content: "You are a search assistant. Answer concisely with facts. Include source URLs when available.",
+          },
+          { role: "user", content: query },
+        ],
+        max_tokens: 1024,
+        return_citations: true,
+        return_images: false,
+        search_recency_filter: "month",
+      }),
+    })
+  } catch (err) {
+    if (isFetchNetworkError(err)) {
+      throw new Error(
+        "Network error reaching api.perplexity.ai. Check your connectivity and API key.",
+      )
+    }
+    throw err
+  }
+
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => "Unknown error")
+    throw new Error(`Perplexity search failed (${response.status}): ${errorText}`)
+  }
+
+  const data = await response.json()
+  const content: string = data?.choices?.[0]?.message?.content ?? ""
+  const citations: string[] = data?.citations ?? []
+
+  const results: WebSearchResult[] = []
+
+  if (content) {
+    results.push({
+      title: `Perplexity: ${query.slice(0, 60)}`,
+      url: citations[0] ?? "https://www.perplexity.ai",
+      snippet: content.slice(0, 800),
+      source: "perplexity.ai",
+    })
+  }
+
+  citations.slice(1, maxResults).forEach((url, i) => {
+    try {
+      results.push({
+        title: `Source ${i + 2}`,
+        url,
+        snippet: "",
+        source: new URL(url).hostname.replace("www.", ""),
+      })
+    } catch {
+      // skip malformed URLs
+    }
+  })
+
+  return results.slice(0, maxResults)
 }
