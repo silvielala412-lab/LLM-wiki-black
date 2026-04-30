@@ -128,3 +128,317 @@
     @apply font-sans;
     }
 }
+
+/* ── Wiki Prose Enhancement ─────────────────────────────────────────────────
+   Overrides Milkdown/Tailwind prose inside .prose.prose-invert (wiki editor)
+   and .prose.prose-sm (file preview / chat markdown).
+   Zero component changes — pure CSS layer.
+──────────────────────────────────────────────────────────────────────────── */
+
+/* Color tokens matching reference design */
+:root {
+  --wiki-blue:   #2B5CE6;
+  --wiki-blbg:   #EBF0FD;
+  --wiki-green:  #0DAB5C;
+  --wiki-grbg:   #E6F9EF;
+  --wiki-org:    #E67E22;
+  --wiki-orbg:   #FDF4E8;
+  --wiki-red:    #E53935;
+  --wiki-rdbg:   #FDECEB;
+  --wiki-pur:    #7C3AED;
+  --wiki-pubg:   #F0E8FD;
+  --wiki-cyan:   #0891B2;
+  --wiki-cybg:   #E4F7FA;
+  --wiki-t2:     #4A5060;
+  --wiki-t3:     #8B92A0;
+}
+
+/* ── Milkdown editor container ── */
+.milkdown .ProseMirror {
+  padding: 28px 36px !important;
+  line-height: 1.85 !important;
+  font-size: 14px !important;
+}
+
+/* ── Headings — colored left-bar accent ── */
+.milkdown .ProseMirror h1,
+.prose h1 {
+  font-size: 1.5rem !important;
+  font-weight: 900 !important;
+  letter-spacing: -0.02em;
+  padding-left: 14px;
+  border-left: 4px solid var(--wiki-blue);
+  margin-top: 2rem !important;
+  margin-bottom: 0.75rem !important;
+  color: #15181E;
+}
+.dark .milkdown .ProseMirror h1,
+.dark .prose h1 { color: #F0F2F5; border-left-color: #6B9EFF; }
+
+.milkdown .ProseMirror h2,
+.prose h2 {
+  font-size: 1.15rem !important;
+  font-weight: 700 !important;
+  padding-left: 10px;
+  border-left: 3px solid var(--wiki-pur);
+  margin-top: 1.75rem !important;
+  margin-bottom: 0.5rem !important;
+  color: #15181E;
+}
+.dark .milkdown .ProseMirror h2,
+.dark .prose h2 { color: #E8EAED; border-left-color: #A78BFA; }
+
+.milkdown .ProseMirror h3,
+.prose h3 {
+  font-size: 1rem !important;
+  font-weight: 600 !important;
+  padding-left: 8px;
+  border-left: 2px solid var(--wiki-cyan);
+  margin-top: 1.25rem !important;
+  margin-bottom: 0.4rem !important;
+  color: #15181E;
+}
+.dark .milkdown .ProseMirror h3,
+.dark .prose h3 { color: #D1D5DB; border-left-color: #67E8F9; }
+
+/* ── Paragraph ── */
+.milkdown .ProseMirror p,
+.prose p {
+  color: var(--wiki-t2);
+  line-height: 1.85;
+  margin-bottom: 0.6rem !important;
+}
+.dark .milkdown .ProseMirror p,
+.dark .prose p { color: #9CA3AF; }
+
+/* ── Inline code — badge style ── */
+.milkdown .ProseMirror code:not(pre code),
+.prose :not(pre) > code {
+  background: var(--wiki-blbg) !important;
+  color: var(--wiki-blue) !important;
+  border: 1px solid #C7D7FB !important;
+  border-radius: 4px !important;
+  padding: 1px 6px !important;
+  font-size: 0.82em !important;
+  font-family: 'DM Mono', 'Fira Code', monospace !important;
+  font-weight: 500 !important;
+}
+.dark .milkdown .ProseMirror code:not(pre code),
+.dark .prose :not(pre) > code {
+  background: rgba(43,92,230,0.15) !important;
+  color: #93B4FF !important;
+  border-color: rgba(43,92,230,0.3) !important;
+}
+
+/* ── Code blocks — dark terminal style ── */
+.milkdown .ProseMirror pre,
+.prose pre {
+  background: #1E2128 !important;
+  border-radius: 8px !important;
+  padding: 16px 20px !important;
+  margin: 1rem 0 !important;
+  overflow-x: auto;
+  border: 1px solid rgba(255,255,255,0.06) !important;
+}
+.milkdown .ProseMirror pre code,
+.prose pre code {
+  background: transparent !important;
+  color: #C8D0E0 !important;
+  border: none !important;
+  padding: 0 !important;
+  font-size: 0.85em !important;
+  line-height: 1.9;
+}
+
+/* ── Blockquote — accent bar ── */
+.milkdown .ProseMirror blockquote,
+.prose blockquote {
+  border-left: 3px solid var(--wiki-org) !important;
+  background: var(--wiki-orbg) !important;
+  border-radius: 0 6px 6px 0 !important;
+  padding: 10px 16px !important;
+  margin: 1rem 0 !important;
+  color: #5C4020 !important;
+  font-style: normal !important;
+}
+.dark .milkdown .ProseMirror blockquote,
+.dark .prose blockquote {
+  background: rgba(230,126,34,0.1) !important;
+  color: #FBD38D !important;
+}
+
+/* ── Tables ── */
+.milkdown .ProseMirror table,
+.prose table {
+  border-collapse: collapse !important;
+  width: 100% !important;
+  font-size: 13px !important;
+  border-radius: 8px !important;
+  overflow: hidden !important;
+  border: 1px solid #E2E5EA !important;
+  margin: 1rem 0 !important;
+}
+.dark .milkdown .ProseMirror table,
+.dark .prose table { border-color: rgba(255,255,255,0.1) !important; }
+
+.milkdown .ProseMirror th,
+.prose th {
+  background: #F5F6F8 !important;
+  color: var(--wiki-t3) !important;
+  font-size: 11px !important;
+  font-weight: 600 !important;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 8px 12px !important;
+  text-align: left !important;
+  border-bottom: 1px solid #E2E5EA !important;
+}
+.dark .milkdown .ProseMirror th,
+.dark .prose th {
+  background: rgba(255,255,255,0.05) !important;
+  color: #6B7280 !important;
+  border-bottom-color: rgba(255,255,255,0.08) !important;
+}
+
+.milkdown .ProseMirror td,
+.prose td {
+  padding: 8px 12px !important;
+  border-bottom: 1px solid #F0F1F3 !important;
+  color: var(--wiki-t2) !important;
+  vertical-align: top !important;
+  transition: background 0.12s;
+}
+.dark .milkdown .ProseMirror td,
+.dark .prose td {
+  border-bottom-color: rgba(255,255,255,0.05) !important;
+  color: #9CA3AF !important;
+}
+.milkdown .ProseMirror tr:hover td,
+.prose tr:hover td {
+  background: rgba(43,92,230,0.04) !important;
+}
+.dark .milkdown .ProseMirror tr:hover td,
+.dark .prose tr:hover td {
+  background: rgba(255,255,255,0.03) !important;
+}
+
+/* ── Lists ── */
+.milkdown .ProseMirror ul,
+.prose ul {
+  list-style: none !important;
+  padding-left: 0 !important;
+}
+.milkdown .ProseMirror ul li,
+.prose ul li {
+  position: relative;
+  padding-left: 1.4em !important;
+  margin-bottom: 0.35rem !important;
+  color: var(--wiki-t2);
+}
+.dark .milkdown .ProseMirror ul li,
+.dark .prose ul li { color: #9CA3AF; }
+
+.milkdown .ProseMirror ul li::before,
+.prose ul li::before {
+  content: '';
+  position: absolute;
+  left: 0.3em;
+  top: 0.65em;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--wiki-blue);
+}
+.dark .milkdown .ProseMirror ul li::before,
+.dark .prose ul li::before { background: #6B9EFF; }
+
+.milkdown .ProseMirror ol,
+.prose ol {
+  padding-left: 1.5em !important;
+}
+.milkdown .ProseMirror ol li,
+.prose ol li {
+  margin-bottom: 0.35rem !important;
+  color: var(--wiki-t2);
+}
+.dark .milkdown .ProseMirror ol li,
+.dark .prose ol li { color: #9CA3AF; }
+
+/* ── Horizontal rule ── */
+.milkdown .ProseMirror hr,
+.prose hr {
+  border: none !important;
+  height: 1px !important;
+  background: linear-gradient(to right, transparent, #E2E5EA, transparent) !important;
+  margin: 2rem 0 !important;
+}
+.dark .milkdown .ProseMirror hr,
+.dark .prose hr {
+  background: linear-gradient(to right, transparent, rgba(255,255,255,0.1), transparent) !important;
+}
+
+/* ── Strong / Bold ── */
+.milkdown .ProseMirror strong,
+.prose strong {
+  color: #15181E !important;
+  font-weight: 700 !important;
+}
+.dark .milkdown .ProseMirror strong,
+.dark .prose strong { color: #F9FAFB !important; }
+
+/* ── Wiki-link badges (links inside prose) ── */
+.milkdown .ProseMirror a,
+.prose a {
+  color: var(--wiki-blue) !important;
+  text-decoration: none !important;
+  font-weight: 500;
+  border-bottom: 1px dashed rgba(43,92,230,0.4);
+  transition: border-color 0.15s, background 0.15s;
+  padding: 0 2px;
+  border-radius: 2px;
+}
+.milkdown .ProseMirror a:hover,
+.prose a:hover {
+  background: var(--wiki-blbg) !important;
+  border-bottom-color: var(--wiki-blue);
+}
+.dark .milkdown .ProseMirror a,
+.dark .prose a { color: #93B4FF !important; border-bottom-color: rgba(147,180,255,0.4); }
+.dark .milkdown .ProseMirror a:hover,
+.dark .prose a:hover { background: rgba(43,92,230,0.15) !important; }
+
+/* ── Images ── */
+.milkdown .ProseMirror img,
+.prose img {
+  border-radius: 8px !important;
+  border: 1px solid #E2E5EA !important;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.06) !important;
+  transition: box-shadow 0.2s;
+}
+.milkdown .ProseMirror img:hover,
+.prose img:hover {
+  box-shadow: 0 4px 16px rgba(0,0,0,0.12) !important;
+}
+.dark .milkdown .ProseMirror img,
+.dark .prose img { border-color: rgba(255,255,255,0.1) !important; }
+
+/* ── Frontmatter YAML block (shown as code) ── */
+.milkdown .ProseMirror pre:first-child,
+.milkdown .ProseMirror > pre:first-of-type {
+  background: linear-gradient(135deg, #1A1F2E, #1E2128) !important;
+  border-left: 3px solid var(--wiki-pur) !important;
+}
+
+/* ── Smooth page-load fade-in ── */
+.milkdown .ProseMirror {
+  animation: wiki-fadein 0.2s ease;
+}
+@keyframes wiki-fadein {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* ── Chat markdown overrides (same token, different container) ── */
+.chat-markdown.prose p { color: inherit !important; }
+.chat-markdown.prose a { color: var(--wiki-blue) !important; }
+.dark .chat-markdown.prose a { color: #93B4FF !important; }
