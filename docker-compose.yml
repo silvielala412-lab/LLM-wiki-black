@@ -1,0 +1,23 @@
+version: "3.8"
+
+services:
+  llm-wiki:
+    image: llm-wiki:latest
+    container_name: llm-wiki
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      # Wiki data persists here — backup this directory
+      - ./wiki-data:/data
+    environment:
+      APP_HOST: "0.0.0.0"
+      APP_PORT: "8000"
+      WIKI_DATA_PATH: "/data"
+      STATIC_DIR: "/app/dist"
+      RUST_LOG: "info"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
