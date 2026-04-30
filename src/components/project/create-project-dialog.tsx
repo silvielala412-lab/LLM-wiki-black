@@ -1,13 +1,11 @@
-import { useState } from "react"
-import { open } from "@tauri-apps/plugin-dialog"
+﻿import { useState } from "react"
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter,
 } from "@/components/ui/dialog"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { FolderOpen } from "lucide-react"
-import { createProject, writeFile, createDirectory } from "@/commands/fs"
+import { createProjectAuto, writeFile, createDirectory } from "@/commands/fs"
 import { getTemplate } from "@/lib/templates"
 import { TemplatePicker } from "@/components/project/template-picker"
 import type { WikiProject } from "@/types/wiki"
@@ -24,42 +22,26 @@ interface CreateProjectDialogProps {
 
 export function CreateProjectDialog({ open: isOpen, onOpenChange, onCreated }: CreateProjectDialogProps) {
   const [name, setName] = useState("")
-  const [path, setPath] = useState("")
   const [selectedTemplate, setSelectedTemplate] = useState("general")
-  // Empty string = "user hasn't picked yet"; we validate this on
-  // submit so a fresh project never starts in implicit auto-detect
-  // mode. Once chosen, the value is one of OUTPUT_LANGUAGE_OPTIONS
-  // (`auto` is a valid explicit choice — the user is then opting
-  // INTO auto-detect rather than getting it by accident).
   const [language, setLanguage] = useState<string>("")
   const [error, setError] = useState("")
   const [creating, setCreating] = useState(false)
   const setOutputLanguage = useWikiStore((s) => s.setOutputLanguage)
 
-  async function handleBrowse() {
-    const selected = await open({
-      directory: true,
-      multiple: false,
-      title: "Select Parent Directory",
-    })
-    if (selected) {
-      setPath(selected)
-    }
-  }
-
   async function handleCreate() {
-    if (!name.trim() || !path.trim()) {
-      setError("Name and path are required")
+    if (!name.trim()) {
+      setError("请输入项目名称")
       return
     }
     if (!language) {
-      setError("Please pick an AI output language")
+      setError("请选择 AI 输出语言")
       return
     }
     setCreating(true)
     setError("")
     try {
-      const project = await createProject(name.trim(), path.trim())
+      // Web mode: server auto-creates project under WIKI_DATA_PATH/<name>
+      const project = await createProjectAuto(name.trim())
       const pp = normalizePath(project.path)
 
       const template = getTemplate(selectedTemplate)
@@ -69,10 +51,6 @@ export function CreateProjectDialog({ open: isOpen, onOpenChange, onCreated }: C
         await createDirectory(`${pp}/${dir}`)
       }
 
-      // Persist the user's language choice. The store / disk
-      // mirror is what the rest of the app reads via
-      // `getOutputLanguage()` — without this write the choice
-      // wouldn't survive past the dialog closing.
       const lang = language as OutputLanguage
       setOutputLanguage(lang)
       await saveOutputLanguage(lang)
@@ -80,7 +58,6 @@ export function CreateProjectDialog({ open: isOpen, onOpenChange, onCreated }: C
       onCreated(project)
       onOpenChange(false)
       setName("")
-      setPath("")
       setSelectedTemplate("general")
       setLanguage("")
     } catch (err) {
@@ -94,20 +71,29 @@ export function CreateProjectDialog({ open: isOpen, onOpenChange, onCreated }: C
     <Dialog open={isOpen} onOpenChange={onOpenChange}>
       <DialogContent className="max-w-lg">
         <DialogHeader>
-          <DialogTitle>Create New Wiki Project</DialogTitle>
+          <DialogTitle>创建新 Wiki 项目</DialogTitle>
         </DialogHeader>
         <div className="flex flex-col gap-4 py-4">
           <div className="flex flex-col gap-2">
-            <Label htmlFor="name">Project Name</Label>
-            <Input id="name" value={name} onChange={(e) => setName(e.target.value)} placeholder="my-research-wiki" />
+            <Label htmlFor="name">项目名称</Label>
+            <Input
+              id="name"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="例如：marketing-wiki"
+              autoFocus
+            />
+            <p className="text-xs text-muted-foreground">
+              项目将在服务器 <code>WIKI_DATA_PATH/{name || "项目名称"}</code> 下自动创建，无需手动指定路径。
+            </p>
           </div>
           <div className="flex flex-col gap-2">
-            <Label>Template</Label>
+            <Label>模板</Label>
             <TemplatePicker selected={selectedTemplate} onSelect={setSelectedTemplate} />
           </div>
           <div className="flex flex-col gap-2">
             <Label htmlFor="language">
-              AI Output Language <span className="text-destructive">*</span>
+              AI 输出语言 <span className="text-destructive">*</span>
             </Label>
             <select
               id="language"
@@ -115,45 +101,19 @@ export function CreateProjectDialog({ open: isOpen, onOpenChange, onCreated }: C
               onChange={(e) => setLanguage(e.target.value)}
               className="w-full rounded-md border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
             >
-              <option value="" disabled>
-                Pick a language…
-              </option>
-              {/*
-                * "auto" is intentionally filtered out at project
-                * creation time. Auto-detect is a fine post-hoc
-                * setting (Settings → Output) for users who later
-                * decide they want it, but at create time we force
-                * an explicit commitment so the project never starts
-                * in the implicit-detect mode that was the source
-                * of "wiki content showed up in a language I didn't
-                * expect" surprises.
-                */}
+              <option value="" disabled>选择语言…</option>
               {OUTPUT_LANGUAGE_OPTIONS.filter((l) => l.value !== "auto").map((l) => (
-                <option key={l.value} value={l.value}>
-                  {l.label}
-                </option>
+                <option key={l.value} value={l.value}>{l.label}</option>
               ))}
             </select>
-            <p className="text-xs text-muted-foreground">
-              All AI-generated content (wiki pages, chat replies, research
-              output) will use this language. You can change it later in
-              Settings → Output.
-            </p>
-          </div>
-          <div className="flex flex-col gap-2">
-            <Label htmlFor="path">Parent Directory</Label>
-            <div className="flex gap-2">
-              <Input id="path" value={path} onChange={(e) => setPath(e.target.value)} placeholder="/Users/you/projects" className="flex-1" />
-              <Button variant="outline" size="icon" onClick={handleBrowse} type="button">
-                <FolderOpen className="h-4 w-4" />
-              </Button>
-            </div>
           </div>
           {error && <p className="text-sm text-destructive">{error}</p>}
         </div>
         <DialogFooter>
-          <Button variant="outline" onClick={() => onOpenChange(false)}>Cancel</Button>
-          <Button onClick={handleCreate} disabled={creating}>{creating ? "Creating..." : "Create"}</Button>
+          <Button variant="outline" onClick={() => onOpenChange(false)}>取消</Button>
+          <Button onClick={handleCreate} disabled={creating}>
+            {creating ? "创建中…" : "创建项目"}
+          </Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>

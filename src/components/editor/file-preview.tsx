@@ -1,5 +1,5 @@
-import { useEffect, useRef } from "react"
-import { convertFileSrc } from "@tauri-apps/api/core"
+﻿import { useEffect, useRef } from "react"
+function convertFileSrc(path: string): string { return `/api/fs/media?path=${encodeURIComponent(path)}` }
 import ReactMarkdown from "react-markdown"
 import remarkGfm from "remark-gfm"
 import remarkMath from "remark-math"

@@ -1,5 +1,4 @@
-import { useState, useEffect } from "react"
-import { open } from "@tauri-apps/plugin-dialog"
+﻿import { useState, useEffect } from "react"
 import i18n from "@/i18n"
 import { useWikiStore } from "@/stores/wiki-store"
 import { useReviewStore } from "@/stores/review-store"
@@ -267,22 +266,7 @@ function App() {
         console.error("Failed to restore ingest queue:", err)
       )
     })
-    // Notify local clip server of the current project + all recent projects
-    fetch("http://127.0.0.1:19827/project", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path: proj.path }),
-    }).catch(() => {})
-
-    // Send all recent projects to clip server for extension project picker
-    getRecentProjects().then((recents) => {
-      const projects = recents.map((p) => ({ name: p.name, path: p.path }))
-      fetch("http://127.0.0.1:19827/projects", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ projects }),
-      }).catch(() => {})
-    }).catch(() => {})
+    // Clip server not used in web mode — skip.
     try {
       const tree = await listDirectory(proj.path)
       setFileTree(tree)
@@ -325,14 +309,23 @@ function App() {
   }
 
   async function handleOpenProject() {
-    const selected = await open({
-      directory: true,
-      multiple: false,
-      title: "Open Wiki Project",
-    })
-    if (!selected) return
     try {
-      const proj = await openProject(selected)
+      const { listProjects } = await import("@/commands/fs")
+      const projects = await listProjects()
+      if (projects.length === 0) {
+        window.alert("服务器上暂无项目，请先创建一个新项目。")
+        return
+      }
+      // Build a simple selection prompt listing all available projects
+      const menu = projects.map((p, i) => `${i + 1}. ${p.name}`).join("\n")
+      const input = window.prompt(`请选择要打开的项目（输入序号）：\n\n${menu}`)
+      if (!input) return
+      const idx = parseInt(input.trim(), 10) - 1
+      if (isNaN(idx) || idx < 0 || idx >= projects.length) {
+        window.alert("无效的序号，请重新操作。")
+        return
+      }
+      const proj = await openProject(projects[idx].path)
       await handleProjectOpened(proj)
     } catch (err) {
       window.alert(`Failed to open project: ${err}`)

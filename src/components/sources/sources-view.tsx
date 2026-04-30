@@ -1,6 +1,4 @@
-import { useState, useEffect, useCallback } from "react"
-import { open } from "@tauri-apps/plugin-dialog"
-import { invoke } from "@tauri-apps/api/core"
+﻿import { useState, useEffect, useCallback, useRef } from "react"
 import { Plus, FileText, RefreshCw, BookOpen, Trash2, Folder, ChevronRight, ChevronDown } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { ScrollArea } from "@/components/ui/scroll-area"
@@ -78,140 +76,58 @@ export function SourcesView() {
 
   async function handleImport() {
     if (!project) return
-
-    const selected = await open({
-      multiple: true,
-      title: "Import Source Files",
-      filters: [
-        {
-          name: "Documents",
-          extensions: [
-            "md", "mdx", "txt", "rtf", "pdf",
-            "html", "htm", "xml",
-            "doc", "docx", "xls", "xlsx", "ppt", "pptx",
-            "odt", "ods", "odp", "epub", "pages", "numbers", "key",
-          ],
-        },
-        {
-          name: "Data",
-          extensions: ["json", "jsonl", "csv", "tsv", "yaml", "yml", "ndjson"],
-        },
-        {
-          name: "Code",
-          extensions: [
-            "py", "js", "ts", "jsx", "tsx", "rs", "go", "java",
-            "c", "cpp", "h", "rb", "php", "swift", "sql", "sh",
-          ],
-        },
-        {
-          name: "Images",
-          extensions: ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "tiff", "avif", "heic"],
-        },
-        {
-          name: "Media",
-          extensions: ["mp4", "webm", "mov", "avi", "mkv", "mp3", "wav", "ogg", "flac", "m4a"],
-        },
-        { name: "All Files", extensions: ["*"] },
-      ],
-    })
-
-    if (!selected || selected.length === 0) return
-
-    setImporting(true)
-    const pp = normalizePath(project.path)
-    const paths = Array.isArray(selected) ? selected : [selected]
-
-    const importedPaths: string[] = []
-    for (const sourcePath of paths) {
-      const originalName = getFileName(sourcePath) || "unknown"
-      const destPath = await getUniqueDestPath(`${pp}/raw/sources`, originalName)
-      try {
-        await copyFile(sourcePath, destPath)
-        importedPaths.push(destPath)
-        // Pre-process file (extract text from PDF, etc.) for instant preview later
-        preprocessFile(destPath).catch(() => {})
-      } catch (err) {
-        console.error(`Failed to import ${originalName}:`, err)
+    // Web mode: trigger a hidden <input type="file"> instead of Tauri dialog
+    const input = document.createElement("input")
+    input.type = "file"
+    input.multiple = true
+    input.accept = ".md,.mdx,.txt,.rtf,.pdf,.html,.htm,.xml,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.odt,.epub,.json,.csv,.yaml,.yml,.py,.js,.ts,.png,.jpg,.jpeg,.gif,.webp"
+    input.onchange = async () => {
+      const files = Array.from(input.files ?? [])
+      if (!files.length) return
+      setImporting(true)
+      const pp = normalizePath(project.path)
+      const destDir = `${pp}/raw/sources`
+      const { uploadFiles } = await import("@/commands/fs")
+      const results = await uploadFiles(files, destDir)
+      const importedPaths: string[] = results
+        .filter((r): r is { path: string; name: string; size: number } => "path" in r)
+        .map((r) => r.path)
+      setImporting(false)
+      await loadSources()
+      if (llmConfig.apiKey || llmConfig.provider === "ollama" || llmConfig.provider === "custom") {
+        for (const destPath of importedPaths) {
+          enqueueIngest(project.id, destPath).catch((err) =>
+            console.error(`Failed to enqueue ingest:`, err)
+          )
+        }
       }
     }
-
-    setImporting(false)
-    await loadSources()
-
-    // Enqueue for serial ingest (runs in background via ingest queue)
-    if (llmConfig.apiKey || llmConfig.provider === "ollama" || llmConfig.provider === "custom") {
-      for (const destPath of importedPaths) {
-        enqueueIngest(project.id, destPath).catch((err) =>
-          console.error(`Failed to enqueue ingest:`, err)
-        )
-      }
-    }
+    input.click()
   }
 
   async function handleImportFolder() {
     if (!project) return
-
-    const selected = await open({
-      directory: true,
-      title: "Import Source Folder",
-    })
-
-    if (!selected || typeof selected !== "string") return
-
+    // Web mode: folder import not supported via browser security model
+    // Users should place folder on the server and use the server path
+    const folderPath = window.prompt("请输入要导入的文件夹路径（服务器上的绝对路径）：")
+    if (!folderPath || !folderPath.trim()) return
     setImporting(true)
     const pp = normalizePath(project.path)
-    const folderName = getFileName(selected) || "imported"
-    const destDir = `${pp}/raw/sources/${folderName}`
-
+    const { copyDirectory } = await import("@/commands/fs")
     try {
-      // Recursively copy the folder
-      const copiedFiles: string[] = await invoke("copy_directory", {
-        source: selected,
-        destination: destDir,
-      })
-
-      console.log(`[Folder Import] Copied ${copiedFiles.length} files from ${folderName}`)
-
-      // Preprocess all files
-      for (const filePath of copiedFiles) {
-        preprocessFile(filePath).catch(() => {})
-      }
-
+      const copiedFiles = await copyDirectory(folderPath.trim(), `${pp}/raw/sources/${folderPath.trim().split(/[\/\\]/).pop() || "imported"}`)
       setImporting(false)
       await loadSources()
-
-      // Build ingest tasks with folder context
       if (llmConfig.apiKey || llmConfig.provider === "ollama" || llmConfig.provider === "custom") {
         const tasks = copiedFiles
-          .filter((fp) => {
-            const ext = fp.split(".").pop()?.toLowerCase() ?? ""
-            // Only ingest text-based files, skip images/media
-            return ["md", "mdx", "txt", "pdf", "docx", "pptx", "xlsx", "xls",
-                    "csv", "json", "html", "htm", "rtf", "xml", "yaml", "yml"].includes(ext)
-          })
-          .map((filePath) => {
-            // Build folder context from relative path. On Windows the
-            // Rust-returned filePath uses backslashes while destDir was
-            // composed with forward slashes — normalize both sides before
-            // the replace so this works on every platform.
-            const normFilePath = normalizePath(filePath)
-            const normDestDir = normalizePath(destDir)
-            const relPath = normFilePath.replace(normDestDir + "/", "")
-            const parts = relPath.split("/")
-            parts.pop() // remove filename
-            const context = parts.length > 0
-              ? `${folderName} > ${parts.join(" > ")}`
-              : folderName
-            return { sourcePath: filePath, folderContext: context }
-          })
-
+          .filter((fp) => ["md","mdx","txt","pdf","docx","pptx","xlsx","xls","csv","json","html"].includes(fp.split(".").pop()?.toLowerCase() ?? ""))
+          .map((filePath) => ({ filePath, folderContext: "" }))
         if (tasks.length > 0) {
-          await enqueueBatch(project.id, tasks)
-          console.log(`[Folder Import] Enqueued ${tasks.length} files for ingest`)
+          enqueueBatch(project.id, tasks).catch((err) => console.error("enqueueBatch failed:", err))
         }
       }
     } catch (err) {
-      console.error(`Failed to import folder:`, err)
+      console.error("Folder import failed:", err)
       setImporting(false)
     }
   }

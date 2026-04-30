@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Image extraction orchestration for the ingest pipeline.
  *
  * Pure dispatch + path-shaping layer over the Rust commands
@@ -13,7 +13,6 @@
  * captioning lands, the same helper grows a `caption` field per
  * image and the markdown line uses that instead.
  */
-import { invoke } from "@tauri-apps/api/core"
 import { getFileName, normalizePath } from "@/lib/path-utils"
 
 /** Mirrors `commands::extract_images::SavedImage` on the Rust side. */
@@ -55,51 +54,12 @@ const SUPPORTED_OFFICE_EXTS = ["pptx", "docx", "ppt", "doc"] as const
  * convention the rest of ingest uses (see `wiki/sources/<slug>.md`).
  */
 export async function extractAndSaveSourceImages(
-  projectPath: string,
-  sourcePath: string,
+  _projectPath: string,
+  _sourcePath: string,
 ): Promise<SavedImage[]> {
-  const pp = normalizePath(projectPath)
-  const sp = normalizePath(sourcePath)
-  const fileName = getFileName(sp)
-  const ext = fileName.split(".").pop()?.toLowerCase() ?? ""
-
-  const isPdf = (SUPPORTED_PDF_EXTS as readonly string[]).includes(ext)
-  const isOffice = (SUPPORTED_OFFICE_EXTS as readonly string[]).includes(ext)
-  if (!isPdf && !isOffice) return []
-
-  const slug = fileName.replace(/\.[^.]+$/, "")
-  const destDir = `${pp}/wiki/media/${slug}`
-  const relTo = `${pp}/wiki`
-
-  try {
-    const images = await invoke<unknown[]>(
-      isPdf ? "extract_and_save_pdf_images_cmd" : "extract_and_save_office_images_cmd",
-      { sourcePath: sp, destDir, relTo },
-    )
-    // Rust's `SavedImage` is `#[serde(rename_all = "camelCase")]`,
-    // so the wire format uses `relPath` / `absPath` / `mimeType`.
-    // (Note: Tauri's IPC auto-camelCase applies only to command
-    // PARAMETER names, never to return-value field names — without
-    // the explicit serde attribute on the Rust struct, this filter
-    // would drop every item and return `[]` even when extraction
-    // wrote images to disk. We had that bug.)
-    return images
-      .filter((it): it is SavedImage => {
-        if (!it || typeof it !== "object") return false
-        const obj = it as Record<string, unknown>
-        return (
-          typeof obj.index === "number" &&
-          typeof obj.relPath === "string" &&
-          typeof obj.absPath === "string"
-        )
-      })
-  } catch (err) {
-    console.warn(
-      `[ingest:images] extraction failed for "${fileName}":`,
-      err instanceof Error ? err.message : err,
-    )
-    return []
-  }
+  // Web mode: image extraction from PDF/Office is handled server-side
+  // by /api/fs/preprocess. This function is a no-op stub.
+  return []
 }
 
 /**

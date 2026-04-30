@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Resolve markdown image `src` attributes so they actually load in
  * the Tauri webview.
  *
@@ -25,41 +25,26 @@
  * the appropriate `convertFileSrc(...)` URL or the original src
  * verbatim.
  */
-import { convertFileSrc } from "@tauri-apps/api/core"
 import { normalizePath } from "@/lib/path-utils"
 
 const PASSTHROUGH_RE = /^(https?:|data:|blob:|file:|tauri:)/i
 
-/**
- * `projectPath` is the wiki project's root directory. When null
- * (no project loaded), the resolver passes srcs through unchanged
- * so it remains safe to call before a project is open.
- */
+/** Web-mode replacement for Tauri's convertFileSrc — routes through FastAPI media endpoint. */
+function convertFileSrc(path: string): string {
+  return `/api/fs/media?path=${encodeURIComponent(path)}`
+}
+
 export function resolveMarkdownImageSrc(
   rawSrc: string,
   projectPath: string | null,
 ): string {
   if (!rawSrc) return rawSrc
   if (PASSTHROUGH_RE.test(rawSrc)) return rawSrc
-
   if (!projectPath) return rawSrc
-
   const pp = normalizePath(projectPath)
-  const isAbsolute =
-    rawSrc.startsWith("/") || /^[a-zA-Z]:/.test(rawSrc) || rawSrc.startsWith("\\\\")
-
-  // Absolute paths get fed straight to convertFileSrc — the user (or
-  // some plugin) explicitly chose that path; we don't second-guess.
+  const isAbsolute = rawSrc.startsWith("/") || /^[a-zA-Z]:/.test(rawSrc) || rawSrc.startsWith("\\\\")
   if (isAbsolute) return convertFileSrc(rawSrc)
-
-  // Strip a leading `./` for cleanliness; treat `media/foo.png` and
-  // `./media/foo.png` identically.
-  const cleaned = rawSrc.replace(/^\.\//, "")
-
-  // Resolve as wiki-root-relative. The markdown lives somewhere
-  // under wiki/ but we ignore its location — image references in
-  // generated content always use this convention so the path is
-  // stable regardless of page depth.
+  const cleaned = rawSrc.replace(/^\.\//,"")
   const absolute = `${pp}/wiki/${cleaned}`
   return convertFileSrc(absolute)
 }

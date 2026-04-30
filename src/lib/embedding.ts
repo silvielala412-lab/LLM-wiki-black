@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Embedding pipeline — standard RAG flow.
  *
  *   1. chunkMarkdown(content)        (src/lib/text-chunker.ts)
@@ -20,8 +20,7 @@
  * CORS-unfriendly endpoints work the same as the LLM path.
  */
 
-import { readFile, listDirectory } from "@/commands/fs"
-import { invoke } from "@tauri-apps/api/core"
+import { readFile, listDirectory, vectorUpsertChunks as apiVectorUpsert, vectorSearchChunks as apiVectorSearch, vectorDeletePage as apiVectorDelete, vectorCountChunks as apiVectorCount, vectorDropLegacy as apiVectorDropLegacy } from "@/commands/fs"
 import type { EmbeddingConfig } from "@/stores/wiki-store"
 import type { FileNode } from "@/types/wiki"
 import { normalizePath } from "@/lib/path-utils"
@@ -174,16 +173,12 @@ async function vectorUpsertChunks(
   pageId: string,
   chunks: ChunkUpsertInput[],
 ): Promise<void> {
-  await invoke("vector_upsert_chunks", {
-    projectPath: normalizePath(projectPath),
+  await apiVectorUpsert(
+    normalizePath(projectPath),
     pageId,
-    chunks: chunks.map((c) => ({
-      chunk_index: c.chunkIndex,
-      chunk_text: c.chunkText,
-      heading_path: c.headingPath,
-      embedding: c.embedding.map((v) => Math.fround(v)),
-    })),
-  })
+    chunks.map((c) => c.chunkText),
+    chunks.map((c) => c.embedding.map((v) => Math.fround(v))),
+  )
 }
 
 interface ChunkSearchResult {
@@ -200,40 +195,28 @@ async function vectorSearchChunks(
   queryEmbedding: number[],
   topK: number,
 ): Promise<ChunkSearchResult[]> {
-  return await invoke("vector_search_chunks", {
-    projectPath: normalizePath(projectPath),
-    queryEmbedding: queryEmbedding.map((v) => Math.fround(v)),
+  const raw = await apiVectorSearch(
+    normalizePath(projectPath),
+    queryEmbedding.map((v) => Math.fround(v)),
     topK,
-  })
+  ) as ChunkSearchResult[]
+  return raw
 }
 
 async function vectorDeletePage(projectPath: string, pageId: string): Promise<void> {
-  await invoke("vector_delete_page", {
-    projectPath: normalizePath(projectPath),
-    pageId,
-  })
+  await apiVectorDelete(normalizePath(projectPath), pageId)
 }
 
 async function vectorCountChunks(projectPath: string): Promise<number> {
-  return await invoke("vector_count_chunks", {
-    projectPath: normalizePath(projectPath),
-  })
+  return await apiVectorCount(normalizePath(projectPath))
 }
 
-export async function legacyVectorRowCount(projectPath: string): Promise<number> {
-  try {
-    return await invoke("vector_legacy_row_count", {
-      projectPath: normalizePath(projectPath),
-    })
-  } catch {
-    return 0
-  }
+export async function legacyVectorRowCount(_projectPath: string): Promise<number> {
+  return 0 // Not applicable in web mode (no legacy table)
 }
 
 export async function dropLegacyVectorTable(projectPath: string): Promise<void> {
-  await invoke("vector_drop_legacy", {
-    projectPath: normalizePath(projectPath),
-  })
+  await apiVectorDropLegacy(normalizePath(projectPath))
 }
 
 // ── Chunk enrichment ─────────────────────────────────────────────────────
