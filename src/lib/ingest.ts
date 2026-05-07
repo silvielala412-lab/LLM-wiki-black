@@ -15,6 +15,7 @@ import {
 import { captionMarkdownImages, loadCaptionCache } from "@/lib/image-caption-pipeline"
 import { isImagePdf, ocrImagePdf } from "@/lib/pdf-ocr"
 import { buildVisionLlmConfig } from "@/lib/server-config"
+import { loadExistingEntities, normalizeEntityBlock } from "@/lib/entity-normalizer"
 import type { MultimodalConfig } from "@/stores/wiki-store"
 
 /**
@@ -625,7 +626,7 @@ async function autoIngestImpl(
   }
 
   // ── Step 3: Write files ───────────────────────────────────────
-  activity.updateItem(activityId, { detail: "Writing files..." })
+  activity.updateItem(activityId, { detail: "Writing files...", step: "Analysing entity deduplication" })
   const { writtenPaths, warnings: writeWarnings, hardFailures } = await writeFileBlocks(pp, generation)
 
   // Surface parser / writer warnings to the activity panel so users
@@ -741,14 +742,25 @@ async function autoIngestImpl(
     }
   }
 
+  // ── P3: count entity stats from written paths & warnings ──────
+  const newEntities = writtenPaths.filter(
+    (p) => p.startsWith("wiki/entities/") || p.startsWith("wiki/concepts/")
+  ).length
+  const mergedEntities = writeWarnings.filter((w) => w.includes("merged into canonical")).length
+
   const detail = writtenPaths.length > 0
-    ? `${writtenPaths.length} files written${reviewItems.length > 0 ? `, ${reviewItems.length} review item(s)` : ""}`
+    ? `${writtenPaths.length} files written${reviewItems.length > 0 ? `, ${reviewItems.length} review item(s)` : ""}${
+        mergedEntities > 0 ? ` · ${mergedEntities} entities merged` : ""
+      }`
     : "No files generated"
 
   activity.updateItem(activityId, {
     status: writtenPaths.length > 0 ? "done" : "error",
     detail,
     filesWritten: writtenPaths,
+    step: undefined,
+    newEntities,
+    mergedEntities,
   })
 
   return writtenPaths
@@ -792,6 +804,9 @@ async function writeFileBlocks(
   const { blocks, warnings: parseWarnings } = parseFileBlocks(text)
   const warnings = [...parseWarnings]
   const writtenPaths: string[] = []
+
+  // P2: load existing entities/concepts once for deduplication
+  const existingEntities = await loadExistingEntities(projectPath)
   // "Hard failures" = blocks we INTENDED to write but the FS rejected
   // (disk full, permission, OS-level errors). Distinct from soft drops
   // (language mismatch, parse warnings, path-traversal rejections):
@@ -804,7 +819,21 @@ async function writeFileBlocks(
 
   const targetLang = useWikiStore.getState().outputLanguage
 
-  for (const { path: relativePath, content } of blocks) {
+  for (const { path: originalRelativePath, content: originalContent } of blocks) {
+    // P2: Deduplicate entity/concept pages
+    const normalised = await normalizeEntityBlock(
+      originalRelativePath,
+      originalContent,
+      existingEntities,
+      projectPath,
+    )
+    const relativePath = normalised.path
+    const content = normalised.content
+    if (normalised.merged) {
+      warnings.push(
+        `Entity "${normalised.originalPath}" merged into canonical "${normalised.canonicalName}" (alias injected)`,
+      )
+    }
     // Language guard: reject individual FILE blocks whose body contradicts
     // the user-set target language. Skip:
     // - log.md (structural, short)

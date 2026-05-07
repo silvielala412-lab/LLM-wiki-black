@@ -257,6 +257,15 @@ function ActivityRow({ item, onCancel }: { item: ActivityItem; onCancel?: () => 
     setSelectedFile(fullPath)
   }
 
+  const hasFileProgress =
+    item.status === "running" &&
+    typeof item.totalFiles === "number" &&
+    item.totalFiles > 0
+
+  const filePct = hasFileProgress
+    ? Math.round(((item.doneFiles ?? 0) / item.totalFiles!) * 100)
+    : 0
+
   return (
     <div className="px-3 py-2 text-xs border-b border-border/50 last:border-b-0">
       <div className="flex items-start gap-2">
@@ -267,7 +276,48 @@ function ActivityRow({ item, onCancel }: { item: ActivityItem; onCancel?: () => 
         </div>
         <div className="min-w-0 flex-1">
           <div className="font-medium">{item.title}</div>
+
+          {/* Current step label */}
+          {item.step && item.status === "running" && (
+            <div className="text-[10px] text-primary/70 mt-0.5 truncate">{item.step}</div>
+          )}
+
+          {/* Detail line */}
           <div className="text-muted-foreground mt-0.5">{item.detail}</div>
+
+          {/* File-level progress bar */}
+          {hasFileProgress && (
+            <div className="mt-1.5">
+              <div className="flex justify-between text-[10px] text-muted-foreground/70 mb-0.5">
+                <span>Writing wiki pages</span>
+                <span>{item.doneFiles}/{item.totalFiles} files</span>
+              </div>
+              <div className="h-1 rounded-full bg-muted overflow-hidden">
+                <div
+                  className="h-full rounded-full bg-primary transition-all duration-300"
+                  style={{ width: `${filePct}%` }}
+                />
+              </div>
+            </div>
+          )}
+
+          {/* Entity stats badges (shown on done items) */}
+          {item.status === "done" && ((item.newEntities ?? 0) > 0 || (item.mergedEntities ?? 0) > 0) && (
+            <div className="mt-1 flex gap-1.5 flex-wrap">
+              {(item.newEntities ?? 0) > 0 && (
+                <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/10 px-1.5 py-0.5 text-[10px] text-emerald-600">
+                  <Users className="h-2.5 w-2.5" />
+                  +{item.newEntities} entities
+                </span>
+              )}
+              {(item.mergedEntities ?? 0) > 0 && (
+                <span className="inline-flex items-center gap-1 rounded-full bg-amber-500/10 px-1.5 py-0.5 text-[10px] text-amber-600">
+                  <GitMerge className="h-2.5 w-2.5" />
+                  {item.mergedEntities} merged
+                </span>
+              )}
+            </div>
+          )}
         </div>
         {item.status === "running" && onCancel && (
           <button

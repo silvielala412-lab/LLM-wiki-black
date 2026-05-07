@@ -327,11 +327,152 @@ pub async fn read_file(
     Json(body): Json<PathBody>,
 ) -> Result<Json<Value>> {
     let path = body.path.clone();
+    let ext = Path::new(&path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    // ── PDF: async pipeline with OCR API priority ─────────────────────
+    if ext == "pdf" {
+        let content = extract_pdf_content_async(&path, &state).await?;
+        return Ok(Json(json!(content)));
+    }
+
+    // ── All other file types: sync worker thread ──────────────────────
     let dpi = state.llm_config.pdf_dpi;
     let content = tokio::task::spawn_blocking(move || read_file_sync(&path, dpi))
         .await??;
     Ok(Json(json!(content)))
 }
+
+/// Async PDF content extraction with three-tier fallback:
+///   1. Internal OCR API  (if OCR_ENDPOINT configured) — handles all PDFs
+///   2. pdf-extract       (pure Rust, fast)             — text-layer PDFs only
+///   3. pdftoppm marker   (poppler-utils)               — image-PDF fallback
+async fn extract_pdf_content_async(path: &str, state: &AppState) -> anyhow::Result<String> {
+    // ── Tier 1: internal OCR API ──────────────────────────────────────
+    if let Some(ocr_endpoint) = &state.llm_config.ocr_endpoint {
+        tracing::info!("PDF OCR: calling internal OCR API for {path}");
+        match call_intranet_ocr_api(path, ocr_endpoint, state).await {
+            Ok(text) => {
+                tracing::info!("PDF OCR: success, {} chars", text.len());
+                return Ok(text);
+            }
+            Err(e) => {
+                tracing::warn!("PDF OCR: internal API failed ({e}), falling back to pdf-extract");
+            }
+        }
+    }
+
+    // ── Tier 2: pdf-extract (text-layer PDFs) ─────────────────────────
+    let path_owned = path.to_string();
+    let bytes = tokio::fs::read(&path_owned).await
+        .map_err(|e| anyhow::anyhow!("Cannot read PDF: {e}"))?;
+
+    let text_result = tokio::task::spawn_blocking(move || {
+        pdf_extract::extract_text_from_mem(&bytes)
+    }).await?;
+
+    match text_result {
+        Ok(text) if !text.trim().is_empty() => {
+            return Ok(text.trim().to_string());
+        }
+        _ => {}
+    }
+
+    // ── Tier 3: pdftoppm → image pages marker ─────────────────────────
+    let dpi = state.llm_config.pdf_dpi;
+    let path_owned = path.to_string();
+    let marker = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+        match pdf_to_images_base64(&path_owned, dpi) {
+            Ok(pages) if !pages.is_empty() => {
+                let marker = serde_json::json!({
+                    "type": "image_pages",
+                    "page_count": pages.len(),
+                    "dpi": dpi,
+                    "pages": pages,
+                });
+                Ok(format!("__PDF_IMAGE_PAGES__{}", marker))
+            }
+            Ok(_) => Ok("(PDF has no extractable text and no pages could be rendered)".into()),
+            Err(e) => Ok(format!(
+                "(PDF has no extractable text — install poppler-utils or configure OCR_ENDPOINT. Error: {e})"
+            )),
+        }
+    }).await??;
+
+    Ok(marker)
+}
+
+/// Call the intranet PDF OCR API.
+///
+/// API contract (POST multipart/form-data):
+///   - model: string  ("qwen2.5-v1-72b" | "glm-ocr")
+///   - file:  binary  (PDF file bytes)
+///
+/// Response JSON:
+///   { "code": 0, "message": "成功处理", "data": { "trace_id": "...", "robot_text": "全文..." } }
+async fn call_intranet_ocr_api(
+    path: &str,
+    endpoint: &str,
+    state: &AppState,
+) -> anyhow::Result<String> {
+    let cfg = &state.llm_config;
+
+    // Read PDF bytes
+    let bytes = tokio::fs::read(path).await
+        .map_err(|e| anyhow::anyhow!("Cannot read PDF for OCR: {e}"))?;
+
+    let filename = Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "document.pdf".to_string());
+
+    // Build multipart form
+    let file_part = reqwest::multipart::Part::bytes(bytes)
+        .file_name(filename)
+        .mime_str("application/pdf")
+        .map_err(|e| anyhow::anyhow!("MIME error: {e}"))?;
+
+    let form = reqwest::multipart::Form::new()
+        .text("model", cfg.ocr_model.clone())
+        .part("file", file_part);
+
+    // Build request
+    let mut req = state.http_client.post(endpoint).multipart(form);
+
+    if let Some(key) = cfg.ocr_api_key() {
+        req = req.bearer_auth(key);
+    }
+
+    // Send and parse
+    let resp = req.send().await
+        .map_err(|e| anyhow::anyhow!("OCR API request failed: {e}"))?;
+
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await
+        .map_err(|e| anyhow::anyhow!("OCR API response not JSON (HTTP {status}): {e}"))?;
+
+    // Validate response code
+    let code = body["code"].as_i64().unwrap_or(-1);
+    if code != 0 {
+        let msg = body["message"].as_str().unwrap_or("unknown error");
+        return Err(anyhow::anyhow!("OCR API returned error code {code}: {msg}"));
+    }
+
+    // Extract full-document text
+    let robot_text = body["data"]["robot_text"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("OCR API response missing data.robot_text field"))?;
+
+    if robot_text.trim().is_empty() {
+        return Err(anyhow::anyhow!("OCR API returned empty robot_text"));
+    }
+
+    Ok(robot_text.to_string())
+}
+
 
 pub async fn write_file(Json(body): Json<WriteBody>) -> Result<Json<Value>> {
     let p = Path::new(&body.path);

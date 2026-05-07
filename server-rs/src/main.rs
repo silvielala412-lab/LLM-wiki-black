@@ -41,13 +41,14 @@ async fn main() -> anyhow::Result<()> {
     let static_dir = std::env::var("STATIC_DIR").unwrap_or_else(|_| "./dist".into());
 
     let llm_config = state::LlmServerConfig::from_env();
-    info!("Server LLM config: provider={:?} model={:?} has_key={} vision={:?}",
-        llm_config.provider, llm_config.model, llm_config.has_api_key, llm_config.vision_endpoint);
+    info!("Server LLM config: provider={:?} model={:?} has_key={} vision={:?} ocr_endpoint={}",
+        llm_config.provider, llm_config.model, llm_config.has_api_key,
+        llm_config.vision_endpoint, llm_config.has_ocr_endpoint);
 
-    let state = Arc::new(AppState {
-        data_root: PathBuf::from(&data_root),
+    let state = Arc::new(AppState::new(
+        PathBuf::from(&data_root),
         llm_config,
-    });
+    ));
 
     info!("Wiki data root: {data_root}");
     info!("Serving frontend from: {static_dir}");
