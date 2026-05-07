@@ -1,18 +1,19 @@
 # ── Stage 1: Build Rust HTTP server ──────────────────────────────────────────
-# Use ubuntu:18.04 so glibc 2.27 matches the target runtime
-FROM ubuntu:18.04 AS rust-builder
+# ubuntu:22.04: glibc 2.35, apt protoc 3.21.x (satisfies lance-encoding ≥ 3.15)
+FROM ubuntu:22.04 AS rust-builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     curl build-essential pkg-config \
-    libssl-dev ca-certificates git \
-    perl make python3 \
+    libssl-dev ca-certificates \
+    perl make git \
+    protobuf-compiler libprotobuf-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# cmake >= 3.21 needed by some lancedb deps — install via pip3
-RUN apt-get update && apt-get install -y python3-pip && rm -rf /var/lib/apt/lists/* \
-    && pip3 install --quiet cmake==3.28.0
+# protoc binary + well-known .proto includes (google/protobuf/empty.proto etc.)
+ENV PROTOC=/usr/bin/protoc
+ENV PROTOC_INCLUDE=/usr/include
 
 # Install Rust stable
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
@@ -42,19 +43,21 @@ RUN npm ci --prefer-offline || npm install
 # Copy frontend source (exclude server-rs, src-tauri, etc. via .dockerignore)
 COPY index.html tsconfig*.json vite.config.ts ./
 COPY src ./src
-COPY public ./public
+# public/ is optional in this project
+RUN if [ -d public ]; then cp -r public ./public; fi
 
-RUN npm run build
+RUN npx vite build
 
 # ── Stage 3: Minimal runtime image ───────────────────────────────────────────
-FROM ubuntu:18.04
+FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl \
+    poppler-utils \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd -r -u 1001 -s /bin/false -m wiki
+    && useradd -r -u 1001 -s /bin/false -m wiki 2>/dev/null || true
 
 WORKDIR /app
 
@@ -70,6 +73,25 @@ ENV APP_PORT=8000
 ENV WIKI_DATA_PATH=/data
 ENV STATIC_DIR=/app/dist
 ENV RUST_LOG=info
+
+# ── LLM 服务端配置（管理员设置，不需要用户配置）──────────────
+# 示例：docker run -e LLM_ENDPOINT=http://内网IP:8080/v1 -e LLM_MODEL=deepseek-chat ...
+ENV LLM_PROVIDER=
+ENV LLM_API_KEY=
+ENV LLM_MODEL=
+ENV LLM_ENDPOINT=
+ENV LLM_API_MODE=chat_completions
+ENV LLM_MAX_CONTEXT=
+# Embedding 服务
+ENV EMBEDDING_ENDPOINT=
+ENV EMBEDDING_MODEL=
+# 多模态/视觉模型（图片型 PDF OCR）
+ENV VISION_ENDPOINT=
+ENV VISION_MODEL=
+# PDF 转图 DPI：150（默认）或 200（表格密集场景）
+ENV PDF_DPI=150
+# 用户是否可覆盖服务端配置：true=可以覆盖 false=锁定
+ENV SERVER_CONFIG_LOCKED=false
 
 EXPOSE 8000
 VOLUME ["/data"]

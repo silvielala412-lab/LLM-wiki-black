@@ -1,13 +1,11 @@
 use axum::{
     Router,
     routing::{get, post},
-    extract::State,
-    response::{Json, IntoResponse},
-    http::{StatusCode, Method, header},
+    http::Method,
 };
 use tower_http::{
     cors::{CorsLayer, Any},
-    fs::ServeDir,
+    services::ServeDir,
 };
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use tokio::net::TcpListener;
@@ -18,6 +16,7 @@ mod state;
 mod error;
 
 use state::AppState;
+
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -41,8 +40,13 @@ async fn main() -> anyhow::Result<()> {
     let data_root = std::env::var("WIKI_DATA_PATH").unwrap_or_else(|_| "./data".into());
     let static_dir = std::env::var("STATIC_DIR").unwrap_or_else(|_| "./dist".into());
 
+    let llm_config = state::LlmServerConfig::from_env();
+    info!("Server LLM config: provider={:?} model={:?} has_key={} vision={:?}",
+        llm_config.provider, llm_config.model, llm_config.has_api_key, llm_config.vision_endpoint);
+
     let state = Arc::new(AppState {
         data_root: PathBuf::from(&data_root),
+        llm_config,
     });
 
     info!("Wiki data root: {data_root}");
@@ -57,6 +61,7 @@ async fn main() -> anyhow::Result<()> {
     // API routes
     let api = Router::new()
         .route("/health", get(handlers::health::health))
+        .route("/config", get(handlers::config::get_config))
         // File system
         .route("/fs/read",     post(handlers::fs::read_file))
         .route("/fs/write",    post(handlers::fs::write_file))

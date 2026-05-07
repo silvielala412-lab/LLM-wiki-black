@@ -6,10 +6,10 @@
 use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::{path::Path, sync::Arc};
-use lancedb::{connect, query::ExecutableQuery};
+use std::sync::Arc;
+use lancedb::{connect, query::{ExecutableQuery, QueryBase}};
 use arrow_array::{
-    Float32Array, RecordBatch, RecordBatchIterator, StringArray, FixedSizeListArray,
+    Float32Array, RecordBatch, StringArray, FixedSizeListArray,
 };
 use arrow_schema::{DataType, Field, Schema};
 use futures::TryStreamExt;
@@ -107,8 +107,7 @@ pub async fn upsert_chunks(Json(body): Json<UpsertBody>) -> Result<Json<Value>> 
         ],
     )?;
 
-    let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
-    tbl.add(batches).execute().await?;
+    tbl.add(vec![batch]).execute().await?;
 
     Ok(Json(json!(n)))
 }
@@ -172,6 +171,6 @@ pub async fn count_chunks(Json(body): Json<ProjectPathBody>) -> Result<Json<Valu
 pub async fn drop_legacy(Json(body): Json<ProjectPathBody>) -> Result<Json<Value>> {
     let db_path = db_path(&body.project_path);
     let db = connect(&db_path).execute().await?;
-    let _ = db.drop_table(TABLE).await;
+    let _ = db.drop_table(TABLE, &[]).await;
     Ok(Json(json!(null)))
 }

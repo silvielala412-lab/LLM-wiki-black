@@ -1,4 +1,4 @@
-﻿import path from "path"
+import path from "path"
 import { readFileSync } from "fs"
 import { defineConfig } from "vite"
 import react from "@vitejs/plugin-react"
@@ -25,8 +25,8 @@ export default defineConfig(async () => ({
   // Vite dev server config
   clearScreen: false,
   server: {
-    port: 3000,
-    strictPort: false,
+    port: 1420,
+    strictPort: true,
     host: host || "127.0.0.1",
     hmr: host ? { protocol: "ws", host, port: 3001 } : undefined,
     watch: { ignored: ["**/src-tauri/**"] },

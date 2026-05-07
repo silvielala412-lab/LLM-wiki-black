@@ -7,11 +7,11 @@ use axum::{
     extract::{Query, State},
     Json,
 };
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     fs,
-    io::{Read as IoRead},
     path::Path,
     sync::Arc,
 };
@@ -156,8 +156,94 @@ fn extract_docx_text(path: &str) -> anyhow::Result<String> {
     })
 }
 
+/// Extract text from PDF using pdf-extract (pure Rust, no system libs).
+/// When the PDF has no text layer (image-based / scanned), falls back to
+/// converting each page to a JPEG via `pdftoppm` (poppler-utils) and returns
+/// a special JSON marker that the frontend intercepts to run VLM OCR.
+fn extract_pdf_text(path: &str, pdf_dpi: u32) -> anyhow::Result<String> {
+    let bytes = fs::read(path)?;
+    let text = pdf_extract::extract_text_from_mem(&bytes)
+        .map_err(|e| anyhow::anyhow!("PDF extraction failed: {e}"))?;
+    let trimmed = text.trim();
+    if !trimmed.is_empty() {
+        return Ok(trimmed.to_string());
+    }
+
+    // ── Fallback: image-based PDF → convert pages to JPEG ────────────
+    // Uses `pdftoppm` from poppler-utils (installed in the Docker runtime
+    // image). If pdftoppm is not found, we return a descriptive error
+    // message instead of crashing so text-only ingestion keeps working.
+    match pdf_to_images_base64(path, pdf_dpi) {
+        Ok(pages) if !pages.is_empty() => {
+            let marker = serde_json::json!({
+                "type": "image_pages",
+                "page_count": pages.len(),
+                "dpi": pdf_dpi,
+                "pages": pages,
+            });
+            Ok(format!("__PDF_IMAGE_PAGES__{}", marker))
+        }
+        Ok(_) => Ok("(PDF has no extractable text and no pages could be rendered)".into()),
+        Err(e) => {
+            tracing::warn!("pdf_to_images failed for {path}: {e}");
+            Ok(format!(
+                "(PDF has no extractable text — may be image-based. \
+                 Install poppler-utils in the container to enable OCR. Error: {e})"
+            ))
+        }
+    }
+}
+
+/// Convert a PDF to per-page JPEG images using `pdftoppm` (poppler-utils).
+/// Returns a Vec of base64-encoded JPEG strings, one per page.
+fn pdf_to_images_base64(path: &str, dpi: u32) -> anyhow::Result<Vec<String>> {
+    use std::process::Command;
+
+    // Write output to a temp directory so we can glob the results.
+    let tmp = tempfile::tempdir()?;
+    let out_prefix = tmp.path().join("page");
+    let out_prefix_str = out_prefix.to_string_lossy();
+
+    let status = Command::new("pdftoppm")
+        .args([
+            "-jpeg",
+            "-r", &dpi.to_string(),
+            path,
+            &out_prefix_str,
+        ])
+        .status()
+        .map_err(|e| anyhow::anyhow!("pdftoppm not found or failed to start: {e}. \
+            Ensure poppler-utils is installed."))?;
+
+    if !status.success() {
+        return Err(anyhow::anyhow!("pdftoppm exited with status {status}"));
+    }
+
+    // Collect output files (pdftoppm names them page-1.jpg, page-2.jpg …)
+    let mut entries: Vec<_> = fs::read_dir(tmp.path())?
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.path()
+                .extension()
+                .and_then(|x| x.to_str())
+                .map(|x| x.eq_ignore_ascii_case("jpg") || x.eq_ignore_ascii_case("jpeg"))
+                .unwrap_or(false)
+        })
+        .collect();
+
+    // Sort by filename to preserve page order.
+    entries.sort_by_key(|e| e.file_name());
+
+    let mut result = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let data = fs::read(entry.path())?;
+        result.push(B64.encode(&data));
+    }
+    Ok(result)
+}
+
 /// Read and preprocess a file — returns text content (same behaviour as Tauri read_file).
-fn read_file_sync(path: &str) -> anyhow::Result<String> {
+fn read_file_sync(path: &str, pdf_dpi: u32) -> anyhow::Result<String> {
     let p = Path::new(path);
     let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
 
@@ -170,6 +256,7 @@ fn read_file_sync(path: &str) -> anyhow::Result<String> {
                     p.file_name().unwrap_or_default().to_string_lossy())),
             }
         }
+        "pdf" => extract_pdf_text(path, pdf_dpi),
         e if IMAGE_EXTS.contains(&e) => {
             let size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
             Ok(format!("[Image: {} ({:.1} KB)]",
@@ -235,9 +322,13 @@ fn copy_dir_recursive(src: &Path, dst: &Path, collected: &mut Vec<String>) -> an
 
 // ── Handlers ─────────────────────────────────────────────────────────────────
 
-pub async fn read_file(Json(body): Json<PathBody>) -> Result<Json<Value>> {
+pub async fn read_file(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<PathBody>,
+) -> Result<Json<Value>> {
     let path = body.path.clone();
-    let content = tokio::task::spawn_blocking(move || read_file_sync(&path))
+    let dpi = state.llm_config.pdf_dpi;
+    let content = tokio::task::spawn_blocking(move || read_file_sync(&path, dpi))
         .await??;
     Ok(Json(json!(content)))
 }

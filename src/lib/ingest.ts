@@ -13,6 +13,8 @@ import {
   buildImageMarkdownSection,
 } from "@/lib/extract-source-images"
 import { captionMarkdownImages, loadCaptionCache } from "@/lib/image-caption-pipeline"
+import { isImagePdf, ocrImagePdf } from "@/lib/pdf-ocr"
+import { buildVisionLlmConfig } from "@/lib/server-config"
 import type { MultimodalConfig } from "@/stores/wiki-store"
 
 /**
@@ -290,13 +292,45 @@ async function autoIngestImpl(
     filesWritten: [],
   })
 
-  const [sourceContent, schema, purpose, index, overview] = await Promise.all([
+  const [rawSourceContent, schema, purpose, index, overview] = await Promise.all([
     tryReadFile(sp),
     tryReadFile(`${pp}/schema.md`),
     tryReadFile(`${pp}/purpose.md`),
     tryReadFile(`${pp}/wiki/index.md`),
     tryReadFile(`${pp}/wiki/overview.md`),
   ])
+
+  // ── Image-PDF OCR: detect scanned PDFs and run vision-model OCR ──
+  let sourceContent = rawSourceContent
+  if (isImagePdf(rawSourceContent)) {
+    activity.updateItem(activityId, { detail: "Scanned PDF detected — running OCR..." })
+    const visionCfg = buildVisionLlmConfig()
+    if (visionCfg) {
+      try {
+        sourceContent = await ocrImagePdf(rawSourceContent, visionCfg, {
+          signal,
+          onProgress: (done, total) =>
+            activity.updateItem(activityId, {
+              detail: `OCR: page ${done}/${total}...`,
+            }),
+        })
+        console.log(`[ingest:pdf-ocr] OCR complete for "${fileName}": ${sourceContent.length} chars`)
+      } catch (err) {
+        console.warn(`[ingest:pdf-ocr] OCR failed for "${fileName}":`, err)
+        activity.updateItem(activityId, {
+          status: "error",
+          detail: `PDF OCR failed: ${err instanceof Error ? err.message : err}. Configure VISION_ENDPOINT in server settings.`,
+        })
+        // Non-fatal: fall through with empty content so the pipeline
+        // at least generates a stub source-summary page.
+        sourceContent = `(图片型 PDF — OCR 失败。请在服务器配置中设置 VISION_ENDPOINT 和 VISION_MODEL。文件: ${fileName})`
+      }
+    } else {
+      // Vision model not configured → friendly message in the wiki
+      sourceContent = `(图片型 PDF — 服务器未配置视觉模型 VISION_ENDPOINT，无法 OCR。文件: ${fileName})`
+      console.warn(`[ingest:pdf-ocr] No vision config for "${fileName}" — VISION_ENDPOINT not set`)
+    }
+  }
 
   // ── Cache check: skip re-ingest if source content hasn't changed ──
   //
