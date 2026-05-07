@@ -130,7 +130,24 @@ function CopyButton({ content }: { content: string }) {
       .replace(/<think(?:ing)?>\s*[\s\S]*$/gi, "")
       .trim()
 
-    await navigator.clipboard.writeText(clean)
+    // navigator.clipboard is only available in secure contexts (HTTPS/localhost).
+    // Fall back to execCommand for intranet HTTP deployments.
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(clean)
+      } else {
+        const el = document.createElement("textarea")
+        el.value = clean
+        el.style.position = "fixed"
+        el.style.opacity = "0"
+        document.body.appendChild(el)
+        el.select()
+        document.execCommand("copy")
+        document.body.removeChild(el)
+      }
+    } catch {
+      // silently ignore clipboard errors
+    }
     setCopied(true)
     setTimeout(() => setCopied(false), 2000)
   }, [content])

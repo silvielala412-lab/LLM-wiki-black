@@ -1,4 +1,4 @@
-﻿import { useEffect, useState, useCallback } from "react"
+import { useEffect, useState, useCallback } from "react"
 import { Download, RefreshCw, CheckCircle2, Sparkles } from "lucide-react"
 import { useTranslation } from "react-i18next"
 import { clipServerStatus } from "@/commands/fs"
@@ -231,8 +231,20 @@ function UpdateAvailableBanner({
       window.open(targetUrl, "_blank")
     } catch (err) {
       console.error("[update-banner] openUrl failed:", err)
+      // navigator.clipboard is only available in secure contexts (HTTPS/localhost)
       try {
-        await navigator.clipboard.writeText(targetUrl)
+        if (navigator.clipboard?.writeText) {
+          await navigator.clipboard.writeText(targetUrl)
+        } else {
+          const el = document.createElement("textarea")
+          el.value = targetUrl
+          el.style.position = "fixed"
+          el.style.opacity = "0"
+          document.body.appendChild(el)
+          el.select()
+          document.execCommand("copy")
+          document.body.removeChild(el)
+        }
         // eslint-disable-next-line no-alert
         alert(`Could not open browser. URL copied to clipboard:\n${targetUrl}`)
       } catch {
