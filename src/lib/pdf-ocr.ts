@@ -46,6 +46,13 @@ export function parseImagePdfPayload(content: string): ImagePagePayload {
 /**
  * OCR a single base64-encoded JPEG using the vision LLM.
  * Returns the extracted text for that page.
+ *
+ * Uses the project-native ContentBlock format ({ type: "image", mediaType, dataBase64 })
+ * so llm-providers.ts automatically translates to the correct wire format:
+ *   OpenAI / custom / vLLM / llama.cpp → image_url.url = data:image/jpeg;base64,...
+ *   Anthropic / MiniMax              → source.media_type + source.data
+ *   Gemini                           → inline_data.mime_type + inline_data.data
+ *   Ollama                           → OpenAI compat via /v1/chat/completions
  */
 async function ocrPage(
   pageBase64: string,
@@ -63,17 +70,15 @@ async function ocrPage(
         role: "user",
         content: [
           {
-            type: "image_url",
-            image_url: {
-              url: `data:image/jpeg;base64,${pageBase64}`,
-              detail: "high",
-            },
-          },
-          {
             type: "text",
             text: `这是第 ${pageIndex + 1} 页（共 ${totalPages} 页）扫描文档。请提取图中所有可见文字，保持原始格式（包括换行、标题层级、表格结构等），不要添加任何解释或额外内容，直接输出提取到的文字。`,
           },
-        ] as unknown as string,
+          {
+            type: "image",
+            mediaType: "image/jpeg",
+            dataBase64: pageBase64,
+          },
+        ],
       },
     ],
     {
@@ -89,6 +94,7 @@ async function ocrPage(
 
   return text.trim()
 }
+
 
 /**
  * Run OCR on all pages of an image-based PDF using the vision model.
