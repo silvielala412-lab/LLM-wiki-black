@@ -1,4 +1,0 @@
-cargo::rustc-check-cfg=cfg(kernel_support, values("avx512"))
-cargo:rerun-if-changed=src/simd/f16.c
-cargo:rerun-if-changed=src/simd/dist_table.c
-cargo:warning=fp16 kernels are not supported on Windows. Skipping compilation of kernels.
