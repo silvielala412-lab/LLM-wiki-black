@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Project identity: stable UUID per project + global registry mapping
  * `UUID → current filesystem path`.
  *
@@ -17,6 +17,26 @@ import { readFile, writeFile } from "@/commands/fs"
 import { normalizePath } from "@/lib/path-utils"
 
 const REGISTRY_KEY = "llm-wiki:projectRegistry"
+
+/**
+ * UUID v4 generator that works in both secure (HTTPS) and non-secure (HTTP)
+ * contexts. `crypto.randomUUID()` is only available in secure contexts
+ * (HTTPS or localhost); intranet HTTP deployments need the Math.random fallback.
+ */
+function generateUUID(): string {
+  if (
+    typeof crypto !== "undefined" &&
+    typeof crypto.randomUUID === "function"
+  ) {
+    return crypto.randomUUID()
+  }
+  // RFC 4122 v4 UUID fallback — sufficient for project identity keys
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0
+    const v = c === "x" ? r : (r & 0x3) | 0x8
+    return v.toString(16)
+  })
+}
 
 function lsGet<T>(key: string): T | null {
   try { const r = localStorage.getItem(key); return r ? JSON.parse(r) : null } catch { return null }
@@ -61,7 +81,7 @@ export async function ensureProjectId(projectPath: string): Promise<string> {
     // missing or corrupt — fall through to create
   }
   const identity: ProjectIdentity = {
-    id: crypto.randomUUID(),
+    id: generateUUID(),
     createdAt: Date.now(),
   }
   try {
