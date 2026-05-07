@@ -56,17 +56,17 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl \
     poppler-utils \
-    && rm -rf /var/lib/apt/lists/* \
-    && useradd -r -u 1001 -s /bin/false -m wiki 2>/dev/null || true
+    && rm -rf /var/lib/apt/lists/* ; \
+    useradd -r -u 1001 -g 0 -s /bin/false -M wiki 2>/dev/null || true
 
 WORKDIR /app
 
 COPY --from=rust-builder  /build/target/release/llm-wiki-server .
 COPY --from=frontend-builder /build/dist ./dist
 
-RUN mkdir -p /data && chown -R wiki:wiki /app /data
+RUN mkdir -p /data /app && chown -R 1001:0 /app /data
 
-USER wiki
+USER 1001
 
 ENV APP_HOST=0.0.0.0
 ENV APP_PORT=8000

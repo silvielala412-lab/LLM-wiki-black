@@ -529,10 +529,14 @@ pub async fn copy_directory(Json(body): Json<CopyBody>) -> Result<Json<Value>> {
     Ok(Json(serde_json::to_value(paths)?))
 }
 
-pub async fn preprocess_file(Json(body): Json<PathBody>) -> Result<Json<Value>> {
+pub async fn preprocess_file(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<PathBody>,
+) -> Result<Json<Value>> {
     // Same as read_file — preprocess just warms the cache in Tauri, here we return text directly
     let path = body.path.clone();
-    let content = tokio::task::spawn_blocking(move || read_file_sync(&path))
+    let dpi = state.llm_config.pdf_dpi;
+    let content = tokio::task::spawn_blocking(move || read_file_sync(&path, dpi))
         .await??;
     Ok(Json(json!(content)))
 }
