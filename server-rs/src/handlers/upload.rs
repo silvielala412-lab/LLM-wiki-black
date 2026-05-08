@@ -1,10 +1,10 @@
 use axum::{
-    extract::Multipart,
+    extract::{Multipart, State},
     Json,
 };
 use serde_json::{json, Value};
-use std::{fs, path::Path};
-use crate::error::Result;
+use std::{fs, path::{Path, PathBuf}, sync::Arc};
+use crate::{error::Result, state::AppState};
 
 const ALLOWED_EXTS: &[&str] = &[
     "pdf", "xlsx", "xls", "docx", "doc",
@@ -13,9 +13,37 @@ const ALLOWED_EXTS: &[&str] = &[
 ];
 const MAX_MB: u64 = 200;
 
+/// Resolve destination_dir relative to data_root; reject traversal.
+fn resolve_upload_dir(destination_dir: &str, data_root: &Path) -> anyhow::Result<PathBuf> {
+    let joined = if Path::new(destination_dir).is_absolute() {
+        PathBuf::from(destination_dir)
+    } else {
+        data_root.join(destination_dir)
+    };
+
+    // Normalise without requiring existence
+    let mut canonical = PathBuf::new();
+    for component in joined.components() {
+        use std::path::Component;
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => { canonical.pop(); }
+            c => canonical.push(c),
+        }
+    }
+
+    if !canonical.starts_with(data_root) {
+        anyhow::bail!(
+            "Upload destination '{}' is outside the allowed data directory",
+            destination_dir
+        );
+    }
+    Ok(canonical)
+}
+
 async fn save_upload(
     file_name: &str,
-    destination_dir: &str,
+    destination_dir: &Path,
     data: Vec<u8>,
 ) -> anyhow::Result<Value> {
     let ext = Path::new(file_name)
@@ -32,7 +60,7 @@ async fn save_upload(
     }
 
     fs::create_dir_all(destination_dir)?;
-    let dest = Path::new(destination_dir).join(file_name);
+    let dest = destination_dir.join(file_name);
     fs::write(&dest, &data)?;
 
     Ok(json!({
@@ -42,10 +70,13 @@ async fn save_upload(
     }))
 }
 
-pub async fn upload_file(mut multipart: Multipart) -> Result<Json<Value>> {
+pub async fn upload_file(
+    State(state): State<Arc<AppState>>,
+    mut multipart: Multipart,
+) -> Result<Json<Value>> {
     let mut file_name = String::new();
     let mut file_data: Option<Vec<u8>> = None;
-    let mut destination_dir = String::new();
+    let mut destination_dir_raw = String::new();
 
     while let Some(field) = multipart.next_field().await? {
         let name = field.name().unwrap_or("").to_string();
@@ -58,20 +89,24 @@ pub async fn upload_file(mut multipart: Multipart) -> Result<Json<Value>> {
                 file_data = Some(field.bytes().await?.to_vec());
             }
             "destination_dir" => {
-                destination_dir = field.text().await?;
+                destination_dir_raw = field.text().await?;
             }
             _ => {}
         }
     }
 
+    let dest_dir = resolve_upload_dir(&destination_dir_raw, &state.data_root)?;
     let data = file_data.ok_or_else(|| anyhow::anyhow!("No file provided"))?;
-    let result = save_upload(&file_name, &destination_dir, data).await?;
+    let result = save_upload(&file_name, &dest_dir, data).await?;
     Ok(Json(result))
 }
 
-pub async fn upload_files(mut multipart: Multipart) -> Result<Json<Value>> {
+pub async fn upload_files(
+    State(state): State<Arc<AppState>>,
+    mut multipart: Multipart,
+) -> Result<Json<Value>> {
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
-    let mut destination_dir = String::new();
+    let mut destination_dir_raw = String::new();
 
     while let Some(field) = multipart.next_field().await? {
         let name = field.name().unwrap_or("").to_string();
@@ -85,15 +120,17 @@ pub async fn upload_files(mut multipart: Multipart) -> Result<Json<Value>> {
                 files.push((fname, data));
             }
             "destination_dir" => {
-                destination_dir = field.text().await?;
+                destination_dir_raw = field.text().await?;
             }
             _ => {}
         }
     }
 
+    let dest_dir = resolve_upload_dir(&destination_dir_raw, &state.data_root)?;
+
     let mut results = Vec::new();
     for (fname, data) in files {
-        match save_upload(&fname, &destination_dir, data).await {
+        match save_upload(&fname, &dest_dir, data).await {
             Ok(v) => results.push(v),
             Err(e) => results.push(json!({ "error": e.to_string(), "name": fname })),
         }

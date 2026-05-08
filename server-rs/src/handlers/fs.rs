@@ -12,10 +12,44 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     fs,
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 use crate::{error::Result, state::AppState};
+
+// ── Path safety ──────────────────────────────────────────────────────────────
+
+/// Ensure `path` is within `root`. Returns the canonical absolute path.
+/// Rejects path traversal attempts (../../etc/passwd etc.).
+fn guard_path(path: &str, root: &Path) -> anyhow::Result<PathBuf> {
+    // Resolve the path without requiring it to exist (for write operations)
+    // by joining to root and then normalising `.` / `..` segments manually.
+    let joined = if Path::new(path).is_absolute() {
+        PathBuf::from(path)
+    } else {
+        root.join(path)
+    };
+
+    // Remove `.` / `..` without requiring the path to exist
+    let mut canonical = PathBuf::new();
+    for component in joined.components() {
+        use std::path::Component;
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => { canonical.pop(); }
+            c => canonical.push(c),
+        }
+    }
+
+    // Must stay inside data_root
+    if !canonical.starts_with(root) {
+        anyhow::bail!(
+            "Path '{}' is outside the allowed data directory",
+            path
+        );
+    }
+    Ok(canonical)
+}
 
 // ── Known file type categories (same as Tauri) ──────────────────────────────
 
@@ -474,7 +508,11 @@ async fn call_intranet_ocr_api(
 }
 
 
-pub async fn write_file(Json(body): Json<WriteBody>) -> Result<Json<Value>> {
+pub async fn write_file(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<WriteBody>,
+) -> Result<Json<Value>> {
+    guard_path(&body.path, &state.data_root)?;
     let p = Path::new(&body.path);
     if let Some(parent) = p.parent() {
         fs::create_dir_all(parent)?;
@@ -495,7 +533,11 @@ pub async fn file_exists(Json(body): Json<PathBody>) -> Result<Json<Value>> {
     Ok(Json(json!(Path::new(&body.path).exists())))
 }
 
-pub async fn delete_file(Json(body): Json<PathBody>) -> Result<Json<Value>> {
+pub async fn delete_file(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<PathBody>,
+) -> Result<Json<Value>> {
+    guard_path(&body.path, &state.data_root)?;
     let p = Path::new(&body.path);
     if p.is_dir() {
         fs::remove_dir_all(&body.path)?;
@@ -628,4 +670,13 @@ pub async fn serve_media(
             .body(Body::empty())
             .unwrap(),
     }
+}
+
+/// Clip-server status stub.
+/// In the Tauri desktop build a local clip-server daemon runs on 127.0.0.1:19827
+/// and tracks clipboard history. The web/Docker deployment doesn't need this
+/// (users upload files via the browser upload dialog instead), so we return
+/// "disabled" — the frontend already handles this gracefully.
+pub async fn clip_server_status() -> Json<Value> {
+    Json(json!("disabled"))
 }

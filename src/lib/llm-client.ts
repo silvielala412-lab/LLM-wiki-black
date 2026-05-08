@@ -33,6 +33,44 @@ function parseLines(chunk: Uint8Array, buffer: string): [string[], string] {
   return [lines, remaining]
 }
 
+// ── Backend proxy detection ───────────────────────────────────────────────────
+
+/**
+ * Whether the server has LLM_ENDPOINT configured.
+ * Cached after first call — the config doesn't change at runtime.
+ */
+let _serverHasLlm: boolean | null = null
+
+async function serverHasLlm(): Promise<boolean> {
+  if (_serverHasLlm !== null) return _serverHasLlm
+  try {
+    const res = await fetch("/api/config")
+    if (!res.ok) { _serverHasLlm = false; return false }
+    const cfg = await res.json()
+    _serverHasLlm = !!(cfg?.llm?.endpoint)
+    return _serverHasLlm
+  } catch {
+    _serverHasLlm = false
+    return false
+  }
+}
+
+// Standard OpenAI SSE line parser (used for the backend proxy stream,
+// which always emits OpenAI-format SSE regardless of the upstream provider).
+function parseOpenAiSseLine(line: string): string | null {
+  if (!line.startsWith("data:")) return null
+  const data = line.slice(5).trim()
+  if (data === "[DONE]") return null
+  try {
+    const json = JSON.parse(data)
+    return json?.choices?.[0]?.delta?.content ?? null
+  } catch {
+    return null
+  }
+}
+
+// ── Main stream function ──────────────────────────────────────────────────────
+
 export async function streamChat(
   config: LlmConfig,
   messages: import("./llm-providers").ChatMessage[],
@@ -57,15 +95,33 @@ export async function streamChat(
     return streamViaClaudeCodeCli(config, messages, callbacks, signal, requestOverrides)
   }
 
+  // ── Backend proxy mode ────────────────────────────────────────────────────
+  // When the Rust backend has LLM_ENDPOINT configured, route through
+  // /api/llm/stream. This avoids Mixed Content errors (HTTPS page → HTTP
+  // LLM service) and CORS issues without requiring changes to the LLM service.
+  const useProxy = await serverHasLlm()
+
+  if (useProxy) {
+    return streamChatViaProxy(config, messages, callbacks, signal, requestOverrides)
+  }
+
+  // ── Direct mode (dev / desktop) ───────────────────────────────────────────
+  return streamChatDirect(config, messages, callbacks, signal, requestOverrides)
+}
+
+// ── Direct fetch (original implementation) ───────────────────────────────────
+
+async function streamChatDirect(
+  config: LlmConfig,
+  messages: import("./llm-providers").ChatMessage[],
+  callbacks: StreamCallbacks,
+  signal?: AbortSignal,
+  requestOverrides?: RequestOverrides,
+): Promise<void> {
+  const { onToken, onDone, onError } = callbacks
   const providerConfig = getProviderConfig(config)
 
-  // Combined abort: (a) user cancel, (b) our long-horizon timeout.
-  // The long timeout is a backstop for truly stuck requests; it's NOT
-  // what fires when a user sees "Timeout" after 2 seconds — that is
-  // almost always a fast network failure (DNS, TLS, 404, refused) that
-  // WebKit surfaces as a generic "Load failed". We track whether the
-  // backstop actually fired so we can tell the two apart in the error.
-  const timeoutMs = 30 * 60 * 1000 // 30 min — generous backstop for huge-context reasoning models
+  const timeoutMs = 30 * 60 * 1000
   let combinedSignal = signal
   let timeoutController: AbortController | undefined
   let timeoutFired = false
@@ -97,29 +153,19 @@ export async function streamChat(
       signal: combinedSignal,
     })
   } catch (err) {
-    if (signal?.aborted) {
-      onDone()
-      return
-    }
+    if (signal?.aborted) { onDone(); return }
     if (err instanceof Error && err.name === "AbortError") {
-      // Backstop timeout aborted the request (we tracked this via
-      // timeoutFired); treat it as a real timeout rather than a cancel.
       if (timeoutFired) {
         onError(new Error(`Request timed out after ${Math.round(timeoutMs / 60000)} min. Try a faster model or a smaller context.`))
         return
       }
-      onDone()
-      return
+      onDone(); return
     }
     if (isFetchNetworkError(err)) {
       if (timeoutFired) {
         onError(new Error(`Request timed out after ${Math.round(timeoutMs / 60000)} min. Try a faster model or a smaller context.`))
         return
       }
-      // Fast fetch failure: DNS, TLS handshake, connection refused,
-      // wrong endpoint, CORS preflight rejection, etc. All webviews
-      // collapse this class of failure into an opaque error — point
-      // users at the likely cause (endpoint / key / connectivity).
       onError(new Error(`Network error reaching ${providerConfig.url}. Check endpoint URL, API key, and connectivity.`))
       return
     }
@@ -132,9 +178,7 @@ export async function streamChat(
     try {
       const body = await response.text()
       if (body) errorDetail += ` — ${body}`
-    } catch {
-      // ignore body read failure
-    }
+    } catch { /* ignore */ }
     onError(new Error(errorDetail))
     return
   }
@@ -144,7 +188,73 @@ export async function streamChat(
     return
   }
 
-  const reader = response.body.getReader()
+  await consumeStream(response.body, providerConfig.parseStream, callbacks, signal)
+}
+
+// ── Proxy fetch ───────────────────────────────────────────────────────────────
+
+async function streamChatViaProxy(
+  config: LlmConfig,
+  messages: import("./llm-providers").ChatMessage[],
+  callbacks: StreamCallbacks,
+  signal?: AbortSignal,
+  requestOverrides?: RequestOverrides,
+): Promise<void> {
+  const { onToken, onDone, onError } = callbacks
+
+  const body: Record<string, unknown> = { messages }
+  if (requestOverrides?.temperature !== undefined) body.temperature = requestOverrides.temperature
+  if (requestOverrides?.maxTokens !== undefined) body.max_tokens = requestOverrides.maxTokens
+  // Pass model name so the backend can respect it when allow_user_override=true
+  if (config.model) body.model = config.model
+
+  let response: Response
+  try {
+    response = await fetch("/api/llm/stream", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal,
+    })
+  } catch (err) {
+    if (signal?.aborted) { onDone(); return }
+    if (isFetchNetworkError(err)) {
+      onError(new Error("Network error reaching the LLM proxy. Check server logs."))
+      return
+    }
+    onError(err instanceof Error ? err : new Error(String(err)))
+    return
+  }
+
+  if (!response.ok) {
+    let errorDetail = `HTTP ${response.status}: ${response.statusText}`
+    try {
+      const body = await response.text()
+      if (body) errorDetail += ` — ${body}`
+    } catch { /* ignore */ }
+    onError(new Error(errorDetail))
+    return
+  }
+
+  if (!response.body) {
+    onError(new Error("Response body is null"))
+    return
+  }
+
+  // Proxy always streams OpenAI-format SSE regardless of upstream provider
+  await consumeStream(response.body, parseOpenAiSseLine, callbacks, signal)
+}
+
+// ── Shared SSE consumer ───────────────────────────────────────────────────────
+
+async function consumeStream(
+  body: ReadableStream<Uint8Array>,
+  parseLine: (line: string) => string | null,
+  callbacks: StreamCallbacks,
+  signal?: AbortSignal,
+): Promise<void> {
+  const { onToken, onDone, onError } = callbacks
+  const reader = body.getReader()
   let lineBuffer = ""
 
   try {
@@ -153,7 +263,7 @@ export async function streamChat(
 
       if (done) {
         if (lineBuffer.trim()) {
-          const token = providerConfig.parseStream(lineBuffer.trim())
+          const token = parseLine(lineBuffer.trim())
           if (token !== null) onToken(token)
         }
         break
@@ -165,21 +275,17 @@ export async function streamChat(
       for (const line of lines) {
         const trimmed = line.trim()
         if (!trimmed) continue
-        const token = providerConfig.parseStream(trimmed)
+        const token = parseLine(trimmed)
         if (token !== null) onToken(token)
       }
     }
 
     onDone()
   } catch (err) {
-    if (err instanceof Error && (err.name === "AbortError" || (signal?.aborted))) {
-      onDone()
-      return
+    if (err instanceof Error && (err.name === "AbortError" || signal?.aborted)) {
+      onDone(); return
     }
     if (isFetchNetworkError(err)) {
-      // Stream reader threw a network error mid-response (connection
-      // dropped, server closed early, network blip). Same message
-      // regardless of whether the webview is WebKit or Chromium.
       onError(new Error("Connection lost during streaming. Try again."))
       return
     }

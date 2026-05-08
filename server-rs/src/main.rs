@@ -6,6 +6,7 @@ use axum::{
 use tower_http::{
     cors::{CorsLayer, Any},
     services::ServeDir,
+    trace::TraceLayer,
 };
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use tokio::net::TcpListener;
@@ -76,6 +77,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/fs/read-base64", post(handlers::fs::read_file_base64))
         .route("/fs/related-wiki-pages", post(handlers::fs::related_wiki_pages))
         .route("/fs/media",    get(handlers::fs::serve_media))
+        .route("/fs/clip-server-status", get(handlers::fs::clip_server_status))
         // Project
         .route("/project/list",        get(handlers::project::list_projects))
         .route("/project/open",        post(handlers::project::open_project))
@@ -90,6 +92,9 @@ async fn main() -> anyhow::Result<()> {
         // Upload
         .route("/upload/file",  post(handlers::upload::upload_file))
         .route("/upload/files", post(handlers::upload::upload_files))
+        // LLM / Embedding proxy (solves Mixed Content + CORS for HTTPS deployments)
+        .route("/llm/stream", post(handlers::llm::stream_chat))
+        .route("/llm/embed",  post(handlers::llm::embed))
         .with_state(state);
 
     // SPA fallback — serve React app for all non-API routes
@@ -100,6 +105,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .nest("/api", api)
         .fallback_service(spa)
+        .layer(TraceLayer::new_for_http())
         .layer(cors);
 
     let addr: SocketAddr = format!("{host}:{port}").parse()?;

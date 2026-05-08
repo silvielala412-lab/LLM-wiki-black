@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Embedding pipeline — standard RAG flow.
  *
  *   1. chunkMarkdown(content)        (src/lib/text-chunker.ts)
@@ -81,6 +81,25 @@ export async function fetchEmbedding(
   cfg: EmbeddingConfig,
   maxRetries = 3,
 ): Promise<number[] | null> {
+  if (!cfg.endpoint && !cfg.model) return null
+
+  // ── Backend proxy mode ────────────────────────────────────────────────────
+  // When the page is served from the Rust backend (/api/config returns an
+  // embedding endpoint), route through /api/llm/embed to avoid Mixed Content
+  // and CORS issues in HTTPS intranet deployments.
+  try {
+    const cfgRes = await fetch("/api/config")
+    if (cfgRes.ok) {
+      const serverCfg = await cfgRes.json()
+      if (serverCfg?.embedding?.endpoint) {
+        return fetchEmbeddingViaProxy(text, maxRetries)
+      }
+    }
+  } catch {
+    // /api/config not available (e.g. dev mode) — fall through to direct
+  }
+
+  // ── Direct mode (dev / Tauri desktop) ────────────────────────────────────
   if (!cfg.endpoint) return null
 
   const headers: Record<string, string> = { "Content-Type": "application/json" }
@@ -110,34 +129,21 @@ export async function fetchEmbedding(
         return null
       }
 
-      // Non-OK: try to read the body for an oversize hint.
       let bodyText = ""
-      try {
-        bodyText = await resp.text()
-      } catch {
-        // ignore — some servers return empty bodies on error
-      }
+      try { bodyText = await resp.text() } catch { /* ignore */ }
 
       if (looksLikeOversizeError(resp.status, bodyText)) {
-        // Can we still halve-and-retry? Need room on both axes:
-        // text not yet at the 64-char floor, and retry budget left.
         if (current.length > 64 && attempts <= maxRetries) {
           const prev = current.length
           current = current.slice(0, Math.floor(current.length / 2))
-          console.warn(
-            `[Embedding] auto-halving after HTTP ${resp.status} at ${prev} chars → retrying at ${current.length} chars (attempt ${attempts}/${maxRetries + 1})`,
-          )
+          console.warn(`[Embedding] auto-halving after HTTP ${resp.status} at ${prev} chars → retrying at ${current.length} chars (attempt ${attempts}/${maxRetries + 1})`)
           continue
         }
-        // Out of retries on a SERVER-oversize error — give the user a
-        // message that names the smallest size that still failed so
-        // they can tune Settings → Embedding accordingly.
         lastEmbeddingError = `Endpoint rejected input even at ${current.length} chars — server context smaller than expected. Lower Settings → Embedding → Max Chunk Chars (${bodyText.slice(0, 160)}).`
         console.warn(`[Embedding] ${lastEmbeddingError}`)
         return null
       }
 
-      // Non-oversize definitive failure (auth, rate limit, server down, …).
       lastEmbeddingError = `API ${resp.status} ${resp.statusText}${bodyText ? ` — ${bodyText.slice(0, 200)}` : ""} at ${cfg.endpoint}`
       console.warn(`[Embedding] ${lastEmbeddingError}`)
       return null
@@ -152,9 +158,76 @@ export async function fetchEmbedding(
     }
   }
 
-  // Exhausted retries (only reachable if every halving round triggered
-  // the retry branch and then the loop condition ended).
   lastEmbeddingError = `Embedding endpoint rejected every size down to ${current.length} chars — the server's context is smaller than ${current.length * 2}. Lower Settings → Embedding → Max Chunk Chars.`
+  console.warn(`[Embedding] ${lastEmbeddingError}`)
+  return null
+}
+
+/**
+ * Call /api/llm/embed (backend proxy) — avoids Mixed Content + CORS.
+ * Auto-halves on oversize errors, same as the direct path.
+ */
+async function fetchEmbeddingViaProxy(
+  text: string,
+  maxRetries = 3,
+): Promise<number[] | null> {
+  let current = text
+  let attempts = 0
+  while (attempts <= maxRetries) {
+    attempts++
+    try {
+      const resp = await fetch("/api/llm/embed", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ input: current }),
+      })
+
+      if (resp.ok) {
+        const data = await resp.json()
+        // OpenAI format: { data: [{ embedding: [...] }] }
+        const embedding = data?.data?.[0]?.embedding ?? null
+        if (embedding) {
+          lastEmbeddingError = null
+          return embedding
+        }
+        lastEmbeddingError = `Embedding proxy response missing data[0].embedding`
+        console.warn(`[Embedding] ${lastEmbeddingError}`)
+        return null
+      }
+
+      let bodyText = ""
+      try { bodyText = await resp.text() } catch { /* ignore */ }
+
+      if (resp.status === 503) {
+        // Not configured server-side
+        lastEmbeddingError = `Embedding not configured on server (set EMBEDDING_ENDPOINT env var).`
+        console.warn(`[Embedding] ${lastEmbeddingError}`)
+        return null
+      }
+
+      if (looksLikeOversizeError(resp.status, bodyText)) {
+        if (current.length > 64 && attempts <= maxRetries) {
+          const prev = current.length
+          current = current.slice(0, Math.floor(current.length / 2))
+          console.warn(`[Embedding] proxy auto-halving after HTTP ${resp.status} at ${prev} chars → ${current.length} chars`)
+          continue
+        }
+        lastEmbeddingError = `Embedding proxy rejected input even at ${current.length} chars.`
+        console.warn(`[Embedding] ${lastEmbeddingError}`)
+        return null
+      }
+
+      lastEmbeddingError = `Embedding proxy HTTP ${resp.status}: ${bodyText.slice(0, 200)}`
+      console.warn(`[Embedding] ${lastEmbeddingError}`)
+      return null
+    } catch (err) {
+      lastEmbeddingError = err instanceof Error ? err.message : String(err)
+      console.warn(`[Embedding] proxy error: ${lastEmbeddingError}`)
+      return null
+    }
+  }
+
+  lastEmbeddingError = `Embedding proxy rejected every size down to ${current.length} chars.`
   console.warn(`[Embedding] ${lastEmbeddingError}`)
   return null
 }
