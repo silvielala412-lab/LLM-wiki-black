@@ -45,10 +45,6 @@ export function WelcomeScreen({
             <Plus className="mr-2 h-4 w-4" />
             {t("welcome.newProject")}
           </Button>
-          <Button variant="outline" onClick={onOpenProject}>
-            <FolderOpen className="mr-2 h-4 w-4" />
-            {t("welcome.openProject")}
-          </Button>
         </div>
 
         {recentProjects.length > 0 && (

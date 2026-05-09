@@ -1,4 +1,4 @@
-﻿/**
+/**
  * HTTP API client — replaces @tauri-apps/api/core invoke().
  *
  * Every function mirrors the exact signature of the original Tauri
@@ -185,8 +185,11 @@ export async function uploadFiles(
 ): Promise<Array<{ path: string; name: string; size: number } | { error: string; name: string }>> {
   const fd = new FormData()
   for (const f of files) fd.append("files", f)
+  // Also include in body as fallback for servers that read multipart fields
   fd.append("destination_dir", destinationDir)
-  const res = await fetch(`${API_BASE}/upload/files`, { method: "POST", body: fd })
+  // Pass as query param so the backend always gets it before reading the body
+  const url = `${API_BASE}/upload/files?dest=${encodeURIComponent(destinationDir)}`
+  const res = await fetch(url, { method: "POST", body: fd })
   if (!res.ok) throw new Error(await res.text())
   return res.json()
 }

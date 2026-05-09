@@ -1,4 +1,4 @@
-﻿import { useState, useEffect, useCallback, useRef } from "react"
+import { useState, useEffect, useCallback, useRef } from "react"
 import { Plus, FileText, RefreshCw, BookOpen, Trash2, Folder, ChevronRight, ChevronDown } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { ScrollArea } from "@/components/ui/scroll-area"
@@ -33,6 +33,8 @@ export function SourcesView() {
   const llmConfig = useWikiStore((s) => s.llmConfig)
   const [sources, setSources] = useState<FileNode[]>([])
   const [importing, setImporting] = useState(false)
+  const [importStatus, setImportStatus] = useState<string | null>(null)
+  const [importError, setImportError] = useState<string | null>(null)
   const [ingestingPath, setIngestingPath] = useState<string | null>(null)
   /**
    * Path of the source-tree node currently in "click again to
@@ -76,7 +78,6 @@ export function SourcesView() {
 
   async function handleImport() {
     if (!project) return
-    // Web mode: trigger a hidden <input type="file"> instead of Tauri dialog
     const input = document.createElement("input")
     input.type = "file"
     input.multiple = true
@@ -85,21 +86,43 @@ export function SourcesView() {
       const files = Array.from(input.files ?? [])
       if (!files.length) return
       setImporting(true)
+      setImportError(null)
+      setImportStatus(`正在上传 ${files.length} 个文件...`)
       const pp = normalizePath(project.path)
       const destDir = `${pp}/raw/sources`
-      const { uploadFiles } = await import("@/commands/fs")
-      const results = await uploadFiles(files, destDir)
-      const importedPaths: string[] = results
-        .filter((r): r is { path: string; name: string; size: number } => "path" in r)
-        .map((r) => r.path)
-      setImporting(false)
-      await loadSources()
-      if (llmConfig.apiKey || llmConfig.provider === "ollama" || llmConfig.provider === "custom") {
-        for (const destPath of importedPaths) {
-          enqueueIngest(project.id, destPath).catch((err) =>
-            console.error(`Failed to enqueue ingest:`, err)
+      try {
+        const { uploadFiles } = await import("@/commands/fs")
+        const results = await uploadFiles(files, destDir)
+        const importedPaths: string[] = results
+          .filter((r): r is { path: string; name: string; size: number } => "path" in r)
+          .map((r) => r.path)
+        const errorCount = results.filter((r) => "error" in r).length
+        setImportStatus(
+          errorCount > 0
+            ? `上传完成：${importedPaths.length} 成功，${errorCount} 失败`
+            : `上传成功：${importedPaths.length} 个文件`
+        )
+        await loadSources()
+        // Trigger ingest: works whether key is local or server-managed (__SERVER_MANAGED__)
+        const canIngest = !!(llmConfig.apiKey || llmConfig.provider === "ollama" || llmConfig.provider === "custom")
+        if (canIngest && importedPaths.length > 0) {
+          setImportStatus(`正在排队解析 ${importedPaths.length} 个文件...`)
+          // Convert absolute server paths to relative sourcePaths for the queue
+          const tasks = importedPaths.map((absPath) => ({
+            sourcePath: absPath.startsWith(pp + "/") ? absPath.slice(pp.length + 1) : absPath,
+            folderContext: "",
+          }))
+          enqueueBatch(project.id, tasks).catch((err) =>
+            console.error(`Failed to enqueue batch:`, err)
           )
         }
+        setTimeout(() => setImportStatus(null), 4000)
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        setImportError(`上传失败: ${msg}`)
+        console.error("Upload failed:", err)
+      } finally {
+        setImporting(false)
       }
     }
     input.click()
@@ -107,29 +130,53 @@ export function SourcesView() {
 
   async function handleImportFolder() {
     if (!project) return
-    // Web mode: folder import not supported via browser security model
-    // Users should place folder on the server and use the server path
-    const folderPath = window.prompt("请输入要导入的文件夹路径（服务器上的绝对路径）：")
-    if (!folderPath || !folderPath.trim()) return
-    setImporting(true)
-    const pp = normalizePath(project.path)
-    const { copyDirectory } = await import("@/commands/fs")
-    try {
-      const copiedFiles = await copyDirectory(folderPath.trim(), `${pp}/raw/sources/${folderPath.trim().split(/[\/\\]/).pop() || "imported"}`)
-      setImporting(false)
-      await loadSources()
-      if (llmConfig.apiKey || llmConfig.provider === "ollama" || llmConfig.provider === "custom") {
-        const tasks = copiedFiles
-          .filter((fp) => ["md","mdx","txt","pdf","docx","pptx","xlsx","xls","csv","json","html"].includes(fp.split(".").pop()?.toLowerCase() ?? ""))
-          .map((filePath) => ({ filePath, folderContext: "" }))
-        if (tasks.length > 0) {
+    // webkitdirectory: browser picks a local folder, hands us all files inside.
+    const input = document.createElement("input")
+    input.type = "file"
+    // @ts-expect-error — webkitdirectory is not in TS types but works in all modern browsers
+    input.webkitdirectory = true
+    input.multiple = true
+    input.onchange = async () => {
+      const files = Array.from(input.files ?? [])
+      if (!files.length) return
+      setImporting(true)
+      setImportError(null)
+      setImportStatus(`正在上传文件夹 (${files.length} 个文件)...`)
+      const pp = normalizePath(project.path)
+      const destDir = `${pp}/raw/sources`
+      try {
+        const { uploadFiles } = await import("@/commands/fs")
+        // Pass files with their webkitRelativePath so the backend preserves
+        // the folder hierarchy (e.g. myfolder/sub/file.pdf → sources/myfolder/sub/file.pdf)
+        const results = await uploadFiles(files, destDir)
+        const importedPaths: string[] = results
+          .filter((r): r is { path: string; name: string; size: number } => "path" in r)
+          .map((r) => r.path)
+        const errorCount = results.filter((r) => "error" in r).length
+        setImportStatus(
+          errorCount > 0
+            ? `上传完成：${importedPaths.length} 成功，${errorCount} 失败`
+            : `上传成功：${importedPaths.length} 个文件`
+        )
+        await loadSources()
+        const canIngest = !!(llmConfig.apiKey || llmConfig.provider === "ollama" || llmConfig.provider === "custom")
+        if (canIngest && importedPaths.length > 0) {
+          setImportStatus(`正在排队解析 ${importedPaths.length} 个文件...`)
+          const tasks = importedPaths.map((absPath) => ({
+            sourcePath: absPath.startsWith(pp + "/") ? absPath.slice(pp.length + 1) : absPath,
+            folderContext: "",
+          }))
           enqueueBatch(project.id, tasks).catch((err) => console.error("enqueueBatch failed:", err))
         }
+        setTimeout(() => setImportStatus(null), 4000)
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        setImportError(`上传失败: ${msg}`)
+      } finally {
+        setImporting(false)
       }
-    } catch (err) {
-      console.error("Folder import failed:", err)
-      setImporting(false)
     }
+    input.click()
   }
 
   async function handleOpenSource(node: FileNode) {
@@ -400,15 +447,29 @@ export function SourcesView() {
             <RefreshCw className="h-4 w-4" />
           </Button>
           <Button size="sm" onClick={handleImport} disabled={importing}>
-            <Plus className="mr-1 h-4 w-4" />
-            {importing ? t("sources.importing") : t("sources.import")}
+            {importing ? (
+              <><RefreshCw className="mr-1 h-4 w-4 animate-spin" />上传中...</>
+            ) : (
+              <><Plus className="mr-1 h-4 w-4" />{t("sources.import")}</>
+            )}
           </Button>
-          <Button size="sm" onClick={handleImportFolder} disabled={importing}>
-            <Plus className="mr-1 h-4 w-4" />
-            {t("sources.importFolder", "Folder")}
+          <Button size="sm" variant="outline" onClick={handleImportFolder} disabled={importing}>
+            <Folder className="mr-1 h-4 w-4" />
+            Folder
           </Button>
         </div>
       </div>
+
+      {/* Upload status bar */}
+      {(importStatus || importError) && (
+        <div className={`px-4 py-2 text-xs border-b ${
+          importError
+            ? "bg-destructive/10 text-destructive"
+            : "bg-blue-500/10 text-blue-700 dark:text-blue-300"
+        }`}>
+          {importError ?? importStatus}
+        </div>
+      )}
 
       <ScrollArea className="flex-1">
         {sources.length === 0 ? (
@@ -421,8 +482,8 @@ export function SourcesView() {
                 {t("sources.importFiles")}
               </Button>
               <Button variant="outline" size="sm" onClick={handleImportFolder}>
-                <Plus className="mr-1 h-4 w-4" />
-                Folder
+                <Folder className="mr-1 h-4 w-4" />
+                导入文件夹
               </Button>
             </div>
           </div>
@@ -446,6 +507,8 @@ export function SourcesView() {
       <div className="border-t px-4 py-2 text-xs text-muted-foreground">
         {t("sources.sourceCount", { count: countFiles(sources) })}
       </div>
+
+      {/* Server folder browser modal - REMOVED, using webkitdirectory instead */}
     </div>
   )
 }

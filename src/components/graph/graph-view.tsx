@@ -450,6 +450,18 @@ export function GraphView() {
     return () => observer.disconnect()
   }, [isResizing])
 
+  // 3. Remount sigma when the tab becomes visible again — WebGL context
+  // may have been lost while the page was hidden (browser power saving).
+  useEffect(() => {
+    const handleVisibility = () => {
+      if (document.visibilityState === "visible") {
+        setSigmaKey((k) => k + 1)
+      }
+    }
+    document.addEventListener("visibilitychange", handleVisibility)
+    return () => document.removeEventListener("visibilitychange", handleVisibility)
+  }, [])
+
   // Count nodes by type for legend
   const typeCounts = nodes.reduce<Record<string, number>>((acc, n) => {
     acc[n.type] = (acc[n.type] ?? 0) + 1
@@ -479,7 +491,10 @@ export function GraphView() {
       <div className="flex h-full flex-col items-center justify-center gap-3 text-muted-foreground">
         <Network className="h-10 w-10 opacity-30" />
         <p className="text-sm text-destructive">{error}</p>
-        <Button variant="outline" size="sm" onClick={loadGraph}>Retry</Button>
+        <div className="flex gap-2">
+          <Button variant="outline" size="sm" onClick={loadGraph}>Retry</Button>
+          <Button variant="ghost" size="sm" onClick={() => { setSigmaKey(k => k + 1); setError(null) }}>Reset Canvas</Button>
+        </div>
       </div>
     )
   }

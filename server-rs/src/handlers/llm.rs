@@ -18,7 +18,7 @@ use axum::{
     Json,
     body::Body,
 };
-use futures_util::StreamExt;
+use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -138,10 +138,11 @@ pub async fn stream_chat(
             .into_response();
     }
 
-    // Stream the SSE bytes straight through to the client
-    let stream = upstream.bytes_stream().map(|result| {
-        result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
-    });
+    // Stream the SSE bytes straight through to the client.
+    // map_err converts reqwest::Error → std::io::Error for Body::from_stream.
+    let stream = upstream
+        .bytes_stream()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
 
     Response::builder()
         .status(StatusCode::OK)
