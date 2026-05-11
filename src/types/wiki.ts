@@ -4,6 +4,35 @@ export interface WikiProject {
   id: string
   name: string
   path: string
+  /** Optional per-project knowledge chunking customization */
+  chunking?: ChunkingConfig
+}
+
+/** Per-project knowledge chunking preferences.
+ *  Stored in .llm-wiki/project.json under the "chunking" key.
+ */
+export interface ChunkingConfig {
+  /** Master toggle — when false, all other fields are ignored */
+  enabled: boolean
+  /** Knowledge granularity: how finely to slice concepts into pages */
+  granularity: "fine" | "standard" | "coarse"
+  /** Writing style for generated wiki pages */
+  style: "academic" | "engineering" | "bullet_points" | "narrative"
+  /** Whether each knowledge concept MUST include a code/usage example */
+  include_examples: boolean
+  /** Whether to include citation/reference annotations */
+  include_references: boolean
+  /** Free-text user instruction appended to the LLM system prompt */
+  custom_instruction: string
+}
+
+export const DEFAULT_CHUNKING_CONFIG: ChunkingConfig = {
+  enabled: false,
+  granularity: "standard",
+  style: "engineering",
+  include_examples: false,
+  include_references: false,
+  custom_instruction: "",
 }
 
 export interface FileNode {

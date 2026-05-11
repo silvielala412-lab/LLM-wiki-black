@@ -1,8 +1,9 @@
-﻿import { useState, useEffect } from "react"
+import { useState, useEffect } from "react"
 import i18n from "@/i18n"
 import { useWikiStore } from "@/stores/wiki-store"
 import { useReviewStore } from "@/stores/review-store"
 import { useChatStore } from "@/stores/chat-store"
+import { useAuthStore } from "@/stores/auth-store"
 import { listDirectory, openProject } from "@/commands/fs"
 import { getLastProject, getRecentProjects, saveLastProject, loadLlmConfig, loadLanguage, loadSearchApiConfig, loadEmbeddingConfig, loadMultimodalConfig, loadOutputLanguage, loadProviderConfigs, loadActivePresetId } from "@/lib/project-store"
 import { loadReviewItems, loadChatHistory } from "@/lib/persist"
@@ -11,6 +12,7 @@ import { startClipWatcher } from "@/lib/clip-watcher"
 import { AppLayout } from "@/components/layout/app-layout"
 import { WelcomeScreen } from "@/components/project/welcome-screen"
 import { CreateProjectDialog } from "@/components/project/create-project-dialog"
+import { AuthPage } from "@/components/auth/auth-page"
 import type { WikiProject } from "@/types/wiki"
 
 function App() {
@@ -21,6 +23,11 @@ function App() {
   const setActiveView = useWikiStore((s) => s.setActiveView)
   const [showCreateDialog, setShowCreateDialog] = useState(false)
   const [loading, setLoading] = useState(true)
+
+  const { user, isLoading: authLoading, checkSession } = useAuthStore()
+
+  // Check auth session on mount
+  useEffect(() => { checkSession() }, [])
 
   // Set up auto-save and clip watcher once on mount
   useEffect(() => {
@@ -340,6 +347,20 @@ function App() {
     setProject(null)
     setFileTree([])
     setSelectedFile(null)
+  }
+
+  // Show loading spinner while checking auth
+  if (authLoading) {
+    return (
+      <div className="flex h-screen items-center justify-center bg-[#0a0a0f] text-white/40">
+        <div className="h-5 w-5 animate-spin rounded-full border-2 border-white/20 border-t-white/60" />
+      </div>
+    )
+  }
+
+  // Auth gate — show login/register if not authenticated
+  if (!user) {
+    return <AuthPage />
   }
 
   if (loading) {

@@ -107,6 +107,7 @@
       "embedding": "向量嵌入",
       "multimodal": "图片描述",
       "webSearch": "网页搜索",
+      "knowledge": "知识切分",
       "output": "输出偏好",
       "interface": "界面",
       "about": "关于"

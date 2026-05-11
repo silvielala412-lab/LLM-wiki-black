@@ -10,6 +10,10 @@ import {
   X,
   Check,
   Trash2,
+  HelpCircle,
+  ShieldCheck,
+  ShieldAlert,
+  ShieldX,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { useReviewStore, type ReviewItem } from "@/stores/review-store"
@@ -290,6 +294,18 @@ function ReviewCard({
 }) {
   const config = typeConfig[item.type]
   const Icon = config.icon
+  const score = item.aiScore
+
+  // Confidence bar color and verdict icon
+  const verdictColor = !score ? "" :
+    score.verdict === "reliable" ? "text-emerald-500" :
+    score.verdict === "uncertain" ? "text-amber-500" : "text-red-500"
+  const verdictBarColor = !score ? "" :
+    score.verdict === "reliable" ? "bg-emerald-500" :
+    score.verdict === "uncertain" ? "bg-amber-500" : "bg-red-500"
+  const VerdictIcon = !score ? null :
+    score.verdict === "reliable" ? ShieldCheck :
+    score.verdict === "uncertain" ? ShieldAlert : ShieldX
 
   return (
     <div
@@ -311,6 +327,45 @@ function ReviewCard({
       </div>
 
       <p className="mb-3 text-xs text-muted-foreground">{item.description}</p>
+
+      {/* AI Score Panel */}
+      {score && (
+        <div className="mb-3 rounded-lg border border-border/60 bg-muted/30 p-2.5">
+          {/* Confidence bar */}
+          <div className="mb-2 flex items-center gap-2">
+            {VerdictIcon && <VerdictIcon className={`h-3.5 w-3.5 shrink-0 ${verdictColor}`} />}
+            <div className="flex-1">
+              <div className="mb-0.5 flex items-center justify-between">
+                <span className="text-[10px] font-medium text-muted-foreground uppercase tracking-wide">AI Confidence</span>
+                <span className={`text-[10px] font-semibold ${verdictColor}`}>
+                  {score.confidence}% · {score.verdict}
+                </span>
+              </div>
+              <div className="h-1 w-full overflow-hidden rounded-full bg-muted">
+                <div
+                  className={`h-full rounded-full transition-all ${verdictBarColor}`}
+                  style={{ width: `${score.confidence}%` }}
+                />
+              </div>
+            </div>
+          </div>
+          {/* Critique */}
+          {score.critique && (
+            <p className="mb-1.5 text-[11px] text-muted-foreground italic">{score.critique}</p>
+          )}
+          {/* Questions */}
+          {score.questions.length > 0 && (
+            <div className="flex flex-col gap-0.5">
+              {score.questions.map((q, i) => (
+                <div key={i} className="flex items-start gap-1 text-[11px] text-muted-foreground">
+                  <HelpCircle className="mt-0.5 h-3 w-3 shrink-0 text-amber-500" />
+                  <span>{q}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
       {item.affectedPages && item.affectedPages.length > 0 && (
         <div className="mb-3 text-xs text-muted-foreground">

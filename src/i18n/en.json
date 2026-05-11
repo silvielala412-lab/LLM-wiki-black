@@ -107,6 +107,7 @@
       "embedding": "Embeddings",
       "multimodal": "Image Captioning",
       "webSearch": "Web Search",
+      "knowledge": "Knowledge",
       "output": "Output",
       "interface": "Interface",
       "about": "About"

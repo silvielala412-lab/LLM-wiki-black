@@ -17,6 +17,7 @@ import { isImagePdf, ocrImagePdf } from "@/lib/pdf-ocr"
 import { buildVisionLlmConfig } from "@/lib/server-config"
 import { loadExistingEntities, normalizeEntityBlock } from "@/lib/entity-normalizer"
 import type { MultimodalConfig } from "@/stores/wiki-store"
+import type { ChunkingConfig } from "@/types/wiki"
 
 /**
  * Resolve the LLM config that the caption pipeline should use.
@@ -282,6 +283,8 @@ async function autoIngestImpl(
 ): Promise<string[]> {
   const pp = normalizePath(projectPath)
   const sp = normalizePath(sourcePath)
+  // Read chunking config from active project (if any)
+  const chunking = useWikiStore.getState().project?.chunking
   const activity = useActivityStore.getState()
   const fileName = getFileName(sp)
   console.log(`[ingest:diag] autoIngestImpl ENTRY for "${fileName}" (project="${pp}", source="${sp}")`)
@@ -552,7 +555,7 @@ async function autoIngestImpl(
   await streamChat(
     llmConfig,
     [
-      { role: "system", content: buildAnalysisPrompt(purpose, index, truncatedContent) },
+      { role: "system", content: buildAnalysisPrompt(purpose, index, truncatedContent, chunking) },
       { role: "user", content: `Analyze this source document:\n\n**File:** ${fileName}${folderContext ? `\n**Folder context:** ${folderContext}` : ""}\n\n---\n\n${truncatedContent}` },
     ],
     {
@@ -583,7 +586,7 @@ async function autoIngestImpl(
   await streamChat(
     llmConfig,
     [
-      { role: "system", content: buildGenerationPrompt(schema, purpose, index, fileName, overview, truncatedContent) },
+      { role: "system", content: buildGenerationPrompt(schema, purpose, index, fileName, overview, truncatedContent, chunking) },
       {
         role: "user",
         content: [
@@ -701,6 +704,86 @@ async function autoIngestImpl(
   const reviewItems = parseReviewBlocks(generation, sp)
   if (reviewItems.length > 0) {
     useReviewStore.getState().addItems(reviewItems)
+  }
+
+  // ── Step 4.5: AI Quality Scoring ────────────────────────────────
+  // For each review item, fire a lightweight (non-streaming) LLM call
+  // to score confidence, generate a critique and questions.
+  // Runs async and non-blocking — failures are silent.
+  if (reviewItems.length > 0 && !signal?.aborted) {
+    ;(async () => {
+      try {
+        const store = useReviewStore.getState()
+        // Find the IDs that were just added (most recent ones in store)
+        const allItems = store.items
+        const addedIds = allItems
+          .filter((it) => !it.resolved && reviewItems.some((ri) => ri.title === it.title))
+          .map((it) => it.id)
+
+        for (const itemId of addedIds) {
+          if (signal?.aborted) break
+          const item = useReviewStore.getState().items.find((it) => it.id === itemId)
+          if (!item) continue
+
+          let scoreRaw = ""
+          await streamChat(
+            llmConfig,
+            [
+              {
+                role: "system",
+                content: [
+                  "你是一位知识质量审核专家。请评估以下 Wiki 审阅条目。",
+                  "只输出一个 JSON 对象（不要加 markdown 代码块），格式如下：",
+                  '{ "confidence": <0-100>, "critique": "<1-2句中文评价>", "questions": ["<问题1>","<问题2>","<问题3>"], "verdict": "reliable"|"uncertain"|"questionable" }',
+                  "confidence说明：80-100=可靠，50-79=存疑，0-49=有问题",
+                ].join("\n"),
+              },
+              {
+                role: "user",
+                content: `Type: ${item.type}\nTitle: ${item.title}\nDescription: ${item.description}`,
+              },
+            ],
+            {
+              onToken: (t) => { scoreRaw += t },
+              onDone: () => {
+                try {
+                  // Strip any markdown code fences if LLM adds them
+                  const clean = scoreRaw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim()
+                  const parsed = JSON.parse(clean)
+                  const verdict =
+                    parsed.confidence >= 80 ? "reliable"
+                    : parsed.confidence >= 50 ? "uncertain"
+                    : "questionable"
+                  useReviewStore.setState((s) => ({
+                    items: s.items.map((it) =>
+                      it.id === itemId
+                        ? {
+                            ...it,
+                            aiScore: {
+                              confidence: Math.max(0, Math.min(100, Number(parsed.confidence) || 0)),
+                              critique: String(parsed.critique || ""),
+                              questions: Array.isArray(parsed.questions) ? parsed.questions.slice(0, 3).map(String) : [],
+                              verdict: (["reliable", "uncertain", "questionable"].includes(parsed.verdict)
+                                ? parsed.verdict : verdict) as "reliable" | "uncertain" | "questionable",
+                            },
+                          }
+                        : it
+                    ),
+                  }))
+                } catch {
+                  // Invalid JSON from LLM — ignore silently
+                }
+              },
+              onError: () => { /* silent */ },
+            },
+            signal,
+            { temperature: 0.1, max_tokens: 200 },
+          )
+        }
+      } catch {
+        // Scoring is non-critical
+      }
+    })()
   }
 
   // ── Step 5: Save to cache ───────────────────────────────────
@@ -977,11 +1060,13 @@ function parseReviewBlocks(
  * Step 1 prompt: AI reads the source and produces a structured analysis.
  * This is the "discussion" step — the AI reasons about the source before writing wiki pages.
  */
-export function buildAnalysisPrompt(purpose: string, index: string, sourceContent: string = ""): string {
+export function buildAnalysisPrompt(purpose: string, index: string, sourceContent: string = "", chunking?: ChunkingConfig): string {
   return [
     "You are an expert research analyst. Read the source document and produce a structured analysis.",
     "",
     languageRule(sourceContent),
+    "",
+    buildChunkingDirective(chunking),
     "",
     "Your analysis should cover:",
     "",
@@ -1024,10 +1109,33 @@ export function buildAnalysisPrompt(purpose: string, index: string, sourceConten
   ].filter(Boolean).join("\n")
 }
 
+/** Build a chunking directive string from user preferences (appended to both prompts). */
+function buildChunkingDirective(cfg?: ChunkingConfig): string {
+  if (!cfg?.enabled) return ""
+  const lines = ["## User Knowledge Chunking Preferences", "Apply these preferences when structuring the output:"]
+  const granularityMap = {
+    fine: "Break knowledge into FINE-GRAINED atomic concepts — one single idea, method or fact per wiki page.",
+    standard: "Use standard granularity — balanced topics per wiki page (default).",
+    coarse: "Use COARSE granularity — group related concepts into larger topic clusters per page.",
+  }
+  const styleMap = {
+    engineering: "Writing style: engineering-focused — practical, concise, with emphasis on how-to and implementation.",
+    academic: "Writing style: academic — formal language, include methodology context and cite evidence.",
+    bullet_points: "Writing style: bullet-point-heavy — use structured lists, minimize prose.",
+    narrative: "Writing style: narrative — flowing prose, story-driven explanations.",
+  }
+  lines.push(`- Granularity: ${granularityMap[cfg.granularity]}`)
+  lines.push(`- Style: ${styleMap[cfg.style]}`)
+  if (cfg.include_examples) lines.push("- REQUIRED: Every concept or entity page MUST include a concrete code or usage example.")
+  if (cfg.include_references) lines.push("- REQUIRED: Include inline source citations/references in each page (e.g. [Source: filename]).")
+  if (cfg.custom_instruction.trim()) lines.push(`- User instruction: ${cfg.custom_instruction.trim()}`)
+  return lines.join("\n")
+}
+
 /**
  * Step 2 prompt: AI takes its own analysis and generates wiki files + review items.
  */
-export function buildGenerationPrompt(schema: string, purpose: string, index: string, sourceFileName: string, overview?: string, sourceContent: string = ""): string {
+export function buildGenerationPrompt(schema: string, purpose: string, index: string, sourceFileName: string, overview?: string, sourceContent: string = "", chunking?: ChunkingConfig): string {
   // Use original filename (without extension) as the source summary page name
   const sourceBaseName = sourceFileName.replace(/\.[^.]+$/, "")
 
@@ -1035,6 +1143,8 @@ export function buildGenerationPrompt(schema: string, purpose: string, index: st
     "You are a wiki maintainer. Based on the analysis provided, generate wiki files.",
     "",
     languageRule(sourceContent),
+    "",
+    buildChunkingDirective(chunking),
     "",
     `## IMPORTANT: Source File`,
     `The original source file is: **${sourceFileName}**`,

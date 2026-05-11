@@ -18,6 +18,13 @@ export interface ReviewItem {
   resolved: boolean
   resolvedAction?: string
   createdAt: number
+  /** AI quality score — populated asynchronously after ingest */
+  aiScore?: {
+    confidence: number       // 0-100
+    critique: string         // 1-2 sentence AI assessment
+    questions: string[]      // up to 3 questions worth investigating
+    verdict: "reliable" | "uncertain" | "questionable"
+  }
 }
 
 interface ReviewState {

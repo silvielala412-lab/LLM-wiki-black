@@ -7,6 +7,7 @@ import {
   Palette,
   Info,
   Image as ImageIcon,
+  Sliders,
 } from "lucide-react"
 import { useTranslation } from "react-i18next"
 import i18n from "@/i18n"
@@ -23,12 +24,16 @@ import { WebSearchSection } from "./sections/web-search-section"
 import { OutputSection } from "./sections/output-section"
 import { InterfaceSection } from "./sections/interface-section"
 import { AboutSection } from "./sections/about-section"
+import { ChunkingSection } from "./sections/chunking-section"
+import type { ChunkingConfig } from "@/types/wiki"
+import { DEFAULT_CHUNKING_CONFIG } from "@/types/wiki"
 
 type CategoryId =
   | "llm"
   | "embedding"
   | "multimodal"
   | "web-search"
+  | "knowledge"
   | "output"
   | "interface"
   | "about"
@@ -47,6 +52,7 @@ const CATEGORIES: Category[] = [
   { id: "embedding", labelKey: "settings.categories.embedding", icon: Binary },
   { id: "multimodal", labelKey: "settings.categories.multimodal", icon: ImageIcon },
   { id: "web-search", labelKey: "settings.categories.webSearch", icon: Globe },
+  { id: "knowledge", labelKey: "settings.categories.knowledge", icon: Sliders },
   { id: "output", labelKey: "settings.categories.output", icon: Languages },
   { id: "interface", labelKey: "settings.categories.interface", icon: Palette },
   { id: "about", labelKey: "settings.categories.about", icon: Info },
@@ -104,8 +110,37 @@ export function SettingsView() {
   const setMultimodalConfig = useWikiStore((s) => s.setMultimodalConfig)
   const outputLanguage = useWikiStore((s) => s.outputLanguage)
   const setOutputLanguage = useWikiStore((s) => s.setOutputLanguage)
+  const project = useWikiStore((s) => s.project)
+  const setProject = useWikiStore((s) => s.setProject)
   const maxHistoryMessages = useChatStore((s) => s.maxHistoryMessages)
   const setMaxHistoryMessages = useChatStore((s) => s.setMaxHistoryMessages)
+
+  // Chunking config — live, saved immediately on change to project.json
+  const [chunkingConfig, setChunkingConfig] = useState<ChunkingConfig>(
+    () => project?.chunking ?? DEFAULT_CHUNKING_CONFIG
+  )
+  useEffect(() => {
+    setChunkingConfig(project?.chunking ?? DEFAULT_CHUNKING_CONFIG)
+  }, [project?.id])
+
+  async function handleChunkingChange(cfg: ChunkingConfig) {
+    setChunkingConfig(cfg)
+    if (!project) return
+    const updated = { ...project, chunking: cfg }
+    setProject(updated)
+    // Persist to .llm-wiki/project.json
+    try {
+      const { writeFile } = await import("@/commands/fs")
+      const cfgPath = `${project.path}/.llm-wiki/project.json`
+      const { readFile } = await import("@/commands/fs")
+      let raw: Record<string, unknown> = {}
+      try { raw = JSON.parse(await readFile(cfgPath)) } catch { /* new file */ }
+      await writeFile(cfgPath, JSON.stringify({ ...raw, chunking: cfg }, null, 2))
+    } catch (e) {
+      console.error("Failed to save chunking config:", e)
+    }
+  }
+
   // Drives the red dot next to the "About" row in the settings
   // sidebar. Uses `hasAvailableUpdate` (NOT `shouldShowUpdateBanner`)
   // so the indicator remains even after the user dismisses the
@@ -243,6 +278,24 @@ export function SettingsView() {
         return <MultimodalSection draft={draft} setDraft={setDraft} />
       case "web-search":
         return <WebSearchSection draft={draft} setDraft={setDraft} />
+      case "knowledge":
+        return (
+          <div className="flex flex-col gap-4">
+            <div>
+              <h2 className="text-base font-semibold">知识切分配置</h2>
+              <p className="text-sm text-muted-foreground mt-1">
+                自定义 AI 在导入文件时切分和组织知识的方式，配置对该项目后续所有导入生效。
+              </p>
+            </div>
+            {project ? (
+              <ChunkingSection config={chunkingConfig} onChange={handleChunkingChange} />
+            ) : (
+              <p className="rounded-lg border border-dashed p-4 text-sm text-muted-foreground">
+                请先打开一个项目，再配置知识切分选项。
+              </p>
+            )}
+          </div>
+        )
       case "output":
         return <OutputSection draft={draft} setDraft={setDraft} />
       case "interface":
@@ -250,7 +303,7 @@ export function SettingsView() {
       case "about":
         return <AboutSection />
     }
-  }, [active, draft, setDraft])
+  }, [active, draft, setDraft, chunkingConfig, project])
 
   return (
     <div className="flex h-full overflow-hidden">
@@ -309,10 +362,8 @@ export function SettingsView() {
           <div className="mx-auto max-w-2xl">{body}</div>
         </div>
 
-        {/* Global Save bar hidden for sections that persist inline:
-            - "llm" saves per-row on every edit (independent per-preset state)
-            - "about" has no editable fields */}
-        {active !== "about" && active !== "llm" && (
+        {/* Global Save bar — hidden for sections that manage their own persistence */}
+        {active !== "about" && active !== "llm" && active !== "knowledge" && (
           <div className="shrink-0 border-t bg-background/80 backdrop-blur px-8 py-3">
             <div className="mx-auto flex max-w-2xl items-center justify-between gap-4">
               <p className="text-xs text-muted-foreground">

@@ -95,6 +95,11 @@ async fn main() -> anyhow::Result<()> {
         // LLM / Embedding proxy (solves Mixed Content + CORS for HTTPS deployments)
         .route("/llm/stream", post(handlers::llm::stream_chat))
         .route("/llm/embed",  post(handlers::llm::embed))
+        // Auth (public — no JWT required)
+        .route("/auth/register", post(handlers::auth::register))
+        .route("/auth/login",    post(handlers::auth::login))
+        .route("/auth/logout",   post(handlers::auth::logout))
+        .route("/auth/me",       get(handlers::auth::me))
         .with_state(state);
 
     // SPA fallback — serve React app for all non-API routes
