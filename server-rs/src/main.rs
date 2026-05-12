@@ -2,6 +2,7 @@ use axum::{
     Router,
     routing::{get, post},
     http::Method,
+    extract::DefaultBodyLimit,
 };
 use tower_http::{
     cors::{CorsLayer, Any},
@@ -89,7 +90,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/vector/delete-page",    post(handlers::vector::delete_page))
         .route("/vector/count-chunks",   post(handlers::vector::count_chunks))
         .route("/vector/drop-legacy",    post(handlers::vector::drop_legacy))
-        // Upload
+        // Upload — allow up to 200 MB per request (axum default is 2 MB)
         .route("/upload/file",  post(handlers::upload::upload_file))
         .route("/upload/files", post(handlers::upload::upload_files))
         // LLM / Embedding proxy (solves Mixed Content + CORS for HTTPS deployments)
@@ -112,6 +113,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .nest("/api", api)
         .fallback_service(spa)
+        .layer(DefaultBodyLimit::max(200 * 1024 * 1024)) // 200 MB — covers large PDF uploads
         .layer(TraceLayer::new_for_http())
         .layer(cors);
 
