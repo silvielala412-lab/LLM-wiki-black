@@ -1,5 +1,4 @@
 import type { SearchApiConfig } from "@/stores/wiki-store"
-import { getHttpFetch, isFetchNetworkError } from "@/lib/tauri-fetch"
 
 export interface WebSearchResult {
   title: string
@@ -8,6 +7,17 @@ export interface WebSearchResult {
   source: string
 }
 
+/**
+ * Execute a web search via the backend proxy (/api/search/web).
+ *
+ * Why proxy instead of direct browser fetch?
+ *   1. CORS — Tavily / Perplexity may not whitelist the Wiki's origin.
+ *   2. Intranet deployments — the client browser is behind a firewall that
+ *      blocks public internet access, but the server has outbound routing.
+ *
+ * The Rust handler forwards the request server-side and returns the same
+ * normalized [{ title, url, snippet, source }] array so no callers change.
+ */
 export async function webSearch(
   query: string,
   config: SearchApiConfig,
@@ -17,132 +27,27 @@ export async function webSearch(
     throw new Error("Web search not configured. Add a search API key in Settings.")
   }
 
-  switch (config.provider) {
-    case "tavily":
-      return tavilySearch(query, config.apiKey, maxResults)
-    case "perplexity":
-      return perplexitySearch(query, config.apiKey, maxResults)
-    default:
-      throw new Error(`Unknown search provider: ${config.provider}`)
-  }
-}
-
-async function tavilySearch(
-  query: string,
-  apiKey: string,
-  maxResults: number,
-): Promise<WebSearchResult[]> {
-  // Route through the Tauri HTTP plugin so future non-Tavily search
-  // providers (Serper, Exa, Brave, Google CSE, ...) with less friendly
-  // CORS don't each need their own workaround. See tauri-fetch.ts.
-  const httpFetch = await getHttpFetch()
-  let response: Response
-  try {
-    response = await httpFetch("https://api.tavily.com/search", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        api_key: apiKey,
-        query,
-        max_results: maxResults,
-        search_depth: "advanced",
-        include_answer: false,
-      }),
-    })
-  } catch (err) {
-    if (isFetchNetworkError(err)) {
-      throw new Error(
-        "Network error reaching api.tavily.com. Check your connectivity and whether the Tavily API key is still valid.",
-      )
-    }
-    throw err
-  }
-
-  if (!response.ok) {
-    const errorText = await response.text().catch(() => "Unknown error")
-    throw new Error(`Tavily search failed (${response.status}): ${errorText}`)
-  }
-
-  const data = await response.json()
-
-  return (data.results ?? []).map((r: { title: string; url: string; content: string }) => ({
-    title: r.title ?? "Untitled",
-    url: r.url ?? "",
-    snippet: r.content ?? "",
-    source: new URL(r.url).hostname.replace("www.", ""),
-  }))
-}
-
-async function perplexitySearch(
-  query: string,
-  apiKey: string,
-  maxResults: number,
-): Promise<WebSearchResult[]> {
-  const httpFetch = await getHttpFetch()
-  let response: Response
-  try {
-    response = await httpFetch("https://api.perplexity.ai/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model: "sonar",
-        messages: [
-          {
-            role: "system",
-            content: "You are a search assistant. Answer concisely with facts. Include source URLs when available.",
-          },
-          { role: "user", content: query },
-        ],
-        max_tokens: 1024,
-        return_citations: true,
-        return_images: false,
-        search_recency_filter: "month",
-      }),
-    })
-  } catch (err) {
-    if (isFetchNetworkError(err)) {
-      throw new Error(
-        "Network error reaching api.perplexity.ai. Check your connectivity and API key.",
-      )
-    }
-    throw err
-  }
-
-  if (!response.ok) {
-    const errorText = await response.text().catch(() => "Unknown error")
-    throw new Error(`Perplexity search failed (${response.status}): ${errorText}`)
-  }
-
-  const data = await response.json()
-  const content: string = data?.choices?.[0]?.message?.content ?? ""
-  const citations: string[] = data?.citations ?? []
-
-  const results: WebSearchResult[] = []
-
-  if (content) {
-    results.push({
-      title: `Perplexity: ${query.slice(0, 60)}`,
-      url: citations[0] ?? "https://www.perplexity.ai",
-      snippet: content.slice(0, 800),
-      source: "perplexity.ai",
-    })
-  }
-
-  citations.slice(1, maxResults).forEach((url, i) => {
-    try {
-      results.push({
-        title: `Source ${i + 2}`,
-        url,
-        snippet: "",
-        source: new URL(url).hostname.replace("www.", ""),
-      })
-    } catch {
-      // skip malformed URLs
-    }
+  const res = await fetch("/api/search/web", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      provider: config.provider,
+      api_key: config.apiKey,
+      query,
+      max_results: maxResults,
+    }),
   })
 
-  return results.slice(0, maxResults)
+  if (!res.ok) {
+    const errorText = await res.text().catch(() => "Unknown error")
+    // Try to parse as JSON error message from the server
+    try {
+      const parsed = JSON.parse(errorText)
+      throw new Error(parsed.error ?? parsed.message ?? errorText)
+    } catch {
+      throw new Error(`Search failed (HTTP ${res.status}): ${errorText}`)
+    }
+  }
+
+  return res.json() as Promise<WebSearchResult[]>
 }

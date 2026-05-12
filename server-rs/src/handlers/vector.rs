@@ -114,7 +114,10 @@ pub async fn upsert_chunks(Json(body): Json<UpsertBody>) -> Result<Json<Value>> 
 
 pub async fn search_chunks(Json(body): Json<SearchBody>) -> Result<Json<Value>> {
     let db_path = db_path(&body.project_path);
-    let db = connect(&db_path).execute().await?;
+    let db = match connect(&db_path).execute().await {
+        Ok(d) => d,
+        Err(_) => return Ok(Json(json!([]))),
+    };
     let tbl = match db.open_table(TABLE).execute().await {
         Ok(t) => t,
         Err(_) => return Ok(Json(json!([]))),
@@ -151,18 +154,24 @@ pub async fn search_chunks(Json(body): Json<SearchBody>) -> Result<Json<Value>> 
 
 pub async fn delete_page(Json(body): Json<PagePathBody>) -> Result<Json<Value>> {
     let db_path = db_path(&body.project_path);
-    let db = connect(&db_path).execute().await?;
+    let db = match connect(&db_path).execute().await {
+        Ok(d) => d,
+        Err(_) => return Ok(Json(json!(0))),
+    };
     if let Ok(tbl) = db.open_table(TABLE).execute().await {
-        tbl.delete(&format!("page_path = '{}'", body.page_path)).await?;
+        let _ = tbl.delete(&format!("page_path = '{}'", body.page_path)).await;
     }
     Ok(Json(json!(0)))
 }
 
 pub async fn count_chunks(Json(body): Json<ProjectPathBody>) -> Result<Json<Value>> {
     let db_path = db_path(&body.project_path);
-    let db = connect(&db_path).execute().await?;
+    let db = match connect(&db_path).execute().await {
+        Ok(d) => d,
+        Err(_) => return Ok(Json(json!(0))),
+    };
     if let Ok(tbl) = db.open_table(TABLE).execute().await {
-        let n = tbl.count_rows(None).await?;
+        let n = tbl.count_rows(None).await.unwrap_or(0);
         return Ok(Json(json!(n)));
     }
     Ok(Json(json!(0)))
@@ -170,7 +179,8 @@ pub async fn count_chunks(Json(body): Json<ProjectPathBody>) -> Result<Json<Valu
 
 pub async fn drop_legacy(Json(body): Json<ProjectPathBody>) -> Result<Json<Value>> {
     let db_path = db_path(&body.project_path);
-    let db = connect(&db_path).execute().await?;
-    let _ = db.drop_table(TABLE, &[]).await;
+    if let Ok(db) = connect(&db_path).execute().await {
+        let _ = db.drop_table(TABLE, &[]).await;
+    }
     Ok(Json(json!(null)))
 }

@@ -400,19 +400,31 @@ async fn extract_pdf_content_async(path: &str, state: &AppState) -> anyhow::Resu
     }
 
     // ── Tier 2: pdf-extract (text-layer PDFs) ─────────────────────────
+    // Use catch_unwind to prevent pdf-extract panics (malformed PDFs can
+    // trigger internal assertions in the library) from killing the request.
     let path_owned = path.to_string();
     let bytes = tokio::fs::read(&path_owned).await
-        .map_err(|e| anyhow::anyhow!("Cannot read PDF: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("Cannot read PDF file '{}': {e}", path_owned))?;
 
     let text_result = tokio::task::spawn_blocking(move || {
-        pdf_extract::extract_text_from_mem(&bytes)
-    }).await?;
+        use std::panic::catch_unwind;
+        catch_unwind(|| pdf_extract::extract_text_from_mem(&bytes))
+    }).await;
 
     match text_result {
-        Ok(text) if !text.trim().is_empty() => {
+        Ok(Ok(Ok(text))) if !text.trim().is_empty() => {
             return Ok(text.trim().to_string());
         }
-        _ => {}
+        Ok(Ok(Err(e))) => {
+            tracing::warn!("pdf-extract failed for {path}: {e}, trying image fallback");
+        }
+        Ok(Err(_)) => {
+            tracing::warn!("pdf-extract panicked for {path} (malformed PDF?), trying image fallback");
+        }
+        Err(e) => {
+            tracing::warn!("spawn_blocking failed for {path}: {e}");
+        }
+        _ => {} // empty text → fall through to Tier 3
     }
 
     // ── Tier 3: pdftoppm → image pages marker ─────────────────────────

@@ -95,6 +95,8 @@ async fn main() -> anyhow::Result<()> {
         // LLM / Embedding proxy (solves Mixed Content + CORS for HTTPS deployments)
         .route("/llm/stream", post(handlers::llm::stream_chat))
         .route("/llm/embed",  post(handlers::llm::embed))
+        // Web search proxy (routes Tavily/Perplexity calls through the server)
+        .route("/search/web", post(handlers::search::web_search))
         // Auth (public — no JWT required)
         .route("/auth/register", post(handlers::auth::register))
         .route("/auth/login",    post(handlers::auth::login))
