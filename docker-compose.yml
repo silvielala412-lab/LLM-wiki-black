@@ -6,13 +6,13 @@ services:
     container_name: llm-wiki
     restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "8231:8231"
     volumes:
       # Wiki 数据持久化目录 — 请定期备份此目录
       - ./wiki-data:/data
     environment:
       APP_HOST: "0.0.0.0"
-      APP_PORT: "8000"
+      APP_PORT: "8231"
       WIKI_DATA_PATH: "/data"
       STATIC_DIR: "/app/dist"
       RUST_LOG: "info"
@@ -40,7 +40,7 @@ services:
       SERVER_CONFIG_LOCKED: "false"  # true=禁止用户在前端修改配置
 
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8000/api/health"]
+      test: ["CMD", "curl", "-sf", "http://localhost:8231/api/health"]
       interval: 30s
       timeout: 5s
       retries: 3
