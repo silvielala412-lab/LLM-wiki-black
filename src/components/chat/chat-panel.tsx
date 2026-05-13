@@ -7,13 +7,15 @@ import { useChatStore, chatMessagesToLLM } from "@/stores/chat-store"
 import { useWikiStore } from "@/stores/wiki-store"
 import { streamChat, type ChatMessage as LLMMessage } from "@/lib/llm-client"
 import { executeIngestWrites } from "@/lib/ingest"
-import { listDirectory, readFile, deleteFile } from "@/commands/fs"
+import { listDirectory, readFile, deleteFile, writeFile } from "@/commands/fs"
 import { searchWiki } from "@/lib/search"
 import { buildRetrievalGraph, getRelatedNodes } from "@/lib/graph-relevance"
 import { normalizePath, getFileName, getRelativePath } from "@/lib/path-utils"
 import { getOutputLanguage, buildLanguageReminder } from "@/lib/output-language"
 import { isGreeting } from "@/lib/greeting-detector"
 import { computeContextBudget } from "@/lib/context-budget"
+import { cascadeDeleteWikiPage } from "@/lib/wiki-page-delete"
+import { ConfirmDialog } from "@/components/ui/confirm-dialog"
 
 // Store the page mapping from the last query so SourceFilesBar can show which pages were cited
 export let lastQueryPages: { title: string; path: string }[] = []
@@ -145,6 +147,28 @@ export function ChatPanel() {
   const abortRef = useRef<AbortController | null>(null)
   const scrollContainerRef = useRef<HTMLDivElement>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
+
+  // State for chat-triggered page deletions (supports batch)
+  const [pendingChatDeletes, setPendingChatDeletes] = useState<{ name: string; path: string }[]>([])
+
+  const handleChatDeleteConfirm = useCallback(async () => {
+    if (pendingChatDeletes.length === 0 || !project) return
+    const pp = normalizePath(project.path)
+    for (const item of pendingChatDeletes) {
+      try {
+        await cascadeDeleteWikiPage(pp, item.path)
+      } catch (err) {
+        console.error('[ChatPanel] Chat delete failed:', item.path, err)
+      }
+    }
+    try {
+      const tree = await listDirectory(pp)
+      useWikiStore.getState().setFileTree(tree)
+      useWikiStore.getState().bumpDataVersion()
+      useWikiStore.getState().setSelectedFile(null)
+    } catch {}
+    setPendingChatDeletes([])
+  }, [pendingChatDeletes, project])
 
   // Auto-scroll to bottom when messages change or streaming content updates
   useEffect(() => {
@@ -323,6 +347,17 @@ export function ChatPanel() {
             "",
             "Use markdown formatting for clarity.",
             "",
+            "",
+            "## Wiki Management Actions",
+            "If the user explicitly asks to DELETE a wiki page, output this action tag at the end of your reply:",
+            "  <!-- action:delete page=\"page-name\" path=\"wiki/entities/page-name.md\" -->",
+            "Always warn the user about consequences BEFORE outputting the action tag.",
+            "",
+            "If the user asks to CREATE a new wiki page, output a FILE block:",
+            '  ---FILE: wiki/entities/<name>.md---',
+            '  (YAML frontmatter + markdown content)',
+            '  ---END FILE---',
+            "",
             purpose ? `## Wiki Purpose\n${purpose}` : "",
             index ? `## Wiki Index\n${index}` : "",
             relevantPages.length > 0 ? `## Page List\n${pageList}` : "",
@@ -388,10 +423,40 @@ export function ChatPanel() {
             accumulated += token
             appendStreamToken(token)
           },
-          onDone: () => {
+          onDone: async () => {
             finalizeStream(accumulated, queryRefs)
             abortRef.current = null
-            // save-worthy detection removed — user has direct "Save to Wiki" button on each message
+            // Parse action tags from LLM response
+            if (project) {
+              const pp = normalizePath(project.path)
+              // Handle delete actions — supports multiple tags in one response
+              const deleteTagRe = /<!-- action:delete\s+page="([^"]+)"\s+path="([^"]+)"\s*-->/g
+              const deleteItems: { name: string; path: string }[] = []
+              for (const m of accumulated.matchAll(deleteTagRe)) {
+                deleteItems.push({ name: m[1], path: `${pp}/${m[2]}` })
+              }
+              if (deleteItems.length > 0) {
+                setPendingChatDeletes(deleteItems)
+              }
+              // Handle create action (FILE blocks)
+              const fileBlockMatch = accumulated.match(/---FILE:\s*(.+?)\s*---\n([\s\S]*?)---END FILE---/)
+              if (fileBlockMatch) {
+                const relPath = fileBlockMatch[1].trim()
+                let fileContent = fileBlockMatch[2]
+                // Inject provenance if not present
+                if (!fileContent.includes('ingested_by:')) {
+                  fileContent = fileContent.replace('---\n\n', `ingested_at: "${new Date().toISOString()}"\ningested_by: "chat"\n---\n\n`)
+                }
+                try {
+                  await writeFile(`${pp}/${relPath}`, fileContent)
+                  const tree = await listDirectory(pp)
+                  useWikiStore.getState().setFileTree(tree)
+                  useWikiStore.getState().bumpDataVersion()
+                } catch (err) {
+                  console.error('[ChatPanel] Create page from chat failed:', err)
+                }
+              }
+            }
           },
           onError: (err) => {
             finalizeStream(`Error: ${err.message}`, undefined)
@@ -401,7 +466,7 @@ export function ChatPanel() {
         controller.signal,
       )
     },
-    [llmConfig, addMessage, setStreaming, appendStreamToken, finalizeStream, createConversation, maxHistoryMessages],
+    [llmConfig, addMessage, setStreaming, appendStreamToken, finalizeStream, createConversation, maxHistoryMessages, project],
   )
 
   const handleStop = useCallback(() => {
@@ -518,6 +583,22 @@ export function ChatPanel() {
           }
         />
       </div>
+
+      {/* Batch delete confirmation dialog for chat-triggered deletions */}
+      <ConfirmDialog
+        open={pendingChatDeletes.length > 0}
+        title={pendingChatDeletes.length === 1 ? "确认删除此页面？" : `确认删除 ${pendingChatDeletes.length} 个页面？`}
+        description={
+          pendingChatDeletes.length === 1
+            ? `AI 建议删除「${pendingChatDeletes[0]?.name}」。此操作将永久删除该页面及其向量索引，不可撤销。`
+            : `AI 建议删除以下 ${pendingChatDeletes.length} 个页面（永久删除，不可撤销）：\n${pendingChatDeletes.map(d => `• ${d.name}`).join('\n')}`
+        }
+        confirmLabel={pendingChatDeletes.length === 1 ? "确认删除" : `确认删除 ${pendingChatDeletes.length} 项`}
+        cancelLabel="取消"
+        variant="destructive"
+        onConfirm={handleChatDeleteConfirm}
+        onCancel={() => setPendingChatDeletes([])}
+      />
     </div>
   )
 }

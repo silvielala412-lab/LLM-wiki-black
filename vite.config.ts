@@ -29,7 +29,7 @@ export default defineConfig(async () => ({
     strictPort: true,
     host: host || "127.0.0.1",
     hmr: host ? { protocol: "ws", host, port: 3001 } : undefined,
-    watch: { ignored: ["**/src-tauri/**"] },
+    watch: { ignored: ["**/src-tauri/**", "**/wiki-data/**", "**/.runtime/**"] },
     // Web mode: proxy /api → FastAPI backend running on :8000
     proxy: {
       "/api": {

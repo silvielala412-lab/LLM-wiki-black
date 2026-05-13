@@ -187,6 +187,8 @@ async function executeResearch(
       `created: ${date}`,
       `origin: deep-research`,
       `tags: [research]`,
+      `ingested_at: "${new Date().toISOString()}"`,
+      `ingested_by: "deep-research"`,
       "---",
       "",
       `# Research: ${topic}`,

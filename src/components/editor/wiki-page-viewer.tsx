@@ -14,11 +14,14 @@ import ReactMarkdown from "react-markdown"
 import remarkGfm from "remark-gfm"
 import remarkMath from "remark-math"
 import rehypeKatex from "rehype-katex"
-import { Pencil } from "lucide-react"
+import { Pencil, Trash2, Plus } from "lucide-react"
 import { useWikiStore } from "@/stores/wiki-store"
 import { resolveMarkdownImageSrc } from "@/lib/markdown-image-resolver"
 import type { FileNode } from "@/types/wiki"
 import { normalizePath } from "@/lib/path-utils"
+import { cascadeDeleteWikiPage } from "@/lib/wiki-page-delete"
+import { listDirectory, writeFile } from "@/commands/fs"
+import { ConfirmDialog } from "@/components/ui/confirm-dialog"
 
 // ── Type icons & colours ─────────────────────────────────────────────────────
 
@@ -40,12 +43,15 @@ interface Frontmatter {
   sources: string[]
   created: string
   updated: string
+  ingested_at: string
+  ingested_by: string
+  ingested_by_user: string
 }
 
 function parseFrontmatter(content: string): { fm: Frontmatter; body: string } {
   const fm: Frontmatter = {
     title: "", type: "default", tags: [], related: [], sources: [],
-    created: "", updated: "",
+    created: "", updated: "", ingested_at: "", ingested_by: "", ingested_by_user: "",
   }
 
   const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/m)
@@ -293,6 +299,7 @@ interface WikiPageViewerProps {
   filePath: string
   content: string
   onEditRequest: () => void
+  onDeleteComplete?: () => void
 }
 
 /** Recursively flatten a FileNode tree into a list of file paths (forward-slash). */
@@ -337,10 +344,15 @@ function findWikiPage(name: string, allPaths: string[]): string | null {
   return null
 }
 
-export function WikiPageViewer({ filePath, content, onEditRequest }: WikiPageViewerProps) {
+export function WikiPageViewer({ filePath, content, onEditRequest, onDeleteComplete }: WikiPageViewerProps) {
   const projectPath = useWikiStore(s => s.project?.path ?? null)
   const fileTree = useWikiStore(s => s.fileTree)
   const setSelectedFile = useWikiStore(s => s.setSelectedFile)
+  const setFileTree = useWikiStore(s => s.setFileTree)
+  const bumpDataVersion = useWikiStore(s => s.bumpDataVersion)
+
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
+  const [showCreateMenu, setShowCreateMenu] = useState(false)
 
   const { fm, sections } = useMemo(() => {
     const { fm, body } = parseFrontmatter(content)
@@ -365,6 +377,64 @@ export function WikiPageViewer({ filePath, content, onEditRequest }: WikiPageVie
     setSelectedFile(path)
   }, [setSelectedFile])
 
+  // ── Delete handler ──
+  const handleDeleteConfirm = useCallback(async () => {
+    if (!projectPath) return
+    setShowDeleteConfirm(false)
+    try {
+      await cascadeDeleteWikiPage(projectPath, filePath)
+      // Refresh file tree
+      const tree = await listDirectory(normalizePath(projectPath))
+      setFileTree(tree)
+      bumpDataVersion()
+      setSelectedFile(null)
+      onDeleteComplete?.()
+    } catch (err) {
+      console.error("[WikiPageViewer] Delete failed:", err)
+    }
+  }, [projectPath, filePath, setFileTree, bumpDataVersion, setSelectedFile, onDeleteComplete])
+
+  // ── Create page handler ──
+  const handleCreatePage = useCallback(async (type: "entity" | "concept") => {
+    if (!projectPath) return
+    setShowCreateMenu(false)
+    const name = prompt(type === "entity" ? "输入实体名称:" : "输入概念名称:")
+    if (!name?.trim()) return
+    const slug = name.trim().toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff\s-]/g, "").replace(/\s+/g, "-")
+    const dir = type === "entity" ? "entities" : "concepts"
+    const pp = normalizePath(projectPath)
+    const pagePath = `${pp}/wiki/${dir}/${slug || name.trim()}.md`
+    const now = new Date()
+    const dateStr = now.toISOString().slice(0, 10)
+    const template = [
+      "---",
+      `type: ${type}`,
+      `title: "${name.trim()}"`,
+      `created: ${dateStr}`,
+      `updated: ${dateStr}`,
+      `tags: []`,
+      `related: []`,
+      `sources: ["手动创建"]`,
+      `ingested_at: "${now.toISOString()}"`,
+      `ingested_by: "manual"`,
+      "---",
+      "",
+      `# ${name.trim()}`,
+      "",
+      "（在此编写内容）",
+      "",
+    ].join("\n")
+    try {
+      await writeFile(pagePath, template)
+      const tree = await listDirectory(pp)
+      setFileTree(tree)
+      bumpDataVersion()
+      setSelectedFile(pagePath)
+    } catch (err) {
+      console.error("[WikiPageViewer] Create failed:", err)
+    }
+  }, [projectPath, setFileTree, bumpDataVersion, setSelectedFile])
+
   return (
     <div
       style={{
@@ -376,22 +446,104 @@ export function WikiPageViewer({ filePath, content, onEditRequest }: WikiPageVie
     >
       <div style={{ maxWidth: 820, margin: "0 auto", padding: "28px 36px 48px" }}>
 
-        {/* ── Top bar: Edit button ── */}
-        <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 16 }}>
-          <button
-            onClick={onEditRequest}
-            style={{
-              display: "flex", alignItems: "center", gap: 5,
-              padding: "4px 12px", borderRadius: 5, fontSize: 11,
-              background: "#F5F6F8", border: "1px solid #E2E5EA",
-              color: "#4A5060", cursor: "pointer", transition: "background 0.15s",
-            }}
-            onMouseEnter={e => (e.currentTarget.style.background = "#EBF0FD")}
-            onMouseLeave={e => (e.currentTarget.style.background = "#F5F6F8")}
-          >
-            <Pencil size={11} /> 编辑
-          </button>
+        {/* ── Top bar: Edit / Delete / Create buttons ── */}
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+          {/* Left: Create page */}
+          <div style={{ position: "relative" }}>
+            <button
+              onClick={() => setShowCreateMenu(!showCreateMenu)}
+              style={{
+                display: "flex", alignItems: "center", gap: 5,
+                padding: "4px 12px", borderRadius: 5, fontSize: 11,
+                background: "#E6F9EF", border: "1px solid #0DAB5C30",
+                color: "#0DAB5C", cursor: "pointer", transition: "background 0.15s",
+              }}
+              onMouseEnter={e => (e.currentTarget.style.background = "#D0F4E0")}
+              onMouseLeave={e => (e.currentTarget.style.background = "#E6F9EF")}
+            >
+              <Plus size={11} /> 新建页面
+            </button>
+            {showCreateMenu && (
+              <div
+                style={{
+                  position: "absolute", top: "100%", left: 0, marginTop: 4,
+                  background: "var(--popover, #fff)", border: "1px solid #E2E5EA",
+                  borderRadius: 8, padding: 4, zIndex: 50, minWidth: 140,
+                  boxShadow: "0 4px 12px rgba(0,0,0,0.1)",
+                }}
+              >
+                <button
+                  onClick={() => handleCreatePage("entity")}
+                  style={{
+                    display: "block", width: "100%", textAlign: "left",
+                    padding: "6px 10px", borderRadius: 5, fontSize: 11,
+                    background: "transparent", border: "none", cursor: "pointer",
+                    color: "#0891B2",
+                  }}
+                  onMouseEnter={e => (e.currentTarget.style.background = "#E4F7FA")}
+                  onMouseLeave={e => (e.currentTarget.style.background = "transparent")}
+                >
+                  💎 新建实体
+                </button>
+                <button
+                  onClick={() => handleCreatePage("concept")}
+                  style={{
+                    display: "block", width: "100%", textAlign: "left",
+                    padding: "6px 10px", borderRadius: 5, fontSize: 11,
+                    background: "transparent", border: "none", cursor: "pointer",
+                    color: "#7C3AED",
+                  }}
+                  onMouseEnter={e => (e.currentTarget.style.background = "#F0E8FD")}
+                  onMouseLeave={e => (e.currentTarget.style.background = "transparent")}
+                >
+                  💡 新建概念
+                </button>
+              </div>
+            )}
+          </div>
+
+          {/* Right: Edit + Delete */}
+          <div style={{ display: "flex", gap: 6 }}>
+            <button
+              onClick={onEditRequest}
+              style={{
+                display: "flex", alignItems: "center", gap: 5,
+                padding: "4px 12px", borderRadius: 5, fontSize: 11,
+                background: "#F5F6F8", border: "1px solid #E2E5EA",
+                color: "#4A5060", cursor: "pointer", transition: "background 0.15s",
+              }}
+              onMouseEnter={e => (e.currentTarget.style.background = "#EBF0FD")}
+              onMouseLeave={e => (e.currentTarget.style.background = "#F5F6F8")}
+            >
+              <Pencil size={11} /> 编辑
+            </button>
+            <button
+              onClick={() => setShowDeleteConfirm(true)}
+              style={{
+                display: "flex", alignItems: "center", gap: 5,
+                padding: "4px 12px", borderRadius: 5, fontSize: 11,
+                background: "#FDECEB", border: "1px solid #E5393530",
+                color: "#E53935", cursor: "pointer", transition: "background 0.15s",
+              }}
+              onMouseEnter={e => (e.currentTarget.style.background = "#FADDD9")}
+              onMouseLeave={e => (e.currentTarget.style.background = "#FDECEB")}
+            >
+              <Trash2 size={11} /> 删除
+            </button>
+          </div>
         </div>
+
+        {/* Delete confirmation dialog */}
+        <ConfirmDialog
+          open={showDeleteConfirm}
+          title="确认删除此页面？"
+          description={`将永久删除「${fm.title || "Untitled"}」（类型: ${fm.type}），包括其关联的向量索引和媒体文件。此操作不可撤销。`}
+          confirmLabel="确认删除"
+          cancelLabel="取消"
+          variant="destructive"
+          onConfirm={handleDeleteConfirm}
+          onCancel={() => setShowDeleteConfirm(false)}
+        />
 
         {/* ── Page header ── */}
         <div style={{ display: "flex", alignItems: "flex-start", gap: 14, marginBottom: 20 }}>
@@ -425,6 +577,9 @@ export function WikiPageViewer({ filePath, content, onEditRequest }: WikiPageVie
               <div style={{ fontSize: 11, color: "#8B92A0" }}>
                 {fm.created && <>创建: {fm.created}</>}
                 {fm.updated && fm.updated !== fm.created && <>　更新: {fm.updated}</>}
+                {fm.ingested_at && <>　导入: {fm.ingested_at.length > 10 ? new Date(fm.ingested_at).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }) : fm.ingested_at}</>}
+                {fm.ingested_by && <>　方式: {({"file-upload": "文件上传", "deep-research": "深度研究", "manual": "手动创建", "chat": "对话生成"} as Record<string, string>)[fm.ingested_by] ?? fm.ingested_by}</>}
+                {fm.ingested_by_user && fm.ingested_by_user !== "unknown" && <>　<span style={{ display: "inline-flex", alignItems: "center", gap: 2, background: "#EEF2FF", color: "#4F46E5", borderRadius: 4, padding: "0 5px", fontSize: 10, fontWeight: 600 }}>👤 {fm.ingested_by_user}</span></>}
                 　路径: {filePath.split(/[/\\]/).slice(-3).join(" / ")}
               </div>
             )}

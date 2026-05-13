@@ -18,6 +18,12 @@ import { buildVisionLlmConfig } from "@/lib/server-config"
 import { loadExistingEntities, normalizeEntityBlock } from "@/lib/entity-normalizer"
 import type { MultimodalConfig } from "@/stores/wiki-store"
 import type { ChunkingConfig } from "@/types/wiki"
+import { useAuthStore } from "@/stores/auth-store"
+
+/** Read the logged-in username without using a React hook (safe to call in lib code). */
+function _getUploaderUsername(): string {
+  try { return useAuthStore.getState().user?.username ?? "unknown" } catch { return "unknown" }
+}
 
 const OCR_IMAGE_EXTS = new Set(["png", "jpg", "jpeg", "webp", "gif", "bmp", "tiff", "tif"])
 
@@ -607,7 +613,7 @@ async function autoIngestImpl(
   await streamChat(
     llmConfig,
     [
-      { role: "system", content: buildGenerationPrompt(schema, purpose, index, fileName, overview, truncatedContent, chunking) },
+      { role: "system", content: buildGenerationPrompt(schema, purpose, index, fileName, overview, truncatedContent, chunking, _getUploaderUsername()) },
       {
         role: "user",
         content: [
@@ -1156,7 +1162,7 @@ function buildChunkingDirective(cfg?: ChunkingConfig): string {
 /**
  * Step 2 prompt: AI takes its own analysis and generates wiki files + review items.
  */
-export function buildGenerationPrompt(schema: string, purpose: string, index: string, sourceFileName: string, overview?: string, sourceContent: string = "", chunking?: ChunkingConfig): string {
+export function buildGenerationPrompt(schema: string, purpose: string, index: string, sourceFileName: string, overview?: string, sourceContent: string = "", chunking?: ChunkingConfig, uploaderUsername = "unknown"): string {
   // Use original filename (without extension) as the source summary page name
   const sourceBaseName = sourceFileName.replace(/\.[^.]+$/, "")
 
@@ -1191,7 +1197,10 @@ export function buildGenerationPrompt(schema: string, purpose: string, index: st
     "updated: YYYY-MM-DD",
     "tags: []",
     "related: []",
-    `sources: [\"${sourceFileName}\"]  # MUST contain the original source filename`,
+    `sources: ["${sourceFileName}"]  # MUST contain the original source filename`,
+    `ingested_at: "${new Date().toISOString()}"  # timestamp of this ingestion`,
+    `ingested_by: "file-upload"  # provenance: file-upload | deep-research | manual | chat`,
+    `ingested_by_user: "${uploaderUsername}"  # who uploaded this`,
     "---",
     "```",
     "",

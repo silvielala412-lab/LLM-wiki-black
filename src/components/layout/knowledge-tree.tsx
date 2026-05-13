@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react"
+import React, { useState, useEffect, useCallback } from "react"
 import {
   FileText, Users, Lightbulb, BookOpen, HelpCircle, GitMerge, BarChart3, ChevronRight, ChevronDown, Layout, Globe,
 } from "lucide-react"
@@ -32,9 +32,16 @@ export function KnowledgeTree() {
   const project = useWikiStore((s) => s.project)
   const selectedFile = useWikiStore((s) => s.selectedFile)
   const setSelectedFile = useWikiStore((s) => s.setSelectedFile)
+  const setFileTree = useWikiStore((s) => s.setFileTree)
+  const bumpDataVersion = useWikiStore((s) => s.bumpDataVersion)
   const fileTree = useWikiStore((s) => s.fileTree)
   const [pages, setPages] = useState<WikiPageInfo[]>([])
   const [expandedTypes, setExpandedTypes] = useState<Set<string>>(new Set(["overview", "entity", "concept", "source"]))
+
+  // Multi-select state
+  const [checkedPaths, setCheckedPaths] = useState<Set<string>>(new Set())
+  const [showBulkConfirm, setShowBulkConfirm] = useState(false)
+  const [isDeleting, setIsDeleting] = useState(false)
 
   const loadPages = useCallback(async () => {
     if (!project) return
@@ -45,7 +52,6 @@ export function KnowledgeTree() {
 
       const pageInfos: WikiPageInfo[] = []
       for (const file of mdFiles) {
-        // Skip index.md and log.md
         if (file.name === "index.md" || file.name === "log.md") continue
         try {
           const content = await readFile(file.path)
@@ -60,17 +66,40 @@ export function KnowledgeTree() {
           })
         }
       }
-
       setPages(pageInfos)
     } catch {
       setPages([])
     }
   }, [project])
 
-  // Reload when file tree changes (after ingest writes new pages)
-  useEffect(() => {
-    loadPages()
-  }, [loadPages, fileTree])
+  useEffect(() => { loadPages() }, [loadPages, fileTree])
+
+  const toggleCheck = useCallback((path: string, e: React.MouseEvent) => {
+    e.stopPropagation()
+    setCheckedPaths((prev) => {
+      const next = new Set(prev)
+      if (next.has(path)) next.delete(path)
+      else next.add(path)
+      return next
+    })
+  }, [])
+
+  const handleBulkDelete = useCallback(async () => {
+    if (!project || checkedPaths.size === 0) return
+    setIsDeleting(true)
+    const pp = normalizePath(project.path)
+    const { cascadeDeleteWikiPage } = await import("@/lib/wiki-page-delete")
+    for (const path of checkedPaths) {
+      try { await cascadeDeleteWikiPage(pp, path) } catch { /* continue */ }
+    }
+    const tree = await listDirectory(pp)
+    setFileTree(tree)
+    bumpDataVersion()
+    if (checkedPaths.has(selectedFile ?? "")) setSelectedFile(null)
+    setCheckedPaths(new Set())
+    setShowBulkConfirm(false)
+    setIsDeleting(false)
+  }, [project, checkedPaths, selectedFile, setFileTree, bumpDataVersion, setSelectedFile])
 
   if (!project) {
     return (
@@ -80,7 +109,6 @@ export function KnowledgeTree() {
     )
   }
 
-  // Group pages by type
   const grouped = new Map<string, WikiPageInfo[]>()
   for (const page of pages) {
     const list = grouped.get(page.type) ?? []
@@ -88,7 +116,6 @@ export function KnowledgeTree() {
     grouped.set(page.type, list)
   }
 
-  // Sort groups by configured order
   const sortedGroups = [...grouped.entries()].sort((a, b) => {
     const orderA = TYPE_CONFIG[a[0]]?.order ?? DEFAULT_CONFIG.order
     const orderB = TYPE_CONFIG[b[0]]?.order ?? DEFAULT_CONFIG.order
@@ -104,72 +131,135 @@ export function KnowledgeTree() {
     })
   }
 
+  const checkedCount = checkedPaths.size
+
   return (
-    <ScrollArea className="h-full">
-      <div className="p-2">
-        <div className="mb-2 px-2 text-xs font-semibold uppercase text-muted-foreground">
-          {project.name}
-        </div>
-
-        {sortedGroups.length === 0 && (
-          <div className="px-2 py-4 text-center text-xs text-muted-foreground">
-            No wiki pages yet. Import sources to get started.
+    <div className="flex h-full flex-col">
+      <ScrollArea className="flex-1">
+        <div className="p-2">
+          <div className="mb-2 px-2 text-xs font-semibold uppercase text-muted-foreground">
+            {project.name}
           </div>
-        )}
 
-        {sortedGroups.map(([type, items]) => {
-          const config = TYPE_CONFIG[type] ?? DEFAULT_CONFIG
-          const Icon = config.icon
-          const isExpanded = expandedTypes.has(type)
-
-          return (
-            <div key={type} className="mb-1">
-              <button
-                onClick={() => toggleType(type)}
-                className="flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-sm hover:bg-accent/50"
-              >
-                {isExpanded ? (
-                  <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-                ) : (
-                  <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-                )}
-                <Icon className={`h-3.5 w-3.5 shrink-0 ${config.color}`} />
-                <span className="flex-1 text-left font-medium">{config.label}</span>
-                <span className="text-xs text-muted-foreground">{items.length}</span>
-              </button>
-
-              {isExpanded && (
-                <div className="ml-3">
-                  {items.map((page) => {
-                    const isSelected = selectedFile === page.path
-                    return (
-                      <button
-                        key={page.path}
-                        onClick={() => setSelectedFile(page.path)}
-                        className={`flex w-full items-center gap-1.5 rounded-md px-2 py-1 text-left text-sm ${
-                          isSelected
-                            ? "bg-accent text-accent-foreground"
-                            : "text-muted-foreground hover:bg-accent/50 hover:text-accent-foreground"
-                        }`}
-                        title={page.path}
-                      >
-                        {page.origin === "web-clip" && <Globe className="h-3 w-3 shrink-0 text-blue-400" />}
-                        <span className="truncate">{page.title}</span>
-                      </button>
-                    )
-                  })}
-                </div>
-              )}
+          {checkedCount > 0 && (
+            <div className="mb-2 flex items-center justify-between rounded-md bg-red-50 border border-red-200 px-2 py-1.5">
+              <span className="text-xs text-red-600 font-medium">已选 {checkedCount} 项</span>
+              <div className="flex gap-1">
+                <button onClick={() => setCheckedPaths(new Set())} className="text-xs text-muted-foreground hover:text-foreground px-1.5 py-0.5 rounded">取消</button>
+                <button onClick={() => setShowBulkConfirm(true)} className="text-xs text-white bg-red-500 hover:bg-red-600 px-2 py-0.5 rounded font-medium">删除所选</button>
+              </div>
             </div>
-          )
-        })}
+          )}
 
-        {/* Raw sources quick access */}
-        <RawSourcesSection />
-      </div>
-    </ScrollArea>
+          {sortedGroups.length === 0 && (
+            <div className="px-2 py-4 text-center text-xs text-muted-foreground">
+              No wiki pages yet. Import sources to get started.
+            </div>
+          )}
+
+          {sortedGroups.map(([type, items]) => {
+            const config = TYPE_CONFIG[type] ?? DEFAULT_CONFIG
+            const Icon = config.icon
+            const isExpanded = expandedTypes.has(type)
+
+            return (
+              <div key={type} className="mb-1">
+                <button
+                  onClick={() => toggleType(type)}
+                  className="flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-sm hover:bg-accent/50"
+                >
+                  {isExpanded ? (
+                    <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                  ) : (
+                    <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                  )}
+                  <Icon className={`h-3.5 w-3.5 shrink-0 ${config.color}`} />
+                  <span className="flex-1 text-left font-medium">{config.label}</span>
+                  <span className="text-xs text-muted-foreground">{items.length}</span>
+                </button>
+
+                {isExpanded && (
+                  <div className="ml-3">
+                    {items.map((page) => {
+                      const isSelected = selectedFile === page.path
+                      const isChecked = checkedPaths.has(page.path)
+                      return (
+                        <div
+                          key={page.path}
+                          className={`group flex w-full items-center gap-1.5 rounded-md px-1 py-1 text-left text-sm ${
+                            isChecked
+                              ? "bg-red-50 text-red-700"
+                              : isSelected
+                              ? "bg-accent text-accent-foreground"
+                              : "text-muted-foreground hover:bg-accent/50 hover:text-accent-foreground"
+                          }`}
+                        >
+                          {/* Checkbox */}
+                          <button
+                            onClick={(e) => toggleCheck(page.path, e)}
+                            className={`flex-shrink-0 w-3.5 h-3.5 rounded border flex items-center justify-center transition-opacity ${
+                              isChecked
+                                ? "opacity-100 border-red-400 bg-red-100"
+                                : "opacity-0 group-hover:opacity-100 border-muted-foreground/40"
+                            }`}
+                            title="选中删除"
+                          >
+                            {isChecked && <span className="text-red-500" style={{ fontSize: 8, lineHeight: 1 }}>✓</span>}
+                          </button>
+
+                          {/* Page title */}
+                          <button
+                            onClick={() => setSelectedFile(page.path)}
+                            className="flex-1 flex items-center gap-1 truncate min-w-0"
+                            title={page.path}
+                          >
+                            {page.origin === "web-clip" && <Globe className="h-3 w-3 shrink-0 text-blue-400" />}
+                            <span className="truncate">{page.title}</span>
+                          </button>
+                        </div>
+                      )
+                    })}
+                  </div>
+                )}
+              </div>
+            )
+          })}
+
+          <RawSourcesSection />
+        </div>
+      </ScrollArea>
+
+      {/* Bulk delete confirmation dialog */}
+      {showBulkConfirm && (
+        <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm rounded-lg">
+          <div className="bg-background border rounded-xl shadow-xl p-5 mx-4 max-w-xs w-full">
+            <div className="flex items-center gap-2 mb-3">
+              <span className="text-xl">🗑️</span>
+              <h3 className="font-semibold text-sm">确认批量删除</h3>
+            </div>
+            <p className="text-xs text-muted-foreground mb-4">
+              将永久删除 <span className="font-bold text-red-500">{checkedCount}</span> 个页面及其向量索引，此操作不可撤销。
+            </p>
+            <div className="flex gap-2 justify-end">
+              <button
+                onClick={() => setShowBulkConfirm(false)}
+                className="px-3 py-1.5 text-xs rounded-md border hover:bg-accent"
+              >取消</button>
+              <button
+                onClick={handleBulkDelete}
+                disabled={isDeleting}
+                className="px-3 py-1.5 text-xs rounded-md bg-red-500 text-white hover:bg-red-600 disabled:opacity-50"
+              >
+                {isDeleting ? "删除中..." : `确认删除 ${checkedCount} 项`}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
   )
 }
+
 
 function RawSourcesSection() {
   const project = useWikiStore((s) => s.project)
