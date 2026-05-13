@@ -154,6 +154,97 @@ pub async fn stream_chat(
         .unwrap()
 }
 
+/// Proxy a vision-capable OpenAI-compatible chat completion stream to the
+/// configured VISION_ENDPOINT. This keeps hosted vision API keys server-side
+/// while allowing the browser ingest pipeline to send image content blocks.
+pub async fn stream_vision_chat(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<StreamRequest>,
+) -> Response {
+    let cfg = &state.llm_config;
+
+    let endpoint = match &cfg.vision_endpoint {
+        Some(e) => e.trim_end_matches('/').to_string(),
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "Vision endpoint not configured. Set VISION_ENDPOINT env var."})),
+            )
+                .into_response()
+        }
+    };
+
+    let model = body
+        .model
+        .filter(|m| !m.is_empty())
+        .or_else(|| cfg.vision_model.clone())
+        .unwrap_or_default();
+
+    let mut req_body = json!({
+        "model": model,
+        "messages": body.messages,
+        "stream": true,
+    });
+    if let Some(t) = body.temperature {
+        req_body["temperature"] = json!(t);
+    }
+    if let Some(m) = body.max_tokens {
+        req_body["max_tokens"] = json!(m);
+    }
+    if let Some(p) = body.top_p {
+        req_body["top_p"] = json!(p);
+    }
+
+    let url = format!("{endpoint}/chat/completions");
+    tracing::info!("Vision proxy -> {url} model={model}");
+
+    let mut req = state
+        .http_client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "text/event-stream");
+
+    if let Some(key) = cfg.vision_api_key() {
+        req = req.header("Authorization", format!("Bearer {key}"));
+    }
+
+    let upstream = match req.json(&req_body).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("Vision proxy request failed: {e}");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": format!("Vision request failed: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    let status = upstream.status();
+    if !status.is_success() {
+        let body_text = upstream.text().await.unwrap_or_default();
+        tracing::warn!("Vision upstream HTTP {status}: {body_text}");
+        return (
+            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+            Json(json!({"error": body_text})),
+        )
+            .into_response();
+    }
+
+    let stream = upstream
+        .bytes_stream()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header(header::CONNECTION, "keep-alive")
+        .header("X-Accel-Buffering", "no")
+        .body(Body::from_stream(stream))
+        .unwrap()
+}
+
 // ── POST /api/llm/embed ──────────────────────────────────────────────────────
 
 /// Proxy an OpenAI-compatible embedding request to the configured

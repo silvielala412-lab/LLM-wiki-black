@@ -41,10 +41,21 @@ pub async fn web_search(
     Json(body): Json<SearchRequest>,
 ) -> axum::response::Result<Json<Value>, axum::http::StatusCode> {
     let max = body.max_results.unwrap_or(10);
+    let api_key = if body.api_key == "__SERVER_MANAGED__" || body.api_key.is_empty() {
+        match std::env::var("SEARCH_API_KEY").ok().filter(|v| !v.is_empty()) {
+            Some(key) => key,
+            None => {
+                tracing::warn!("Web search API key not configured");
+                return Err(axum::http::StatusCode::BAD_REQUEST);
+            }
+        }
+    } else {
+        body.api_key.clone()
+    };
 
     let results = match body.provider.as_str() {
-        "tavily" => tavily_search(&state, &body.query, &body.api_key, max).await,
-        "perplexity" => perplexity_search(&state, &body.query, &body.api_key, max).await,
+        "tavily" => tavily_search(&state, &body.query, &api_key, max).await,
+        "perplexity" => perplexity_search(&state, &body.query, &api_key, max).await,
         other => {
             tracing::warn!("Unknown search provider: {other}");
             return Err(axum::http::StatusCode::BAD_REQUEST);

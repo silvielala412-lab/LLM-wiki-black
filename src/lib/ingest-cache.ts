@@ -18,9 +18,24 @@ interface CacheData {
 }
 
 async function sha256(content: string): Promise<string> {
+  if (!globalThis.crypto?.subtle) {
+    let h1 = 0x811c9dc5
+    let h2 = 0x01000193
+    for (let i = 0; i < content.length; i++) {
+      const c = content.charCodeAt(i)
+      h1 ^= c
+      h1 = Math.imul(h1, 0x01000193)
+      h2 ^= c + i
+      h2 = Math.imul(h2, 0x811c9dc5)
+    }
+    const a = (h1 >>> 0).toString(16).padStart(8, "0")
+    const b = (h2 >>> 0).toString(16).padStart(8, "0")
+    return `fallback-${content.length}-${a}${b}`
+  }
+
   const encoder = new TextEncoder()
   const data = encoder.encode(content)
-  const hashBuffer = await crypto.subtle.digest("SHA-256", data)
+  const hashBuffer = await globalThis.crypto.subtle.digest("SHA-256", data)
   const hashArray = Array.from(new Uint8Array(hashBuffer))
   return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("")
 }

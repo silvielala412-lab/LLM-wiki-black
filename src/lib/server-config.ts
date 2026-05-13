@@ -31,10 +31,16 @@ interface ServerEmbeddingConfig {
 interface ServerVisionConfig {
   endpoint?: string
   model?: string
+  has_api_key?: boolean
 }
 
 interface ServerPdfConfig {
   dpi?: number
+}
+
+interface ServerSearchConfig {
+  provider?: "tavily" | "perplexity" | "none"
+  has_api_key?: boolean
 }
 
 export interface ServerConfig {
@@ -42,6 +48,7 @@ export interface ServerConfig {
   embedding: ServerEmbeddingConfig
   vision: ServerVisionConfig
   pdf: ServerPdfConfig
+  search?: ServerSearchConfig
   allow_user_override: boolean
 }
 
@@ -98,6 +105,19 @@ export async function applyServerConfig(): Promise<void> {
         store.setActivePresetId("custom")
       }
     }
+
+    const currentLlm = store.llmConfig
+    if (!currentLlm.apiKey && llm.has_api_key) {
+      store.setLlmConfig({
+        ...currentLlm,
+        provider: "custom",
+        apiKey: "__SERVER_MANAGED__",
+        model: llm.model ?? currentLlm.model,
+        customEndpoint: llm.endpoint ?? currentLlm.customEndpoint,
+        apiMode: (llm.api_mode as "chat_completions" | "anthropic_messages" | undefined) ?? currentLlm.apiMode ?? "chat_completions",
+        maxContextSize: llm.max_context_size ?? currentLlm.maxContextSize,
+      })
+    }
   }
 
   // ── Apply embedding defaults ────────────────────────────────────────
@@ -119,12 +139,40 @@ export async function applyServerConfig(): Promise<void> {
     _visionConfig = {
       endpoint: cfg.vision.endpoint,
       model: cfg.vision.model,
+      hasApiKey: cfg.vision.has_api_key,
+    }
+
+    if (cfg.vision.has_api_key) {
+      const mmCfg = store.multimodalConfig
+      if (!mmCfg.enabled || !mmCfg.apiKey) {
+        store.setMultimodalConfig({
+          ...mmCfg,
+          enabled: true,
+          useMainLlm: false,
+          provider: "custom",
+          apiKey: "__SERVER_MANAGED_VISION__",
+          model: cfg.vision.model ?? mmCfg.model,
+          customEndpoint: cfg.vision.endpoint ?? mmCfg.customEndpoint,
+          apiMode: "chat_completions",
+        })
+      }
     }
   }
 
   // ── Apply PDF DPI ────────────────────────────────────────────────────
   if (cfg.pdf?.dpi) {
     _pdfDpi = cfg.pdf.dpi
+  }
+
+  const search = cfg.search
+  if (search?.provider && search.provider !== "none" && search.has_api_key) {
+    const currentSearch = store.searchApiConfig
+    if (currentSearch.provider === "none" || !currentSearch.apiKey) {
+      store.setSearchApiConfig({
+        provider: search.provider,
+        apiKey: "__SERVER_MANAGED__",
+      })
+    }
   }
 }
 
@@ -133,6 +181,7 @@ export async function applyServerConfig(): Promise<void> {
 interface VisionEndpoint {
   endpoint?: string
   model?: string
+  hasApiKey?: boolean
 }
 
 let _visionConfig: VisionEndpoint | null = null
@@ -158,6 +207,7 @@ export function buildVisionLlmConfig() {
   return {
     ...baseCfg,
     provider: "custom" as const,
+    apiKey: _visionConfig.hasApiKey ? "__SERVER_MANAGED_VISION__" : baseCfg.apiKey,
     customEndpoint: _visionConfig.endpoint,
     model: _visionConfig.model ?? baseCfg.model,
     apiMode: "chat_completions" as const,

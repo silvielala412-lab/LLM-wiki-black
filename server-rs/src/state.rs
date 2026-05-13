@@ -23,6 +23,9 @@ pub struct LlmServerConfig {
     // ── Vision / Multimodal (for image-PDF OCR) ───────────────────────
     pub vision_endpoint: Option<String>,
     pub vision_model: Option<String>,
+    #[serde(skip)]
+    pub vision_api_key: Option<String>,
+    pub has_vision_api_key: bool,
     pub pdf_dpi: u32,
 
     // ── Internal PDF OCR API (custom format) ──────────────────────────
@@ -48,6 +51,7 @@ pub struct LlmServerConfig {
 impl LlmServerConfig {
     pub fn from_env() -> Self {
         let api_key = Self::opt_env("LLM_API_KEY");
+        let vision_api_key = Self::opt_env("VISION_API_KEY").or_else(|| Self::opt_env("SEARCH_API_KEY"));
         let ocr_endpoint = Self::opt_env("OCR_ENDPOINT");
         let ocr_api_key = Self::opt_env("OCR_API_KEY");
         Self {
@@ -63,6 +67,8 @@ impl LlmServerConfig {
             embedding_model: Self::opt_env("EMBEDDING_MODEL"),
             vision_endpoint: Self::opt_env("VISION_ENDPOINT"),
             vision_model: Self::opt_env("VISION_MODEL"),
+            has_vision_api_key: vision_api_key.is_some(),
+            vision_api_key,
             pdf_dpi: Self::opt_env("PDF_DPI")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(150),
@@ -88,6 +94,10 @@ impl LlmServerConfig {
 
     pub fn ocr_api_key(&self) -> Option<&str> {
         self.ocr_api_key.as_deref()
+    }
+
+    pub fn vision_api_key(&self) -> Option<&str> {
+        self.vision_api_key.as_deref()
     }
 }
 

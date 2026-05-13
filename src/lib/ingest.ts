@@ -1,4 +1,4 @@
-import { readFile, writeFile, listDirectory } from "@/commands/fs"
+import { readFile, writeFile, listDirectory, readFileAsBase64 } from "@/commands/fs"
 import { streamChat } from "@/lib/llm-client"
 import type { LlmConfig } from "@/stores/wiki-store"
 import { useWikiStore } from "@/stores/wiki-store"
@@ -13,11 +13,18 @@ import {
   buildImageMarkdownSection,
 } from "@/lib/extract-source-images"
 import { captionMarkdownImages, loadCaptionCache } from "@/lib/image-caption-pipeline"
-import { isImagePdf, ocrImagePdf } from "@/lib/pdf-ocr"
+import { isImagePdf, ocrImagePdf, ocrImageBytes } from "@/lib/pdf-ocr"
 import { buildVisionLlmConfig } from "@/lib/server-config"
 import { loadExistingEntities, normalizeEntityBlock } from "@/lib/entity-normalizer"
 import type { MultimodalConfig } from "@/stores/wiki-store"
 import type { ChunkingConfig } from "@/types/wiki"
+
+const OCR_IMAGE_EXTS = new Set(["png", "jpg", "jpeg", "webp", "gif", "bmp", "tiff", "tif"])
+
+function isImageSourcePath(path: string): boolean {
+  const ext = path.split(".").pop()?.toLowerCase() ?? ""
+  return OCR_IMAGE_EXTS.has(ext)
+}
 
 /**
  * Resolve the LLM config that the caption pipeline should use.
@@ -333,6 +340,20 @@ async function autoIngestImpl(
       // Vision model not configured → friendly message in the wiki
       sourceContent = `(图片型 PDF — 服务器未配置视觉模型 VISION_ENDPOINT，无法 OCR。文件: ${fileName})`
       console.warn(`[ingest:pdf-ocr] No vision config for "${fileName}" — VISION_ENDPOINT not set`)
+    }
+  } else if (isImageSourcePath(sp)) {
+    const visionCfg = buildVisionLlmConfig()
+    if (visionCfg) {
+      try {
+        activity.updateItem(activityId, { detail: "Image file detected - running OCR..." })
+        const image = await readFileAsBase64(sp)
+        const ocrText = await ocrImageBytes(image.base64, image.mimeType, visionCfg, signal)
+        if (ocrText) {
+          sourceContent = `# OCR text extracted from ${fileName}\n\n${ocrText}`
+        }
+      } catch (err) {
+        console.warn(`[ingest:image-ocr] OCR failed for "${fileName}":`, err)
+      }
     }
   }
 

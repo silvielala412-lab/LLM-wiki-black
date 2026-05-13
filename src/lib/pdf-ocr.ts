@@ -95,6 +95,46 @@ async function ocrPage(
   return text.trim()
 }
 
+export async function ocrImageBytes(
+  imageBase64: string,
+  mediaType: string,
+  visionConfig: LlmConfig,
+  signal?: AbortSignal,
+): Promise<string> {
+  let text = ""
+
+  await streamChat(
+    visionConfig,
+    [
+      {
+        role: "user",
+        content: [
+          {
+            type: "text",
+            text: "Extract all visible text from this image. Preserve headings, line breaks, table structure, numbers, and labels as much as possible. If it is a chart or diagram, include the key labels and values. Output plain text only.",
+          },
+          {
+            type: "image",
+            mediaType,
+            dataBase64: imageBase64,
+          },
+        ],
+      },
+    ],
+    {
+      onToken: (token) => { text += token },
+      onDone: () => {},
+      onError: (err) => {
+        throw err
+      },
+    },
+    signal,
+    { temperature: 0 },
+  )
+
+  return text.trim()
+}
+
 
 /**
  * Run OCR on all pages of an image-based PDF using the vision model.

@@ -95,6 +95,18 @@ export async function streamChat(
     return streamViaClaudeCodeCli(config, messages, callbacks, signal, requestOverrides)
   }
 
+  if (config.apiKey === "__SERVER_MANAGED_VISION__") {
+    return streamChatViaProxyEndpoint(
+      "/api/llm/vision-stream",
+      config,
+      messages,
+      callbacks,
+      signal,
+      requestOverrides,
+      "vision",
+    )
+  }
+
   // ── Backend proxy mode ────────────────────────────────────────────────────
   // When the Rust backend has LLM_ENDPOINT configured, route through
   // /api/llm/stream. This avoids Mixed Content errors (HTTPS page → HTTP
@@ -200,6 +212,26 @@ async function streamChatViaProxy(
   signal?: AbortSignal,
   requestOverrides?: RequestOverrides,
 ): Promise<void> {
+  return streamChatViaProxyEndpoint(
+    "/api/llm/stream",
+    config,
+    messages,
+    callbacks,
+    signal,
+    requestOverrides,
+    "LLM",
+  )
+}
+
+async function streamChatViaProxyEndpoint(
+  endpoint: string,
+  config: LlmConfig,
+  messages: import("./llm-providers").ChatMessage[],
+  callbacks: StreamCallbacks,
+  signal?: AbortSignal,
+  requestOverrides?: RequestOverrides,
+  label: string = "LLM",
+): Promise<void> {
   const { onToken, onDone, onError } = callbacks
 
   const body: Record<string, unknown> = { messages }
@@ -210,7 +242,7 @@ async function streamChatViaProxy(
 
   let response: Response
   try {
-    response = await fetch("/api/llm/stream", {
+    response = await fetch(endpoint, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -219,7 +251,7 @@ async function streamChatViaProxy(
   } catch (err) {
     if (signal?.aborted) { onDone(); return }
     if (isFetchNetworkError(err)) {
-      onError(new Error("Network error reaching the LLM proxy. Check server logs."))
+      onError(new Error(`Network error reaching the ${label} proxy. Check server logs.`))
       return
     }
     onError(err instanceof Error ? err : new Error(String(err)))

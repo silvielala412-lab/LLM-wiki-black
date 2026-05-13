@@ -95,6 +95,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/upload/files", post(handlers::upload::upload_files))
         // LLM / Embedding proxy (solves Mixed Content + CORS for HTTPS deployments)
         .route("/llm/stream", post(handlers::llm::stream_chat))
+        .route("/llm/vision-stream", post(handlers::llm::stream_vision_chat))
         .route("/llm/embed",  post(handlers::llm::embed))
         // Web search proxy (routes Tavily/Perplexity calls through the server)
         .route("/search/web", post(handlers::search::web_search))

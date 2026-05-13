@@ -54,11 +54,26 @@ function parseFrontmatter(content: string): { fm: Frontmatter; body: string } {
   const yamlStr = match[1]
   const body = match[2] ?? ""
 
+  const asList = (value: unknown): string[] => {
+    if (Array.isArray(value)) {
+      return value.map(String).map(s => s.trim()).filter(Boolean)
+    }
+    if (typeof value !== "string") return []
+    const trimmed = value.trim()
+    if (!trimmed) return []
+    const bracketed = trimmed.match(/^\[(.*)]$/)
+    const raw = bracketed ? bracketed[1] : trimmed
+    return raw
+      .split(",")
+      .map(s => s.trim().replace(/^["']|["']$/g, ""))
+      .filter(Boolean)
+  }
+
   // Simple line-by-line YAML parser (covers list + scalar)
   let currentKey = ""
   for (const line of yamlStr.split(/\r?\n/)) {
-    const scalarM = line.match(/^(\w+):\s*"?([^"#\r\n]*)"?\s*$/)
     const listStartM = line.match(/^(\w+):\s*\[(.*)]\s*$/)
+    const scalarM = line.match(/^(\w+):\s*"?([^"#\r\n]*)"?\s*$/)
     const listItemM = line.match(/^\s*-\s+"?([^"]*)"?\s*$/)
 
     if (listStartM) {
@@ -79,6 +94,9 @@ function parseFrontmatter(content: string): { fm: Frontmatter; body: string } {
     const h1 = body.match(/^#\s+(.+)$/m)
     fm.title = h1 ? h1[1].trim() : "Untitled"
   }
+  fm.tags = asList(fm.tags)
+  fm.related = asList(fm.related)
+  fm.sources = asList(fm.sources)
 
   return { fm, body }
 }

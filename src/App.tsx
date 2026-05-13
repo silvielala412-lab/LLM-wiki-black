@@ -14,6 +14,7 @@ import { WelcomeScreen } from "@/components/project/welcome-screen"
 import { CreateProjectDialog } from "@/components/project/create-project-dialog"
 import { AuthPage } from "@/components/auth/auth-page"
 import type { WikiProject } from "@/types/wiki"
+import { applyServerConfig } from "@/lib/server-config"
 
 function App() {
   const project = useWikiStore((s) => s.project)
@@ -216,6 +217,7 @@ function App() {
         if (savedSearchConfig) {
           useWikiStore.getState().setSearchApiConfig(savedSearchConfig)
         }
+        await applyServerConfig()
         const savedEmbeddingConfig = await loadEmbeddingConfig()
         if (savedEmbeddingConfig) {
           useWikiStore.getState().setEmbeddingConfig(savedEmbeddingConfig)

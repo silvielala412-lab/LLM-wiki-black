@@ -56,15 +56,31 @@ const CACHE_REL_PATH = ".llm-wiki/image-caption-cache.json"
  * string — same image encoded with different base64 line-wrap
  * settings would otherwise miss the cache).
  *
- * Uses `crypto.subtle` which is available in both Tauri's webview
- * and the Node test environment (since Node 19+ exposes the
- * `webcrypto` shape on `globalThis.crypto`).
+ * Uses `crypto.subtle` when available. Some intranet/browser contexts
+ * expose no WebCrypto subtle API, so we fall back to a deterministic
+ * non-cryptographic key. The hash only deduplicates caption-cache entries;
+ * it is not used for security.
  */
 async function sha256OfBase64(b64: string): Promise<string> {
+  if (!globalThis.crypto?.subtle) {
+    let h1 = 0x811c9dc5
+    let h2 = 0x01000193
+    for (let i = 0; i < b64.length; i++) {
+      const c = b64.charCodeAt(i)
+      h1 ^= c
+      h1 = Math.imul(h1, 0x01000193)
+      h2 ^= c + i
+      h2 = Math.imul(h2, 0x811c9dc5)
+    }
+    const a = (h1 >>> 0).toString(16).padStart(8, "0")
+    const b = (h2 >>> 0).toString(16).padStart(8, "0")
+    return `fallback-${b64.length}-${a}${b}`
+  }
+
   const binary = atob(b64)
   const bytes = new Uint8Array(binary.length)
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
-  const digest = await crypto.subtle.digest("SHA-256", bytes)
+  const digest = await globalThis.crypto.subtle.digest("SHA-256", bytes)
   return Array.from(new Uint8Array(digest))
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("")

@@ -35,10 +35,16 @@ pub async fn get_config(State(state): State<Arc<AppState>>) -> Result<Json<Value
         "vision": {
             "endpoint": cfg.vision_endpoint,
             "model":    cfg.vision_model,
+            "has_api_key": cfg.has_vision_api_key,
         },
         // PDF processing
         "pdf": {
             "dpi": cfg.pdf_dpi,
+        },
+        // Web search
+        "search": {
+            "provider": std::env::var("SEARCH_PROVIDER").ok(),
+            "has_api_key": std::env::var("SEARCH_API_KEY").ok().filter(|v| !v.is_empty()).is_some(),
         },
         // Frontend behaviour
         "allow_user_override": cfg.allow_user_override,
