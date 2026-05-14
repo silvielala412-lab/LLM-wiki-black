@@ -863,6 +863,29 @@ async function autoIngestImpl(
     }
   }
 
+  // ── Step 7: Governance pipeline (conflict detection + LLM judge) ──────────
+  // Runs fire-and-forget — never blocks ingest completion.
+  // Must run AFTER Step 6 (embedding) so the vector index is up to date
+  // before conflict detection queries it.
+  {
+    const { runGovernancePipeline } = await import("@/lib/knowledge-governance")
+    const llmConfig = useWikiStore.getState().llmConfig
+    const govEmbCfg = useWikiStore.getState().embeddingConfig
+    const SKIP_GOV = new Set(["index.md", "log.md", "overview.md"])
+
+    for (const rel of writtenPaths) {
+      const base = rel.split("/").pop() ?? ""
+      if (SKIP_GOV.has(base) || !rel.startsWith("wiki/")) continue
+      const absPath = `${pp}/${rel}`
+      // Read the content once and hand it off; don't await — fire-and-forget
+      readFile(absPath).then((content) => {
+        runGovernancePipeline(pp, absPath, content, govEmbCfg, llmConfig).catch((err) => {
+          console.warn(`[governance] Pipeline failed for ${rel}:`, err)
+        })
+      }).catch(() => {/* non-critical */})
+    }
+  }
+
   // ── P3: count entity stats from written paths & warnings ──────
   const newEntities = writtenPaths.filter(
     (p) => p.startsWith("wiki/entities/") || p.startsWith("wiki/concepts/")
