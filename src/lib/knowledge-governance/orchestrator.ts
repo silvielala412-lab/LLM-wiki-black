@@ -79,20 +79,22 @@ export async function runGovernancePipeline(
     candidates = await detectConflicts(projectPath, newPageId, newPagePath, newContent, embCfg)
   } catch (err) {
     console.warn("[governance] Conflict detection failed:", err)
+    await notifyUser(`[治理调试] 冲突检测异常: ${String(err).slice(0, 80)}`)
     return
   }
 
   if (candidates.length === 0) {
-    // No similar pages found — new page stays as candidate, nothing to review
     console.log(`[governance] No conflicts found for ${newPageId}`)
+    // Debug: show that we ran but found nothing
+    await notifyUser(`[治理] ${newPageId.split("/").pop()} — 无相似页面，跳过`)
     return
   }
 
-  // Use the top-scoring candidate
   const topCandidate = candidates[0]
   console.log(
     `[governance] Conflict candidate for "${newPageId}": "${topCandidate.title}" (score=${topCandidate.score.toFixed(2)}, method=${topCandidate.matchMethod})`,
   )
+  await notifyUser(`[治理] 发现相似页面: 「${topCandidate.title}」 得分=${topCandidate.score.toFixed(2)}`)
 
   // ── Step 2: LLM Judgement ─────────────────────────────────────────────────
   // Extract new page title + excerpt
@@ -120,8 +122,10 @@ export async function runGovernancePipeline(
     )
   } catch (err) {
     console.warn("[governance] Judge module failed:", err)
-    // Proceed without judgement — policy engine handles null
+    await notifyUser(`[治理调试] LLM 判断异常: ${String(err).slice(0, 80)}`)
   }
+
+  await notifyUser(`[治理] LLM 判断: relation=${judgement?.relation ?? "null(LLM失败)"} confidence=${judgement?.confidence ?? "-"}`)
 
   // ── Step 3: Policy Decision ───────────────────────────────────────────────
   const decision = evaluatePolicy(judgement, {
