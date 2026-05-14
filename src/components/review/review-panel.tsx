@@ -52,6 +52,7 @@ export function ReviewPanel() {
             const { generateSemanticDiff } = await import("@/lib/knowledge-governance/diff-engine")
             const { recordTransition } = await import("@/lib/knowledge-governance/lineage-tracker")
             const llmConfig = (await import("@/stores/wiki-store")).useWikiStore.getState().llmConfig
+            const reviewer = (await import("@/stores/auth-store")).useAuthStore.getState().user?.username ?? "unknown"
 
             const [oldContent, newContent] = await Promise.all([
               readFile(item.existingPagePath!).catch(() => ""),
@@ -74,6 +75,8 @@ export function ReviewPanel() {
               item.newPageTitle,
               diffResult,
               "supersedes",
+              "user",
+              reviewer,
             )
 
             console.log(`[ReviewPanel] Lineage recorded for "${item.newPageTitle}" ← "${item.existingPageTitle}"`)

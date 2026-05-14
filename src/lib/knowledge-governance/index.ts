@@ -65,7 +65,7 @@ export { runGovernancePipeline } from "./orchestrator"
 // ── Phase 3: Knowledge Evolution + Lineage ────────────────────────────────────
 
 // Lineage Tracker
-export type { KnowledgeTransition } from "./lineage-tracker"
+export type { KnowledgeTransition, TransitionSource } from "./lineage-tracker"
 export {
   loadLineage,
   appendTransition,

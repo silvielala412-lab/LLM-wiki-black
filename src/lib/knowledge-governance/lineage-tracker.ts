@@ -15,6 +15,11 @@ import { readFile, writeFile } from "@/commands/fs"
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
+export type TransitionSource =
+  | "user"         // Human reviewer confirmed in Review Panel
+  | "auto_accept"  // Policy engine: high-confidence unrelated/complement, auto-accepted
+  | "auto_notify"  // Policy engine: update/same detected, notified but not queued
+
 export interface KnowledgeTransition {
   /** UUID */
   id: string
@@ -34,8 +39,10 @@ export interface KnowledgeTransition {
   changedPoints: string[]    // Concepts that changed between versions
   /** One-line human-readable summary */
   summary: string
-  /** Who triggered this transition */
-  resolvedBy: "user" | "auto"
+  /** How this transition was resolved */
+  resolvedBy: TransitionSource
+  /** Username of the human reviewer (only set when resolvedBy === 'user') */
+  reviewedBy?: string
 }
 
 const LINEAGE_FILE = "knowledge-lineage.json"
@@ -119,6 +126,8 @@ export async function recordTransition(
   toPageTitle: string,
   diffResult: Pick<KnowledgeTransition, "addedPoints" | "removedPoints" | "changedPoints" | "summary"> | null,
   relation: KnowledgeTransition["relation"] = "supersedes",
+  resolvedBy: TransitionSource = "user",
+  reviewedBy?: string,
 ): Promise<KnowledgeTransition> {
   const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
   const transition: KnowledgeTransition = {
@@ -133,15 +142,19 @@ export async function recordTransition(
     removedPoints: diffResult?.removedPoints ?? [],
     changedPoints: diffResult?.changedPoints ?? [],
     summary:       diffResult?.summary       ?? `「${toPageTitle}」替代了「${fromPageTitle}」`,
-    resolvedBy: "user",
+    resolvedBy,
+    reviewedBy,
   }
 
   // Persist lineage record
   await appendTransition(projectPath, transition)
 
   // Inject cross-reference pointers into both pages' frontmatter
-  await injectLineageFrontmatter(fromPagePath, "superseded_by", toPagePath)
-  await injectLineageFrontmatter(toPagePath,   "supersedes",    fromPagePath)
+  // Only inject for user-confirmed supersessions (not auto-detected notifies)
+  if (resolvedBy === "user") {
+    await injectLineageFrontmatter(fromPagePath, "superseded_by", toPagePath)
+    await injectLineageFrontmatter(toPagePath,   "supersedes",    fromPagePath)
+  }
 
   return transition
 }

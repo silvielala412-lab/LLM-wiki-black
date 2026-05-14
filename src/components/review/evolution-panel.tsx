@@ -31,6 +31,32 @@ function DiffPoint({ type, text }: { type: "added" | "removed" | "changed"; text
   )
 }
 
+function ResolutionBadge({ resolvedBy, reviewedBy }: { resolvedBy: string; reviewedBy?: string }) {
+  if (resolvedBy === "user") {
+    return (
+      <span className="inline-flex items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[10px] font-medium text-emerald-700 dark:border-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-400">
+        <span>👤</span>
+        人工审核{reviewedBy ? `·${reviewedBy}` : ""}
+      </span>
+    )
+  }
+  if (resolvedBy === "auto_accept") {
+    return (
+      <span className="inline-flex items-center gap-1 rounded-full border border-violet-200 bg-violet-50 px-2 py-0.5 text-[10px] font-medium text-violet-700 dark:border-violet-800 dark:bg-violet-950/40 dark:text-violet-400">
+        <span>✨</span>
+        AI 自动确认
+      </span>
+    )
+  }
+  // auto_notify
+  return (
+    <span className="inline-flex items-center gap-1 rounded-full border border-blue-200 bg-blue-50 px-2 py-0.5 text-[10px] font-medium text-blue-700 dark:border-blue-800 dark:bg-blue-950/40 dark:text-blue-400">
+      <span>🤖</span>
+      AI 检测通知
+    </span>
+  )
+}
+
 function TransitionCard({
   transition,
   isLatest,
@@ -77,6 +103,10 @@ function TransitionCard({
               }`}>
                 {transition.relation === "supersedes" ? "替代" : transition.relation === "updates" ? "更新" : "合并"}
               </span>
+              <ResolutionBadge
+                resolvedBy={transition.resolvedBy}
+                reviewedBy={transition.reviewedBy}
+              />
             </div>
             <div className="mt-1 flex items-center gap-2 text-sm">
               <button

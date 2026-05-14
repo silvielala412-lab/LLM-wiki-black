@@ -141,12 +141,42 @@ export async function runGovernancePipeline(
   if (decision === "auto_accept") {
     // Automatically confirm the new page as active
     await setPageStatus(newPagePath, "active").catch(() => {})
+
+    // Record in lineage as AI auto-accepted (for auditability)
+    try {
+      const { recordTransition } = await import("./lineage-tracker")
+      await recordTransition(
+        projectPath, topCandidate.pagePath, topCandidate.title,
+        newPagePath, newTitle,
+        judgement ? { addedPoints: [], removedPoints: [], changedPoints: [], summary: judgement.reason ?? description } : null,
+        "supersedes", "auto_accept",
+      )
+    } catch { /* non-critical */ }
     return
   }
 
   if (decision === "notify") {
-    // Don't create a review item — just notify the user
+    // Notify the user but also record in lineage as AI-detected
     await notifyUser(description)
+
+    try {
+      const { recordTransition } = await import("./lineage-tracker")
+      // Generate diff for the lineage record
+      const { generateSemanticDiff } = await import("./diff-engine")
+      const { readFile } = await import("@/commands/fs")
+      const [oldContent, _newContent] = await Promise.all([
+        readFile(topCandidate.pagePath).catch(() => ""),
+        Promise.resolve(newContent),
+      ])
+      const diffResult = await generateSemanticDiff(llmConfig, topCandidate.title, oldContent, newTitle, newContent).catch(() => null)
+
+      await recordTransition(
+        projectPath, topCandidate.pagePath, topCandidate.title,
+        newPagePath, newTitle,
+        diffResult ?? { addedPoints: [], removedPoints: [], changedPoints: [], summary: description },
+        "updates", "auto_notify",
+      )
+    } catch { /* non-critical */ }
     return
   }
 
