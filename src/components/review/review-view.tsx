@@ -1,4 +1,4 @@
-import { useCallback } from "react"
+import { useCallback, useState } from "react"
 import { queueResearch } from "@/lib/deep-research"
 import {
   AlertTriangle,
@@ -20,6 +20,7 @@ import { useReviewStore, type ReviewItem } from "@/stores/review-store"
 import { useWikiStore } from "@/stores/wiki-store"
 import { writeFile, readFile, listDirectory, deleteFile } from "@/commands/fs"
 import { normalizePath } from "@/lib/path-utils"
+import { ReviewPanel as GovernanceReviewPanel } from "./review-panel"
 
 const typeConfig: Record<ReviewItem["type"], { icon: typeof AlertTriangle; label: string; color: string }> = {
   contradiction: { icon: AlertTriangle, label: "Contradiction", color: "text-amber-500" },
@@ -36,6 +37,7 @@ export function ReviewView() {
   const clearResolved = useReviewStore((s) => s.clearResolved)
   const project = useWikiStore((s) => s.project)
   const setFileTree = useWikiStore((s) => s.setFileTree)
+  const [tab, setTab] = useState<"governance" | "ai-suggestions">("governance")
 
   const handleResolve = useCallback(async (id: string, action: string) => {
     const pp = project ? normalizePath(project.path) : ""
@@ -230,58 +232,75 @@ export function ReviewView() {
 
   return (
     <div className="flex h-full flex-col">
-      <div className="flex items-center justify-between border-b px-4 py-3">
-        <h2 className="text-sm font-semibold">
-          Review
+      {/* Tab bar */}
+      <div className="flex shrink-0 border-b">
+        <button
+          onClick={() => setTab("governance")}
+          className={`flex-1 px-3 py-2.5 text-xs font-medium transition-colors ${
+            tab === "governance"
+              ? "border-b-2 border-primary text-foreground"
+              : "text-muted-foreground hover:text-foreground"
+          }`}
+        >
+          🛡 知识审核
+        </button>
+        <button
+          onClick={() => setTab("ai-suggestions")}
+          className={`relative flex-1 px-3 py-2.5 text-xs font-medium transition-colors ${
+            tab === "ai-suggestions"
+              ? "border-b-2 border-primary text-foreground"
+              : "text-muted-foreground hover:text-foreground"
+          }`}
+        >
+          💡 AI 建议
           {pending.length > 0 && (
-            <span className="ml-2 rounded-full bg-primary px-2 py-0.5 text-xs text-primary-foreground">
+            <span className="ml-1 rounded-full bg-primary px-1.5 py-0.5 text-[10px] text-primary-foreground">
               {pending.length}
             </span>
           )}
-        </h2>
-        {resolved.length > 0 && (
-          <Button variant="ghost" size="sm" onClick={clearResolved} className="text-xs">
-            <Trash2 className="mr-1 h-3 w-3" />
-            Clear resolved
-          </Button>
-        )}
+        </button>
       </div>
 
-      <div className="flex-1 overflow-y-auto">
-        {items.length === 0 ? (
-          <div className="flex flex-col items-center justify-center gap-2 p-8 text-center text-sm text-muted-foreground">
-            <CheckCircle2 className="h-8 w-8 text-muted-foreground/30" />
-            <p>All clear — nothing to review</p>
-          </div>
-        ) : (
-          <div className="flex flex-col gap-2 p-3">
-            {pending.map((item) => (
-              <ReviewCard
-                key={item.id}
-                item={item}
-                onResolve={handleResolve}
-                onDismiss={dismissItem}
-              />
-            ))}
-            {resolved.length > 0 && pending.length > 0 && (
-              <div className="my-2 text-center text-xs text-muted-foreground">
-                — Resolved —
+      {/* Governance tab */}
+      {tab === "governance" && <GovernanceReviewPanel />}
+
+      {/* AI Suggestions tab */}
+      {tab === "ai-suggestions" && (
+        <div className="flex flex-1 flex-col overflow-hidden">
+          {resolved.length > 0 && (
+            <div className="flex justify-end border-b px-3 py-1.5">
+              <Button variant="ghost" size="sm" onClick={clearResolved} className="text-xs">
+                <Trash2 className="mr-1 h-3 w-3" />
+                Clear resolved
+              </Button>
+            </div>
+          )}
+          <div className="flex-1 overflow-y-auto">
+            {items.length === 0 ? (
+              <div className="flex flex-col items-center justify-center gap-2 p-8 text-center text-sm text-muted-foreground">
+                <CheckCircle2 className="h-8 w-8 text-muted-foreground/30" />
+                <p>All clear — nothing to review</p>
+              </div>
+            ) : (
+              <div className="flex flex-col gap-2 p-3">
+                {pending.map((item) => (
+                  <ReviewCard key={item.id} item={item} onResolve={handleResolve} onDismiss={dismissItem} />
+                ))}
+                {resolved.length > 0 && pending.length > 0 && (
+                  <div className="my-2 text-center text-xs text-muted-foreground">— Resolved —</div>
+                )}
+                {resolved.map((item) => (
+                  <ReviewCard key={item.id} item={item} onResolve={handleResolve} onDismiss={dismissItem} />
+                ))}
               </div>
             )}
-            {resolved.map((item) => (
-              <ReviewCard
-                key={item.id}
-                item={item}
-                onResolve={handleResolve}
-                onDismiss={dismissItem}
-              />
-            ))}
           </div>
-        )}
-      </div>
+        </div>
+      )}
     </div>
   )
 }
+
 
 function ReviewCard({
   item,

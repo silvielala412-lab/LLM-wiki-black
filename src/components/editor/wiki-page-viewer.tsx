@@ -22,6 +22,9 @@ import { normalizePath } from "@/lib/path-utils"
 import { cascadeDeleteWikiPage } from "@/lib/wiki-page-delete"
 import { listDirectory, writeFile } from "@/commands/fs"
 import { ConfirmDialog } from "@/components/ui/confirm-dialog"
+import { StatusBadge } from "@/components/review/status-badge"
+import { setPageStatus, parseStatusFromContent } from "@/lib/knowledge-governance"
+import type { KnowledgeStatus } from "@/lib/knowledge-governance"
 
 // ── Type icons & colours ─────────────────────────────────────────────────────
 
@@ -46,12 +49,14 @@ interface Frontmatter {
   ingested_at: string
   ingested_by: string
   ingested_by_user: string
+  status: string
 }
+
 
 function parseFrontmatter(content: string): { fm: Frontmatter; body: string } {
   const fm: Frontmatter = {
     title: "", type: "default", tags: [], related: [], sources: [],
-    created: "", updated: "", ingested_at: "", ingested_by: "", ingested_by_user: "",
+    created: "", updated: "", ingested_at: "", ingested_by: "", ingested_by_user: "", status: "",
   }
 
   const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/m)
@@ -373,6 +378,18 @@ export function WikiPageViewer({ filePath, content, onEditRequest, onDeleteCompl
     }))
   }, [fm.related, allPaths])
 
+  const status: KnowledgeStatus = (parseStatusFromContent(content) as KnowledgeStatus)
+
+  const handleMarkActive = useCallback(async () => {
+    if (!projectPath) return
+    try {
+      await setPageStatus(filePath, "active")
+      bumpDataVersion()
+    } catch (err) {
+      console.error("[WikiPageViewer] Failed to mark active:", err)
+    }
+  }, [filePath, projectPath, bumpDataVersion])
+
   const openRelated = useCallback((path: string) => {
     setSelectedFile(path)
   }, [setSelectedFile])
@@ -569,6 +586,17 @@ export function WikiPageViewer({ filePath, content, onEditRequest, onDeleteCompl
               <Badge color={typeMeta.color} bg={typeMeta.bg}>
                 {fm.type}
               </Badge>
+              {/* Knowledge status badge */}
+              <StatusBadge status={status} />
+              {status === "candidate" && (
+                <button
+                  onClick={handleMarkActive}
+                  className="inline-flex items-center gap-1 rounded-full border border-emerald-300 bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-700 hover:bg-emerald-100 transition-colors dark:bg-emerald-950/40 dark:border-emerald-700 dark:text-emerald-400"
+                  title="确认为有效知识"
+                >
+                  ✓ 标记为已确认
+                </button>
+              )}
               {fm.tags.slice(0, 3).map(tag => (
                 <TagBadge key={tag}>{tag}</TagBadge>
               ))}

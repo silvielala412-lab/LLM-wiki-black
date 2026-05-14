@@ -659,6 +659,17 @@ async function autoIngestImpl(
   activity.updateItem(activityId, { detail: "Writing files...", step: "Analysing entity deduplication" })
   const { writtenPaths, warnings: writeWarnings, hardFailures } = await writeFileBlocks(pp, generation)
 
+  // Stamp all newly written wiki pages as "candidate" (knowledge governance).
+  // Skip structural pages (index, log, overview) — they don't need review.
+  const { stampCandidate } = await import("@/lib/knowledge-governance")
+  const SKIP_STAMP = new Set(["index.md", "log.md", "overview.md"])
+  for (const rel of writtenPaths) {
+    const base = rel.split("/").pop() ?? ""
+    if (!SKIP_STAMP.has(base) && rel.startsWith("wiki/")) {
+      stampCandidate(`${pp}/${rel}`).catch(() => {/* non-critical */})
+    }
+  }
+
   // Surface parser / writer warnings to the activity panel so users
   // don't have to open devtools to find out a block was dropped.
   // Keeping the base "Writing files..." detail on top and appending the
