@@ -43,8 +43,45 @@ export function ReviewPanel() {
       } else if (resolution === "superseded" && item.existingPagePath) {
         await setPageStatus(item.existingPagePath, "superseded")
         await setPageStatus(item.newPagePath, "active")
+
+        // ── Phase 3: Record knowledge transition + generate semantic diff ───
+        // Fire-and-forget so the UI is not blocked.
+        ;(async () => {
+          try {
+            const { readFile } = await import("@/commands/fs")
+            const { generateSemanticDiff } = await import("@/lib/knowledge-governance/diff-engine")
+            const { recordTransition } = await import("@/lib/knowledge-governance/lineage-tracker")
+            const llmConfig = (await import("@/stores/wiki-store")).useWikiStore.getState().llmConfig
+
+            const [oldContent, newContent] = await Promise.all([
+              readFile(item.existingPagePath!).catch(() => ""),
+              readFile(item.newPagePath).catch(() => ""),
+            ])
+
+            const diffResult = await generateSemanticDiff(
+              llmConfig,
+              item.existingPageTitle,
+              oldContent,
+              item.newPageTitle,
+              newContent,
+            )
+
+            await recordTransition(
+              pp,
+              item.existingPagePath!,
+              item.existingPageTitle,
+              item.newPagePath,
+              item.newPageTitle,
+              diffResult,
+              "supersedes",
+            )
+
+            console.log(`[ReviewPanel] Lineage recorded for "${item.newPageTitle}" ← "${item.existingPageTitle}"`)
+          } catch (err) {
+            console.warn("[ReviewPanel] Failed to record transition:", err)
+          }
+        })()
       } else if (resolution === "merged") {
-        // Merged: reject the new page (content should be merged manually)
         await setPageStatus(item.newPagePath, "rejected")
       }
     } catch (err) {

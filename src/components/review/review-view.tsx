@@ -21,6 +21,7 @@ import { useWikiStore } from "@/stores/wiki-store"
 import { writeFile, readFile, listDirectory, deleteFile } from "@/commands/fs"
 import { normalizePath } from "@/lib/path-utils"
 import { ReviewPanel as GovernanceReviewPanel } from "./review-panel"
+import { EvolutionPanel } from "./evolution-panel"
 
 const typeConfig: Record<ReviewItem["type"], { icon: typeof AlertTriangle; label: string; color: string }> = {
   contradiction: { icon: AlertTriangle, label: "Contradiction", color: "text-amber-500" },
@@ -37,7 +38,7 @@ export function ReviewView() {
   const clearResolved = useReviewStore((s) => s.clearResolved)
   const project = useWikiStore((s) => s.project)
   const setFileTree = useWikiStore((s) => s.setFileTree)
-  const [tab, setTab] = useState<"governance" | "ai-suggestions">("governance")
+  const [tab, setTab] = useState<"governance" | "evolution" | "ai-suggestions">("governance")
 
   const handleResolve = useCallback(async (id: string, action: string) => {
     const pp = project ? normalizePath(project.path) : ""
@@ -236,7 +237,7 @@ export function ReviewView() {
       <div className="flex shrink-0 border-b">
         <button
           onClick={() => setTab("governance")}
-          className={`flex-1 px-3 py-2.5 text-xs font-medium transition-colors ${
+          className={`flex-1 px-2 py-2.5 text-xs font-medium transition-colors ${
             tab === "governance"
               ? "border-b-2 border-primary text-foreground"
               : "text-muted-foreground hover:text-foreground"
@@ -245,8 +246,18 @@ export function ReviewView() {
           🛡 知识审核
         </button>
         <button
+          onClick={() => setTab("evolution")}
+          className={`flex-1 px-2 py-2.5 text-xs font-medium transition-colors ${
+            tab === "evolution"
+              ? "border-b-2 border-primary text-foreground"
+              : "text-muted-foreground hover:text-foreground"
+          }`}
+        >
+          📈 知识演化
+        </button>
+        <button
           onClick={() => setTab("ai-suggestions")}
-          className={`relative flex-1 px-3 py-2.5 text-xs font-medium transition-colors ${
+          className={`relative flex-1 px-2 py-2.5 text-xs font-medium transition-colors ${
             tab === "ai-suggestions"
               ? "border-b-2 border-primary text-foreground"
               : "text-muted-foreground hover:text-foreground"
@@ -263,6 +274,9 @@ export function ReviewView() {
 
       {/* Governance tab */}
       {tab === "governance" && <GovernanceReviewPanel />}
+
+      {/* Evolution tab */}
+      {tab === "evolution" && <EvolutionPanel />}
 
       {/* AI Suggestions tab */}
       {tab === "ai-suggestions" && (

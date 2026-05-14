@@ -61,3 +61,21 @@ export { evaluatePolicy, buildPolicyDescription } from "./policy-engine"
 
 // Orchestrator (main Phase 2 entry point)
 export { runGovernancePipeline } from "./orchestrator"
+
+// ── Phase 3: Knowledge Evolution + Lineage ────────────────────────────────────
+
+// Lineage Tracker
+export type { KnowledgeTransition } from "./lineage-tracker"
+export {
+  loadLineage,
+  appendTransition,
+  recordTransition,
+  getSupersededBy,
+  getSupersedes,
+  buildVersionChain,
+} from "./lineage-tracker"
+
+// Diff Engine
+export type { SemanticDiff } from "./diff-engine"
+export { generateSemanticDiff } from "./diff-engine"
+
