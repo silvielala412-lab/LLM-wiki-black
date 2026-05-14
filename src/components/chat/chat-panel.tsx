@@ -16,9 +16,93 @@ import { isGreeting } from "@/lib/greeting-detector"
 import { computeContextBudget } from "@/lib/context-budget"
 import { cascadeDeleteWikiPage } from "@/lib/wiki-page-delete"
 import { ConfirmDialog } from "@/components/ui/confirm-dialog"
+import type { FileNode } from "@/types/wiki"
 
 // Store the page mapping from the last query so SourceFilesBar can show which pages were cited
 export let lastQueryPages: { title: string; path: string }[] = []
+
+type ChatDeleteItem = { name: string; path: string }
+
+function flattenMarkdownFiles(nodes: FileNode[]): FileNode[] {
+  const files: FileNode[] = []
+  for (const node of nodes) {
+    if (node.is_dir && node.children) {
+      files.push(...flattenMarkdownFiles(node.children))
+    } else if (!node.is_dir && node.name.toLowerCase().endsWith(".md")) {
+      files.push(node)
+    }
+  }
+  return files
+}
+
+function extractPageTitle(fileName: string, content: string): string {
+  const fm = content.match(/^---\n([\s\S]*?)\n---/)
+  const titleMatch = fm?.[1].match(/^title:\s*["']?(.+?)["']?\s*$/m)
+  if (titleMatch) return titleMatch[1].trim()
+
+  const headingMatch = content.match(/^#\s+(.+)$/m)
+  if (headingMatch) return headingMatch[1].trim()
+
+  return fileName.replace(/\.md$/i, "").replace(/-/g, " ")
+}
+
+function parseBulkTitleDeleteKeyword(text: string): string | null {
+  const lower = text.toLowerCase()
+  const wantsDelete = /delete/.test(lower) || /删除|删掉|移除|清理/.test(text)
+  const mentionsTitle = /title/.test(lower) || /标题/.test(text)
+  if (!wantsDelete || !mentionsTitle) return null
+
+  const patterns = [
+    /标题\s*(?:中)?\s*(?:含有|包含|包括|带有|有)\s*["'`“”]?(.+?)["'`“”]?\s*(?:的)?\s*(?:所有|全部)?\s*(?:文档|页面|资料|文件|wiki)/i,
+    /title\s*(?:contains|including|includes|with)\s*["'`]?(.+?)["'`]?\s*(?:documents|pages|files|wiki)?/i,
+  ]
+
+  for (const pattern of patterns) {
+    const match = text.match(pattern)
+    if (!match) continue
+    const keyword = match[1]
+      .trim()
+      .replace(/^["'`“”]+|["'`“”]+$/g, "")
+      .replace(/\s*(?:的)?\s*(?:所有|全部)?\s*(?:文档|页面|资料|文件|wiki).*$/i, "")
+      .trim()
+    if (keyword) return keyword
+  }
+
+  return null
+}
+
+async function findWikiPagesByTitleKeyword(projectPath: string, keyword: string): Promise<ChatDeleteItem[]> {
+  const pp = normalizePath(projectPath)
+  const tree = await listDirectory(`${pp}/wiki`) as FileNode[]
+  const mdFiles = flattenMarkdownFiles(tree)
+  const needle = keyword.toLowerCase()
+  const matches: ChatDeleteItem[] = []
+
+  for (const file of mdFiles) {
+    if (file.name === "index.md" || file.name === "log.md") continue
+    try {
+      const content = await readFile(file.path)
+      const title = extractPageTitle(file.name, content)
+      if (title.toLowerCase().includes(needle) || file.name.toLowerCase().includes(needle)) {
+        matches.push({ name: title, path: file.path })
+      }
+    } catch {
+      const fallbackTitle = file.name.replace(/\.md$/i, "").replace(/-/g, " ")
+      if (fallbackTitle.toLowerCase().includes(needle) || file.name.toLowerCase().includes(needle)) {
+        matches.push({ name: fallbackTitle, path: file.path })
+      }
+    }
+  }
+
+  return matches.sort((a, b) => a.name.localeCompare(b.name))
+}
+
+function formatDeletePreview(items: ChatDeleteItem[]): string {
+  return items
+    .slice(0, 20)
+    .map((item) => `- ${item.name}`)
+    .join("\n")
+}
 
 function formatDate(timestamp: number): string {
   const d = new Date(timestamp)
@@ -149,15 +233,19 @@ export function ChatPanel() {
   const bottomRef = useRef<HTMLDivElement>(null)
 
   // State for chat-triggered page deletions (supports batch)
-  const [pendingChatDeletes, setPendingChatDeletes] = useState<{ name: string; path: string }[]>([])
+  const [pendingChatDeletes, setPendingChatDeletes] = useState<ChatDeleteItem[]>([])
 
   const handleChatDeleteConfirm = useCallback(async () => {
     if (pendingChatDeletes.length === 0 || !project) return
     const pp = normalizePath(project.path)
+    let deletedCount = 0
+    const failed: ChatDeleteItem[] = []
     for (const item of pendingChatDeletes) {
       try {
         await cascadeDeleteWikiPage(pp, item.path)
+        deletedCount += 1
       } catch (err) {
+        failed.push(item)
         console.error('[ChatPanel] Chat delete failed:', item.path, err)
       }
     }
@@ -167,8 +255,14 @@ export function ChatPanel() {
       useWikiStore.getState().bumpDataVersion()
       useWikiStore.getState().setSelectedFile(null)
     } catch {}
+    addMessage(
+      "assistant",
+      failed.length === 0
+        ? `Deleted ${deletedCount} wiki page(s).`
+        : `Deleted ${deletedCount} wiki page(s). Failed to delete ${failed.length}: ${failed.map((item) => item.name).join(", ")}`,
+    )
     setPendingChatDeletes([])
-  }, [pendingChatDeletes, project])
+  }, [addMessage, pendingChatDeletes, project])
 
   // Auto-scroll to bottom when messages change or streaming content updates
   useEffect(() => {
@@ -187,6 +281,41 @@ export function ChatPanel() {
       }
 
       addMessage("user", text)
+
+      const bulkDeleteKeyword = parseBulkTitleDeleteKeyword(text)
+      if (bulkDeleteKeyword && project) {
+        try {
+          const matches = await findWikiPagesByTitleKeyword(project.path, bulkDeleteKeyword)
+          if (matches.length === 0) {
+            addMessage(
+              "assistant",
+              `No wiki pages have a title containing "${bulkDeleteKeyword}". Nothing was deleted.`,
+            )
+            return
+          }
+
+          setPendingChatDeletes(matches)
+          const overflow = matches.length > 20 ? `\n\n...and ${matches.length - 20} more.` : ""
+          addMessage(
+            "assistant",
+            [
+              `Found ${matches.length} wiki page(s) with titles or filenames containing "${bulkDeleteKeyword}".`,
+              "",
+              formatDeletePreview(matches) + overflow,
+              "",
+              "Use the confirmation dialog to delete them. This will remove the page files and their vector index entries.",
+            ].join("\n"),
+          )
+          return
+        } catch (err) {
+          addMessage(
+            "assistant",
+            `I could not scan wiki page titles for "${bulkDeleteKeyword}": ${err instanceof Error ? err.message : String(err)}`,
+          )
+          return
+        }
+      }
+
       setStreaming(true)
 
       // Build system prompt with wiki context using graph-enhanced retrieval
@@ -431,7 +560,7 @@ export function ChatPanel() {
               const pp = normalizePath(project.path)
               // Handle delete actions — supports multiple tags in one response
               const deleteTagRe = /<!-- action:delete\s+page="([^"]+)"\s+path="([^"]+)"\s*-->/g
-              const deleteItems: { name: string; path: string }[] = []
+              const deleteItems: ChatDeleteItem[] = []
               for (const m of accumulated.matchAll(deleteTagRe)) {
                 deleteItems.push({ name: m[1], path: `${pp}/${m[2]}` })
               }
@@ -587,14 +716,14 @@ export function ChatPanel() {
       {/* Batch delete confirmation dialog for chat-triggered deletions */}
       <ConfirmDialog
         open={pendingChatDeletes.length > 0}
-        title={pendingChatDeletes.length === 1 ? "确认删除此页面？" : `确认删除 ${pendingChatDeletes.length} 个页面？`}
+        title={pendingChatDeletes.length === 1 ? "Confirm page deletion?" : `Confirm deleting ${pendingChatDeletes.length} pages?`}
         description={
           pendingChatDeletes.length === 1
-            ? `AI 建议删除「${pendingChatDeletes[0]?.name}」。此操作将永久删除该页面及其向量索引，不可撤销。`
-            : `AI 建议删除以下 ${pendingChatDeletes.length} 个页面（永久删除，不可撤销）：\n${pendingChatDeletes.map(d => `• ${d.name}`).join('\n')}`
+            ? `This will permanently delete "${pendingChatDeletes[0]?.name}", including its vector index entry. This cannot be undone.`
+            : `This will permanently delete these ${pendingChatDeletes.length} pages, including their vector index entries:\n${pendingChatDeletes.map(d => `- ${d.name}`).join('\n')}`
         }
-        confirmLabel={pendingChatDeletes.length === 1 ? "确认删除" : `确认删除 ${pendingChatDeletes.length} 项`}
-        cancelLabel="取消"
+        confirmLabel={pendingChatDeletes.length === 1 ? "Delete page" : `Delete ${pendingChatDeletes.length} pages`}
+        cancelLabel="Cancel"
         variant="destructive"
         onConfirm={handleChatDeleteConfirm}
         onCancel={() => setPendingChatDeletes([])}
