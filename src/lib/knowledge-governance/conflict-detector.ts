@@ -144,11 +144,61 @@ export async function findSimilarByVector(
   }
 }
 
+// ── Keyword extraction helper ─────────────────────────────────────────────────
+
+/**
+ * Extract meaningful keywords from a title.
+ * - Strips year-like numbers (2020-2029)
+ * - Strips common noise chars
+ * - Splits by CJK character boundaries and Latin words
+ * - Returns unique tokens of length ≥ 2
+ */
+function extractKeywords(title: string): string[] {
+  const normalized = title
+    .toLowerCase()
+    .replace(/20\d{2}/g, "")          // remove years like 2023, 2024
+    .replace(/[（）()【】\[\]「」\s_\-·]/g, " ") // punctuation → space
+    .trim()
+
+  // Split CJK characters into bigrams + Latin words
+  const tokens: string[] = []
+  const latinWords = normalized.match(/[a-z0-9]{2,}/g) ?? []
+  tokens.push(...latinWords)
+
+  // CJK: extract all 2-char sequences as bigrams
+  const cjk = normalized.replace(/[a-z0-9\s]/g, "")
+  for (let i = 0; i < cjk.length - 1; i++) {
+    tokens.push(cjk.slice(i, i + 2))
+  }
+  // Also add individual CJK chars that appear ≥ 2 times in original title
+  for (const ch of cjk) {
+    if (ch.trim()) tokens.push(ch)
+  }
+
+  return [...new Set(tokens.filter((t) => t.length >= 1))]
+}
+
+/** Jaccard-like keyword overlap score 0-1 */
+function keywordSimilarity(a: string[], b: string[]): number {
+  if (a.length === 0 || b.length === 0) return 0
+  const setA = new Set(a)
+  const setB = new Set(b)
+  let intersection = 0
+  for (const kw of setA) { if (setB.has(kw)) intersection++ }
+  const union = new Set([...setA, ...setB]).size
+  return intersection / union
+}
+
 // ── Title-based fallback ─────────────────────────────────────────────────────
 
 /**
  * Find pages with a similar title using file system scan.
  * Used as fallback when embedding is not configured.
+ *
+ * Matching strategy (in priority order):
+ *   1. Exact title match               → score 0.95
+ *   2. One title contains the other    → score 0.75
+ *   3. Keyword overlap ≥ 0.30          → score 0.65
  *
  * @param projectPath  Absolute project root path
  * @param newTitle     Title of the new page
@@ -181,6 +231,7 @@ export async function findSimilarByTitle(
 
     const candidates: ConflictCandidate[] = []
     const needle = newTitle.toLowerCase().replace(/\s+/g, "")
+    const needleKeywords = extractKeywords(newTitle)
     const SKIP = new Set(["index.md", "log.md", "overview.md"])
 
     for (const filePath of allPaths) {
@@ -201,6 +252,13 @@ export async function findSimilarByTitle(
           method = "title_exact"
         } else if (titleNorm.includes(needle) || needle.includes(titleNorm)) {
           score = 0.75
+        } else {
+          // Keyword overlap fallback
+          const existingKeywords = extractKeywords(title)
+          const kwScore = keywordSimilarity(needleKeywords, existingKeywords)
+          if (kwScore >= 0.30) {
+            score = 0.55 + kwScore * 0.3  // maps 0.30..1.0 → 0.64..0.85
+          }
         }
 
         if (score > 0) {
@@ -224,6 +282,7 @@ export async function findSimilarByTitle(
     return []
   }
 }
+
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
