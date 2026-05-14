@@ -10,6 +10,7 @@
  */
 
 import type { JudgementResult, JudgeRelation, JudgeConfidence } from "./types"
+import { callLLM } from "./llm-helper"
 
 // ── Prompt construction ───────────────────────────────────────────────────────
 
@@ -102,82 +103,34 @@ export async function judgeRelationship(
   }
 
   const prompt = buildJudgePrompt(newTitle, newExcerpt, existingTitle, existingExcerpt)
+  const responseText = await callLLM(
+    llmConfig,
+    [{ role: "user", content: prompt }],
+    256,
+  )
 
-  try {
-    // Try backend proxy first (avoids CORS in production)
-    let responseText: string | null = null
-
-    try {
-      const proxyRes = await fetch("/api/llm/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          messages: [{ role: "user", content: prompt }],
-          temperature: 0.1,
-          max_tokens: 256,
-          stream: false,
-        }),
-      })
-      if (proxyRes.ok) {
-        const data = await proxyRes.json()
-        responseText = data?.choices?.[0]?.message?.content ?? null
-      }
-    } catch {
-      // Backend proxy not available — fall through to direct call
-    }
-
-    // Direct LLM call (dev mode / Tauri)
-    if (!responseText && llmConfig.endpoint) {
-      const headers: Record<string, string> = { "Content-Type": "application/json" }
-      if (llmConfig.apiKey) headers.Authorization = `Bearer ${llmConfig.apiKey}`
-
-      const { getHttpFetch } = await import("@/lib/tauri-fetch")
-      const httpFetch = await getHttpFetch()
-      const res = await httpFetch(llmConfig.endpoint, {
-        method: "POST",
-        headers,
-        body: JSON.stringify({
-          model: llmConfig.model,
-          messages: [{ role: "user", content: prompt }],
-          temperature: 0.1,
-          max_tokens: 256,
-          stream: false,
-        }),
-      })
-      if (!res.ok) {
-        console.warn(`[judge-module] LLM returned HTTP ${res.status}`)
-        return null
-      }
-      const data = await res.json()
-      responseText = data?.choices?.[0]?.message?.content ?? null
-    }
-
-    if (!responseText) {
-      console.warn("[judge-module] LLM returned empty response")
-      return null
-    }
-
-    const parsed = parseJudgeResponse(responseText)
-    if (!parsed) {
-      console.warn("[judge-module] Could not parse LLM response:", responseText.slice(0, 200))
-      return null
-    }
-
-    const relation = VALID_RELATIONS.has(parsed.relation as JudgeRelation)
-      ? (parsed.relation as JudgeRelation)
-      : "uncertain"
-    const confidence = VALID_CONFIDENCES.has(parsed.confidence as JudgeConfidence)
-      ? (parsed.confidence as JudgeConfidence)
-      : "low"
-
-    return {
-      relation,
-      confidence,
-      reason: parsed.reason ?? "无法获取分析理由。",
-      judgedAt: new Date().toISOString(),
-    }
-  } catch (err) {
-    console.warn("[judge-module] LLM call failed:", err)
+  if (!responseText) {
+    console.warn("[judge-module] LLM returned empty response")
     return null
+  }
+
+  const parsed = parseJudgeResponse(responseText)
+  if (!parsed) {
+    console.warn("[judge-module] Could not parse LLM response:", responseText.slice(0, 200))
+    return null
+  }
+
+  const relation = VALID_RELATIONS.has(parsed.relation as JudgeRelation)
+    ? (parsed.relation as JudgeRelation)
+    : "uncertain"
+  const confidence = VALID_CONFIDENCES.has(parsed.confidence as JudgeConfidence)
+    ? (parsed.confidence as JudgeConfidence)
+    : "low"
+
+  return {
+    relation,
+    confidence,
+    reason: parsed.reason ?? "无法获取分析理由。",
+    judgedAt: new Date().toISOString(),
   }
 }

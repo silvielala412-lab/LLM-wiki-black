@@ -81,7 +81,7 @@ function parseDiffResponse(raw: string): {
   }
 }
 
-// ── Public API ────────────────────────────────────────────────────────────────
+import { callLLM } from "./llm-helper"
 
 export interface SemanticDiff {
   addedPoints: string[]
@@ -113,53 +113,16 @@ export async function generateSemanticDiff(
   }
 
   const prompt = buildDiffPrompt(oldTitle, oldContent, newTitle, newContent)
-  let responseText: string | null = null
+  const responseText = await callLLM(
+    llmConfig,
+    [{ role: "user", content: prompt }],
+    512,
+  )
 
-  // Try backend proxy first
-  try {
-    const proxyRes = await fetch("/api/llm/chat", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        messages: [{ role: "user", content: prompt }],
-        temperature: 0.1,
-        max_tokens: 512,
-        stream: false,
-      }),
-    })
-    if (proxyRes.ok) {
-      const data = await proxyRes.json()
-      responseText = data?.choices?.[0]?.message?.content ?? null
-    }
-  } catch { /* fall through */ }
-
-  // Direct call fallback
-  if (!responseText && llmConfig.endpoint) {
-    try {
-      const headers: Record<string, string> = { "Content-Type": "application/json" }
-      if (llmConfig.apiKey) headers.Authorization = `Bearer ${llmConfig.apiKey}`
-      const { getHttpFetch } = await import("@/lib/tauri-fetch")
-      const httpFetch = await getHttpFetch()
-      const res = await httpFetch(llmConfig.endpoint, {
-        method: "POST",
-        headers,
-        body: JSON.stringify({
-          model: llmConfig.model,
-          messages: [{ role: "user", content: prompt }],
-          temperature: 0.1,
-          max_tokens: 512,
-          stream: false,
-        }),
-      })
-      if (res.ok) {
-        const data = await res.json()
-        responseText = data?.choices?.[0]?.message?.content ?? null
-      }
-    } catch (err) {
-      console.warn("[diff-engine] Direct LLM call failed:", err)
-    }
+  if (!responseText) {
+    console.warn("[diff-engine] LLM returned no response")
+    return null
   }
-
-  if (!responseText) return null
   return parseDiffResponse(responseText)
 }
+
