@@ -39,9 +39,11 @@ async function notifyUser(message: string): Promise<void> {
   try {
     const { useActivityStore } = await import("@/stores/activity-store")
     useActivityStore.getState().addItem({
-      type: "info",
+      type: "ingest",
+      status: "done",
       title: "知识治理",
       detail: message,
+      filesWritten: [],
     })
   } catch {
     console.info("[governance] notify:", message)
