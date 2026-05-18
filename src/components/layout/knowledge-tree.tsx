@@ -134,8 +134,8 @@ export function KnowledgeTree() {
   const checkedCount = checkedPaths.size
 
   return (
-    <div className="flex h-full flex-col">
-      <ScrollArea className="flex-1">
+    <div className="flex h-full min-h-0 flex-col overflow-hidden">
+      <ScrollArea className="min-h-0 flex-1">
         <div className="p-2">
           <div className="mb-2 px-2 text-xs font-semibold uppercase text-muted-foreground">
             {project.name}

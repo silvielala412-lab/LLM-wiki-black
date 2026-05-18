@@ -109,7 +109,7 @@ export function ReviewPanel() {
   }
 
   return (
-    <div className="flex h-full flex-col">
+    <div className="flex h-full min-h-0 flex-col overflow-hidden">
       {/* Header */}
       <div className="flex items-center gap-2 border-b px-4 py-3">
         <ShieldCheck className="h-4 w-4 text-amber-500" />
@@ -121,7 +121,7 @@ export function ReviewPanel() {
         )}
       </div>
 
-      <ScrollArea className="flex-1">
+      <ScrollArea className="min-h-0 flex-1">
         <div className="p-3 space-y-3">
           {isLoading && (
             <div className="flex justify-center py-8">

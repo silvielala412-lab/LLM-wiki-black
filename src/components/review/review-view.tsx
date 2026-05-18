@@ -232,7 +232,7 @@ export function ReviewView() {
   const resolved = items.filter((i) => i.resolved)
 
   return (
-    <div className="flex h-full flex-col">
+    <div className="flex h-full min-h-0 flex-col overflow-hidden">
       {/* Tab bar */}
       <div className="flex shrink-0 border-b">
         <button
@@ -273,14 +273,22 @@ export function ReviewView() {
       </div>
 
       {/* Governance tab */}
-      {tab === "governance" && <GovernanceReviewPanel />}
+      {tab === "governance" && (
+        <div className="min-h-0 flex-1 overflow-hidden">
+          <GovernanceReviewPanel />
+        </div>
+      )}
 
       {/* Evolution tab */}
-      {tab === "evolution" && <EvolutionPanel />}
+      {tab === "evolution" && (
+        <div className="min-h-0 flex-1 overflow-hidden">
+          <EvolutionPanel />
+        </div>
+      )}
 
       {/* AI Suggestions tab */}
       {tab === "ai-suggestions" && (
-        <div className="flex flex-1 flex-col overflow-hidden">
+        <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
           {resolved.length > 0 && (
             <div className="flex justify-end border-b px-3 py-1.5">
               <Button variant="ghost" size="sm" onClick={clearResolved} className="text-xs">
@@ -289,7 +297,7 @@ export function ReviewView() {
               </Button>
             </div>
           )}
-          <div className="flex-1 overflow-y-auto">
+          <div className="min-h-0 flex-1 overflow-y-auto">
             {items.length === 0 ? (
               <div className="flex flex-col items-center justify-center gap-2 p-8 text-center text-sm text-muted-foreground">
                 <CheckCircle2 className="h-8 w-8 text-muted-foreground/30" />
