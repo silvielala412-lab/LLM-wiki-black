@@ -10,6 +10,8 @@ import { ChevronDown, ChevronUp, Sliders, Sparkles } from "lucide-react"
 import type { ChunkingConfig } from "@/types/wiki"
 import { DEFAULT_CHUNKING_CONFIG } from "@/types/wiki"
 
+const CUSTOM_INSTRUCTION_MAX_LENGTH = 1500
+
 interface ChunkingSectionProps {
   config: ChunkingConfig
   onChange: (config: ChunkingConfig) => void
@@ -176,12 +178,12 @@ export function ChunkingSection({ config, onChange }: ChunkingSectionProps) {
               <Sparkles className="h-3.5 w-3.5 text-violet-400" />
               <Label className="text-xs font-medium text-muted-foreground">
                 自定义指令
-                <span className="ml-1 text-muted-foreground/60">({config.custom_instruction.length}/500)</span>
+                <span className="ml-1 text-muted-foreground/60">({config.custom_instruction.length}/{CUSTOM_INSTRUCTION_MAX_LENGTH})</span>
               </Label>
             </div>
             <textarea
               value={config.custom_instruction}
-              onChange={(e) => update({ custom_instruction: e.target.value.slice(0, 500) })}
+              onChange={(e) => update({ custom_instruction: e.target.value.slice(0, CUSTOM_INSTRUCTION_MAX_LENGTH) })}
               placeholder="例如：每个知识点请附上适用场景和常见误区，用中文输出..."
               rows={3}
               className="w-full resize-none rounded-md border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
