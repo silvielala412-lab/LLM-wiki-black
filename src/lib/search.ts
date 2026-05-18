@@ -23,6 +23,9 @@ export interface SearchResult {
   snippet: string
   titleMatch: boolean
   score: number
+  knowledgeStatus?: "candidate" | "active" | "superseded" | "rejected"
+  ingestQualityConfidence?: "high" | "medium" | "low"
+  governanceScoreMultiplier?: number
   /**
    * Image references found inside this result's markdown. Populated
    * even when the query doesn't match the alt text — the UI splits
@@ -76,6 +79,29 @@ const PHRASE_IN_CONTENT_PER_OCC = 20
 const MAX_PHRASE_OCC_COUNTED = 10 // cap to avoid runaway on huge logs
 const TITLE_TOKEN_WEIGHT = 5
 const CONTENT_TOKEN_WEIGHT = 1
+
+type KnowledgeStatus = "candidate" | "active" | "superseded" | "rejected"
+type IngestQualityConfidence = "high" | "medium" | "low"
+
+const STATUS_SCORE_MULTIPLIER: Record<KnowledgeStatus, number> = {
+  active: 1,
+  candidate: 0.7,
+  superseded: 0.35,
+  rejected: 0,
+}
+
+const QUALITY_SCORE_MULTIPLIER: Record<IngestQualityConfidence, number> = {
+  high: 1,
+  medium: 0.9,
+  low: 0.75,
+}
+
+interface GovernanceSearchMeta {
+  status: KnowledgeStatus
+  qualityConfidence?: IngestQualityConfidence
+  scoreMultiplier: number
+  excluded: boolean
+}
 
 const STOP_WORDS = new Set([
   "的", "是", "了", "什么", "在", "有", "和", "与", "对", "从",
@@ -169,6 +195,42 @@ function extractTitle(content: string, fileName: string): string {
 
   // Fall back to filename
   return fileName.replace(/\.md$/, "").replace(/-/g, " ")
+}
+
+function extractFrontmatterScalar(content: string, key: string): string | null {
+  const fm = content.match(/^---\r?\n([\s\S]*?)\r?\n---/m)
+  if (!fm) return null
+  const re = new RegExp(`^${key}:\\s*["']?([^"'#\\r\\n]+)["']?\\s*$`, "m")
+  const match = fm[1].match(re)
+  return match ? match[1].trim().toLowerCase() : null
+}
+
+function parseGovernanceSearchMeta(content: string): GovernanceSearchMeta {
+  const rawStatus = extractFrontmatterScalar(content, "status")
+  const status: KnowledgeStatus =
+    rawStatus === "candidate" ||
+    rawStatus === "active" ||
+    rawStatus === "superseded" ||
+    rawStatus === "rejected"
+      ? rawStatus
+      : "active"
+
+  const rawQuality = extractFrontmatterScalar(content, "ingest_quality_confidence")
+  const qualityConfidence: IngestQualityConfidence | undefined =
+    rawQuality === "high" || rawQuality === "medium" || rawQuality === "low"
+      ? rawQuality
+      : undefined
+
+  const statusMultiplier = STATUS_SCORE_MULTIPLIER[status]
+  const qualityMultiplier = qualityConfidence ? QUALITY_SCORE_MULTIPLIER[qualityConfidence] : 1
+  const scoreMultiplier = statusMultiplier * qualityMultiplier
+
+  return {
+    status,
+    qualityConfidence,
+    scoreMultiplier,
+    excluded: status === "rejected" || scoreMultiplier <= 0,
+  }
 }
 
 /**
@@ -310,6 +372,11 @@ export async function searchWiki(
           const tryPath = `${pp}/wiki/${dir}/${vr.id}.md`
           try {
             const content = await readFile(tryPath)
+            const governance = parseGovernanceSearchMeta(content)
+            if (governance.excluded) {
+              knownIds.add(vr.id)
+              break
+            }
             const title = extractTitle(content, `${vr.id}.md`)
             results.push({
               path: tryPath,
@@ -317,6 +384,9 @@ export async function searchWiki(
               snippet: buildSnippet(content, query),
               titleMatch: false,
               score: 0, // overwritten by RRF below
+              knowledgeStatus: governance.status,
+              ingestQualityConfidence: governance.qualityConfidence,
+              governanceScoreMultiplier: governance.scoreMultiplier,
               images: extractImageRefs(content),
             })
             knownIds.add(vr.id)
@@ -348,7 +418,7 @@ export async function searchWiki(
     let rrf = 0
     if (tRank !== undefined) rrf += 1 / (RRF_K + tRank)
     if (vRank !== undefined) rrf += 1 / (RRF_K + vRank)
-    r.score = rrf
+    r.score = rrf * (r.governanceScoreMultiplier ?? 1)
   }
 
   // Sort by RRF score descending. Ties (e.g. two pages both at vector
@@ -441,6 +511,9 @@ function scoreFile(
   query: string,
 ): SearchResult | null {
   const title = extractTitle(content, file.name)
+  const governance = parseGovernanceSearchMeta(content)
+  if (governance.excluded) return null
+
   const titleText = `${title} ${file.name}`
   const titleLower = titleText.toLowerCase()
   const contentLower = content.toLowerCase()
@@ -489,6 +562,9 @@ function scoreFile(
     snippet: buildSnippet(content, snippetAnchor),
     titleMatch: isTitleMatch,
     score,
+    knowledgeStatus: governance.status,
+    ingestQualityConfidence: governance.qualityConfidence,
+    governanceScoreMultiplier: governance.scoreMultiplier,
     images: extractImageRefs(content),
   }
 }
