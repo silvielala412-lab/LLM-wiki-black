@@ -50,6 +50,11 @@ interface Frontmatter {
   ingested_by: string
   ingested_by_user: string
   status: string
+  ingest_processing_mode: string
+  ingest_source_chars: string
+  ingest_context_chars: string
+  ingest_chunk_count: string
+  ingest_quality_confidence: string
 }
 
 
@@ -57,6 +62,8 @@ function parseFrontmatter(content: string): { fm: Frontmatter; body: string } {
   const fm: Frontmatter = {
     title: "", type: "default", tags: [], related: [], sources: [],
     created: "", updated: "", ingested_at: "", ingested_by: "", ingested_by_user: "", status: "",
+    ingest_processing_mode: "", ingest_source_chars: "", ingest_context_chars: "",
+    ingest_chunk_count: "", ingest_quality_confidence: "",
   }
 
   const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/m)
@@ -588,6 +595,27 @@ export function WikiPageViewer({ filePath, content, onEditRequest, onDeleteCompl
               </Badge>
               {/* Knowledge status badge */}
               <StatusBadge status={status} />
+              {fm.ingest_quality_confidence && (
+                <Badge
+                  color={
+                    fm.ingest_quality_confidence === "high" ? "#047857"
+                    : fm.ingest_quality_confidence === "medium" ? "#B45309"
+                    : "#B91C1C"
+                  }
+                  bg={
+                    fm.ingest_quality_confidence === "high" ? "#ECFDF5"
+                    : fm.ingest_quality_confidence === "medium" ? "#FFFBEB"
+                    : "#FEF2F2"
+                  }
+                >
+                  Quality: {fm.ingest_quality_confidence}
+                </Badge>
+              )}
+              {fm.ingest_processing_mode === "hierarchical-long-document" && (
+                <Badge color="#2563EB" bg="#EFF6FF">
+                  Long doc: {fm.ingest_chunk_count || "?"} chunks
+                </Badge>
+              )}
               {status === "candidate" && (
                 <button
                   onClick={handleMarkActive}

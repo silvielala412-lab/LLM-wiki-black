@@ -19,6 +19,7 @@ import { loadExistingEntities, normalizeEntityBlock } from "@/lib/entity-normali
 import type { MultimodalConfig } from "@/stores/wiki-store"
 import type { ChunkingConfig } from "@/types/wiki"
 import { useAuthStore } from "@/stores/auth-store"
+import { chunkMarkdown } from "@/lib/text-chunker"
 
 /** Read the logged-in username without using a React hook (safe to call in lib code). */
 function _getUploaderUsername(): string {
@@ -26,6 +27,21 @@ function _getUploaderUsername(): string {
 }
 
 const OCR_IMAGE_EXTS = new Set(["png", "jpg", "jpeg", "webp", "gif", "bmp", "tiff", "tif"])
+const DIRECT_SOURCE_CHAR_LIMIT = 50000
+const LONG_SOURCE_DIGEST_LIMIT = 48000
+const LONG_SOURCE_MERGE_BATCH_CHARS = 30000
+
+type IngestProcessingMode = "direct" | "hierarchical-long-document"
+
+interface PreparedIngestSource {
+  content: string
+  originalChars: number
+  contextChars: number
+  chunkCount: number
+  processingMode: IngestProcessingMode
+  qualityConfidence: "high" | "medium" | "low"
+  qualityNotes: string[]
+}
 
 function isImageSourcePath(path: string): boolean {
   const ext = path.split(".").pop()?.toLowerCase() ?? ""
@@ -261,6 +277,306 @@ export function parseFileBlocks(text: string): ParseFileBlocksResult {
  */
 export function languageRule(sourceContent: string = ""): string {
   return buildLanguageDirective(sourceContent)
+}
+
+function clampInt(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, Math.floor(value)))
+}
+
+async function streamText(
+  llmConfig: LlmConfig,
+  messages: Parameters<typeof streamChat>[1],
+  signal: AbortSignal | undefined,
+  overrides?: Parameters<typeof streamChat>[4],
+): Promise<string> {
+  let out = ""
+  let streamError: Error | null = null
+  await streamChat(
+    llmConfig,
+    messages,
+    {
+      onToken: (token) => { out += token },
+      onDone: () => {},
+      onError: (err) => { streamError = err },
+    },
+    signal,
+    overrides,
+  )
+  if (streamError) throw streamError
+  return out.trim()
+}
+
+interface LongSourceChunk {
+  text: string
+  headingPath: string
+  charStart: number
+  charEnd: number
+}
+
+function hardSplitLongChunk(chunk: LongSourceChunk, maxChars: number, overlapChars: number): LongSourceChunk[] {
+  if (chunk.text.length <= maxChars) return [chunk]
+  const out: LongSourceChunk[] = []
+  const step = Math.max(1, maxChars - Math.max(0, overlapChars))
+  for (let offset = 0; offset < chunk.text.length; offset += step) {
+    const text = chunk.text.slice(offset, offset + maxChars)
+    if (!text.trim()) continue
+    out.push({
+      text,
+      headingPath: chunk.headingPath,
+      charStart: chunk.charStart + offset,
+      charEnd: chunk.charStart + offset + text.length,
+    })
+  }
+  return out
+}
+
+function buildLongSourceChunks(content: string, llmConfig: LlmConfig): LongSourceChunk[] {
+  const contextSize = llmConfig.maxContextSize || 100000
+  const targetChars = clampInt(contextSize * 0.12, 10000, 22000)
+  const maxChars = clampInt(targetChars * 1.25, targetChars, 26000)
+  const overlapChars = clampInt(targetChars * 0.08, 600, 1400)
+
+  const semanticChunks = chunkMarkdown(content, {
+    targetChars,
+    maxChars,
+    minChars: 1200,
+    overlapChars,
+  })
+
+  if (semanticChunks.length === 0 && content.trim()) {
+    return hardSplitLongChunk({
+      text: content,
+      headingPath: "",
+      charStart: 0,
+      charEnd: content.length,
+    }, maxChars, overlapChars)
+  }
+
+  return semanticChunks.flatMap((chunk) =>
+    hardSplitLongChunk({
+      text: chunk.text,
+      headingPath: chunk.headingPath,
+      charStart: chunk.charStart,
+      charEnd: chunk.charEnd,
+    }, maxChars, overlapChars),
+  )
+}
+
+function buildChunkDigestPrompt(fileName: string, chunkNumber: number, totalChunks: number): string {
+  return [
+    "You are extracting durable knowledge from one chunk of a long source document.",
+    "Return a compact, factual digest. Do not invent facts.",
+    "Preserve exact names, dates, numeric data, versions, constraints, and source wording when important.",
+    "Resolve local pronouns only when the referent is explicit inside this chunk; otherwise record the unresolved reference.",
+    "Use the same language as the source where practical.",
+    "",
+    "Output Markdown with exactly these sections:",
+    "## Entities",
+    "- name | type | role | aliases",
+    "## Concepts",
+    "- name | definition | why it matters",
+    "## Claims And Evidence",
+    "- claim | evidence text or data | confidence: high/medium/low",
+    "## Relations",
+    "- subject | relation | object | evidence",
+    "## Updates Or Conflicts",
+    "- item | update/conflict/uncertain | evidence",
+    "## Open References",
+    "- phrase | possible referent | uncertainty",
+    "",
+    `Source file: ${fileName}`,
+    `Chunk: ${chunkNumber}/${totalChunks}`,
+  ].join("\n")
+}
+
+function buildDigestMergePrompt(fileName: string): string {
+  return [
+    "You are merging chunk-level knowledge digests from a long source document.",
+    "Canonicalize duplicate entities and concepts, preserve meaningful aliases, and keep temporal/version differences explicit.",
+    "Do not drop niche but important facts, numbers, dates, rules, exclusions, or definitions.",
+    "When facts conflict, keep both and label the conflict instead of choosing silently.",
+    "Use the same language as the source where practical.",
+    "",
+    "Output Markdown with these sections:",
+    "## Global Entities",
+    "## Global Concepts",
+    "## Core Claims And Evidence",
+    "## Cross-Chunk Relations",
+    "## Temporal Or Version Changes",
+    "## Conflicts And Review Candidates",
+    "## Recommended Wiki Pages",
+    "",
+    `Source file: ${fileName}`,
+  ].join("\n")
+}
+
+async function mergeDigestBatch(
+  fileName: string,
+  llmConfig: LlmConfig,
+  digests: string[],
+  signal?: AbortSignal,
+): Promise<string> {
+  const body = digests.map((digest, idx) => `### Digest ${idx + 1}\n${digest}`).join("\n\n")
+  return streamText(
+    llmConfig,
+    [
+      { role: "system", content: buildDigestMergePrompt(fileName) },
+      { role: "user", content: body },
+    ],
+    signal,
+    { temperature: 0.05, max_tokens: 2200 },
+  )
+}
+
+async function mergeDigestsHierarchically(
+  fileName: string,
+  llmConfig: LlmConfig,
+  digests: string[],
+  signal?: AbortSignal,
+): Promise<{ merged: string; failedMerges: number }> {
+  let level = digests.filter((d) => d.trim().length > 0)
+  let failedMerges = 0
+  if (level.length === 0) return { merged: "", failedMerges }
+
+  for (let depth = 0; depth < 5; depth++) {
+    const combined = level.join("\n\n")
+    if (combined.length <= LONG_SOURCE_DIGEST_LIMIT || level.length === 1) {
+      return { merged: combined, failedMerges }
+    }
+
+    const next: string[] = []
+    let batch: string[] = []
+    let batchChars = 0
+    for (const digest of level) {
+      if (batch.length > 0 && batchChars + digest.length > LONG_SOURCE_MERGE_BATCH_CHARS) {
+        try {
+          next.push(await mergeDigestBatch(fileName, llmConfig, batch, signal))
+        } catch (err) {
+          failedMerges++
+          console.warn(`[ingest:long] digest merge failed:`, err)
+          next.push(batch.join("\n\n"))
+        }
+        batch = []
+        batchChars = 0
+      }
+      batch.push(digest)
+      batchChars += digest.length
+    }
+    if (batch.length > 0) {
+      try {
+        next.push(await mergeDigestBatch(fileName, llmConfig, batch, signal))
+      } catch (err) {
+        failedMerges++
+        console.warn(`[ingest:long] digest merge failed:`, err)
+        next.push(batch.join("\n\n"))
+      }
+    }
+    level = next
+  }
+
+  return { merged: level.join("\n\n").slice(0, LONG_SOURCE_DIGEST_LIMIT), failedMerges }
+}
+
+function fitLongSourceContext(context: string): string {
+  if (context.length <= LONG_SOURCE_DIGEST_LIMIT) return context
+  return `${context.slice(0, LONG_SOURCE_DIGEST_LIMIT)}\n\n[...long-document synthesis clipped to fit generation context...]`
+}
+
+async function prepareSourceForIngest(
+  sourceContent: string,
+  fileName: string,
+  llmConfig: LlmConfig,
+  activityId: string,
+  signal?: AbortSignal,
+): Promise<PreparedIngestSource> {
+  if (sourceContent.length <= DIRECT_SOURCE_CHAR_LIMIT) {
+    return {
+      content: sourceContent,
+      originalChars: sourceContent.length,
+      contextChars: sourceContent.length,
+      chunkCount: 1,
+      processingMode: "direct",
+      qualityConfidence: "high",
+      qualityNotes: ["Full source content used directly."],
+    }
+  }
+
+  const activity = useActivityStore.getState()
+  const chunks = buildLongSourceChunks(sourceContent, llmConfig)
+  const digests: string[] = []
+  let failedChunkDigests = 0
+  activity.updateItem(activityId, {
+    detail: `Long document detected: extracting chunk digests 0/${chunks.length}...`,
+  })
+
+  for (let i = 0; i < chunks.length; i++) {
+    if (signal?.aborted) break
+    const chunk = chunks[i]
+    activity.updateItem(activityId, {
+      detail: `Long document: extracting chunk digest ${i + 1}/${chunks.length}...`,
+    })
+    const chunkHeader = [
+      `File: ${fileName}`,
+      `Chunk: ${i + 1}/${chunks.length}`,
+      chunk.headingPath ? `Heading path: ${chunk.headingPath}` : "",
+      `Character range: ${chunk.charStart}-${chunk.charEnd}`,
+      "",
+      chunk.text,
+    ].filter(Boolean).join("\n")
+
+    try {
+      const digest = await streamText(
+        llmConfig,
+        [
+          { role: "system", content: buildChunkDigestPrompt(fileName, i + 1, chunks.length) },
+          { role: "user", content: chunkHeader },
+        ],
+        signal,
+        { temperature: 0.05, max_tokens: 1800 },
+      )
+      digests.push(`<!-- chunk:${i + 1} chars:${chunk.charStart}-${chunk.charEnd} -->\n${digest}`)
+    } catch (err) {
+      failedChunkDigests++
+      console.warn(`[ingest:long] chunk digest failed for ${fileName} #${i + 1}:`, err)
+      digests.push([
+        `<!-- chunk:${i + 1} chars:${chunk.charStart}-${chunk.charEnd} digest:fallback -->`,
+        `## Fallback Excerpt`,
+        chunk.headingPath ? `Heading path: ${chunk.headingPath}` : "",
+        chunk.text.slice(0, 3000),
+      ].filter(Boolean).join("\n"))
+    }
+  }
+
+  activity.updateItem(activityId, { detail: "Long document: merging chunk digests..." })
+  const { merged, failedMerges } = await mergeDigestsHierarchically(fileName, llmConfig, digests, signal)
+  const context = fitLongSourceContext([
+    `# Long-document synthesis for ${fileName}`,
+    "",
+    `Original characters: ${sourceContent.length}`,
+    `Chunks processed: ${chunks.length}`,
+    `Chunk digest failures: ${failedChunkDigests}`,
+    `Merge failures: ${failedMerges}`,
+    "",
+    "This is a hierarchical synthesis of the full source. It replaces raw truncation: every source chunk was processed into a digest before this global context was produced.",
+    "",
+    merged || digests.join("\n\n"),
+  ].join("\n"))
+
+  const qualityNotes = [
+    `Long source processed with hierarchical chunk digests (${chunks.length} chunks).`,
+    failedChunkDigests > 0 ? `${failedChunkDigests} chunk digest(s) used fallback excerpts.` : "All chunks produced LLM digests.",
+    failedMerges > 0 ? `${failedMerges} merge batch(es) used concatenation fallback.` : "Digest merge completed normally.",
+  ]
+
+  return {
+    content: context,
+    originalChars: sourceContent.length,
+    contextChars: context.length,
+    chunkCount: Math.max(1, chunks.length),
+    processingMode: "hierarchical-long-document",
+    qualityConfidence: failedChunkDigests === 0 && failedMerges === 0 ? "medium" : "low",
+    qualityNotes,
+  }
 }
 
 /**
@@ -568,22 +884,31 @@ async function autoIngestImpl(
     }
   }
 
-  const truncatedContent = enrichedSourceContent.length > 50000
-    ? enrichedSourceContent.slice(0, 50000) + "\n\n[...truncated...]"
-    : enrichedSourceContent
+  const preparedSource = await prepareSourceForIngest(
+    enrichedSourceContent,
+    fileName,
+    llmConfig,
+    activityId,
+    signal,
+  )
+  const sourceForPrompts = preparedSource.content
 
   // ── Step 1: Analysis ──────────────────────────────────────────
   // LLM reads the source and produces a structured analysis:
   // key entities, concepts, main arguments, connections to existing wiki, contradictions
-  activity.updateItem(activityId, { detail: "Step 1/2: Analyzing source..." })
+  activity.updateItem(activityId, {
+    detail: preparedSource.processingMode === "hierarchical-long-document"
+      ? "Step 1/2: Analyzing long-document synthesis..."
+      : "Step 1/2: Analyzing source...",
+  })
 
   let analysis = ""
 
   await streamChat(
     llmConfig,
     [
-      { role: "system", content: buildAnalysisPrompt(purpose, index, truncatedContent, chunking) },
-      { role: "user", content: `Analyze this source document:\n\n**File:** ${fileName}${folderContext ? `\n**Folder context:** ${folderContext}` : ""}\n\n---\n\n${truncatedContent}` },
+      { role: "system", content: buildAnalysisPrompt(purpose, index, sourceForPrompts, chunking) },
+      { role: "user", content: `Analyze this source document:\n\n**File:** ${fileName}${folderContext ? `\n**Folder context:** ${folderContext}` : ""}\n**Processing mode:** ${preparedSource.processingMode}\n\n---\n\n${sourceForPrompts}` },
     ],
     {
       onToken: (token) => { analysis += token },
@@ -613,7 +938,7 @@ async function autoIngestImpl(
   await streamChat(
     llmConfig,
     [
-      { role: "system", content: buildGenerationPrompt(schema, purpose, index, fileName, overview, truncatedContent, chunking, _getUploaderUsername()) },
+      { role: "system", content: buildGenerationPrompt(schema, purpose, index, fileName, overview, sourceForPrompts, chunking, _getUploaderUsername(), preparedSource) },
       {
         role: "user",
         content: [
@@ -627,9 +952,11 @@ async function autoIngestImpl(
           "",
           analysis,
           "",
-          "## Original Source Content",
+          preparedSource.processingMode === "hierarchical-long-document"
+            ? "## Long-Document Synthesis"
+            : "## Original Source Content",
           "",
-          truncatedContent,
+          sourceForPrompts,
           "",
           "---",
           "",
@@ -666,7 +993,9 @@ async function autoIngestImpl(
   for (const rel of writtenPaths) {
     const base = rel.split("/").pop() ?? ""
     if (!SKIP_STAMP.has(base) && rel.startsWith("wiki/")) {
-      stampCandidate(`${pp}/${rel}`).catch(() => {/* non-critical */})
+      const absPath = `${pp}/${rel}`
+      await stampCandidate(absPath).catch(() => {/* non-critical */})
+      await stampIngestQualityMetadata(absPath, preparedSource).catch(() => {/* non-critical */})
     }
   }
 
@@ -1052,6 +1381,35 @@ async function writeFileBlocks(
   return { writtenPaths, warnings, hardFailures }
 }
 
+function yamlScalar(value: string | number): string {
+  if (typeof value === "number") return String(value)
+  return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`
+}
+
+function upsertFrontmatterField(content: string, key: string, value: string | number): string {
+  const line = `${key}: ${yamlScalar(value)}`
+  if (!content.match(/^---\r?\n[\s\S]*?\r?\n---/m)) {
+    return `---\n${line}\n---\n\n${content}`
+  }
+  const re = new RegExp(`^${key}:.*$`, "m")
+  if (re.test(content)) return content.replace(re, line)
+  return content.replace(/^(---\r?\n)/, `$1${line}\n`)
+}
+
+async function stampIngestQualityMetadata(pagePath: string, preparedSource: PreparedIngestSource): Promise<void> {
+  try {
+    let content = await readFile(pagePath)
+    content = upsertFrontmatterField(content, "ingest_processing_mode", preparedSource.processingMode)
+    content = upsertFrontmatterField(content, "ingest_source_chars", preparedSource.originalChars)
+    content = upsertFrontmatterField(content, "ingest_context_chars", preparedSource.contextChars)
+    content = upsertFrontmatterField(content, "ingest_chunk_count", preparedSource.chunkCount)
+    content = upsertFrontmatterField(content, "ingest_quality_confidence", preparedSource.qualityConfidence)
+    await writeFile(pagePath, content)
+  } catch (err) {
+    console.warn("[ingest] Failed to stamp quality metadata:", pagePath, err)
+  }
+}
+
 const REVIEW_BLOCK_REGEX = /---REVIEW:\s*(\w[\w-]*)\s*\|\s*(.+?)\s*---\n([\s\S]*?)---END REVIEW---/g
 
 function parseReviewBlocks(
@@ -1196,7 +1554,7 @@ function buildChunkingDirective(cfg?: ChunkingConfig): string {
 /**
  * Step 2 prompt: AI takes its own analysis and generates wiki files + review items.
  */
-export function buildGenerationPrompt(schema: string, purpose: string, index: string, sourceFileName: string, overview?: string, sourceContent: string = "", chunking?: ChunkingConfig, uploaderUsername = "unknown"): string {
+export function buildGenerationPrompt(schema: string, purpose: string, index: string, sourceFileName: string, overview?: string, sourceContent: string = "", chunking?: ChunkingConfig, uploaderUsername = "unknown", preparedSource?: PreparedIngestSource): string {
   // Use original filename (without extension) as the source summary page name
   const sourceBaseName = sourceFileName.replace(/\.[^.]+$/, "")
 
@@ -1235,6 +1593,11 @@ export function buildGenerationPrompt(schema: string, purpose: string, index: st
     `ingested_at: "${new Date().toISOString()}"  # timestamp of this ingestion`,
     `ingested_by: "file-upload"  # provenance: file-upload | deep-research | manual | chat`,
     `ingested_by_user: "${uploaderUsername}"  # who uploaded this`,
+    preparedSource ? `ingest_processing_mode: "${preparedSource.processingMode}"` : "",
+    preparedSource ? `ingest_source_chars: ${preparedSource.originalChars}` : "",
+    preparedSource ? `ingest_context_chars: ${preparedSource.contextChars}` : "",
+    preparedSource ? `ingest_chunk_count: ${preparedSource.chunkCount}` : "",
+    preparedSource ? `ingest_quality_confidence: "${preparedSource.qualityConfidence}"` : "",
     "---",
     "```",
     "",

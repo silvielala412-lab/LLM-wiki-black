@@ -236,7 +236,7 @@ async function streamChatViaProxyEndpoint(
 
   const body: Record<string, unknown> = { messages }
   if (requestOverrides?.temperature !== undefined) body.temperature = requestOverrides.temperature
-  if (requestOverrides?.maxTokens !== undefined) body.max_tokens = requestOverrides.maxTokens
+  if (requestOverrides?.max_tokens !== undefined) body.max_tokens = requestOverrides.max_tokens
   // Pass model name so the backend can respect it when allow_user_override=true
   if (config.model) body.model = config.model
 
