@@ -18,7 +18,7 @@ interface CacheData {
   entries: Record<string, CacheEntry> // keyed by source filename
 }
 
-const INGEST_PIPELINE_VERSION = "schema-driven-candidates-v1"
+const INGEST_PIPELINE_VERSION = "schema-driven-candidates-v2"
 
 async function sha256(content: string): Promise<string> {
   if (!globalThis.crypto?.subtle) {

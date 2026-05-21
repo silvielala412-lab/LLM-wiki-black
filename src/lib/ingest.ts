@@ -148,20 +148,34 @@ const SERVICE_LIKE_KEYWORDS = [
   ZH.service,
   ZH.doctor,
   ZH.consultation,
+  "\u54a8\u8be2",
   ZH.expert,
   ZH.famousDoctor,
   ZH.checkup,
+  "\u4f53\u68c0",
+  "\u62a5\u544a",
   ZH.appointment,
+  "\u534f\u52a9",
+  "\u5b89\u6392",
   ZH.escort,
   ZH.hospitalization,
   ZH.surgery,
   ZH.nursing,
+  "\u4f1a\u8bca",
+  "\u966a\u8bca",
+  "\u51fa\u9662",
   ZH.rehab,
+  "\u968f\u8bbf",
+  "\u9996\u8bbf",
   ZH.majorIllness,
   "\u5bb6\u533b",
   "\u7eff\u901a",
   "\u9662\u540e",
   "\u8bad\u7ec3\u8425",
+  "\u7528\u836f",
+  "\u6162\u75c5",
+  "\u6570\u5b57\u5316",
+  "\u7ba1\u7406",
 ]
 
 const RULE_LIKE_KEYWORDS = [
@@ -423,11 +437,103 @@ function addSchemaCandidate(
   })
 }
 
+function parseMarkdownTableCells(line: string): string[] {
+  const trimmed = line.trim()
+  if (!trimmed.includes("|")) return []
+  return trimmed
+    .replace(/^\|/, "")
+    .replace(/\|$/, "")
+    .split("|")
+    .map((cell) => normalizeCandidateTitle(cell.replace(/<br\s*\/?>/gi, " ")))
+}
+
+function isMarkdownSeparatorRow(cells: string[]): boolean {
+  return cells.length > 0 && cells.every((cell) => /^:?-{2,}:?$/.test(cell.trim()))
+}
+
+function findHeaderIndex(headers: string[], names: string[]): number {
+  return headers.findIndex((header) => names.some((name) => header.includes(name)))
+}
+
+function addServiceTableCandidates(
+  map: Map<string, SchemaDrivenCandidate>,
+  lines: string[],
+  signals: SchemaCandidateSignals,
+): void {
+  if (!signals.serviceManual) return
+
+  let activeHeader: string[] | null = null
+  let serviceItemIndex = -1
+  let serviceCountIndex = -1
+  let serviceStageIndex = -1
+  let serviceSceneIndex = -1
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim()
+    if (!line.includes("|")) {
+      activeHeader = null
+      continue
+    }
+
+    const cells = parseMarkdownTableCells(line)
+    if (cells.length < 2 || isMarkdownSeparatorRow(cells)) continue
+
+    const possibleServiceItemIndex = findHeaderIndex(cells, [ZH.service + "\u9879\u76ee", "\u6743\u76ca\u9879\u76ee", "\u9879\u76ee"])
+    const possibleCountIndex = findHeaderIndex(cells, [ZH.service + "\u6b21\u6570", ZH.frequency, "\u6b21/\u5e74", "\u6b21"])
+    if (possibleServiceItemIndex >= 0 && possibleCountIndex >= 0) {
+      activeHeader = cells
+      serviceItemIndex = possibleServiceItemIndex
+      serviceCountIndex = possibleCountIndex
+      serviceStageIndex = findHeaderIndex(cells, [ZH.service + "\u9636\u6bb5", "\u9636\u6bb5"])
+      serviceSceneIndex = findHeaderIndex(cells, [ZH.service + "\u573a\u666f", "\u573a\u666f"])
+      continue
+    }
+
+    if (!activeHeader || serviceItemIndex < 0 || cells.length <= serviceItemIndex) continue
+    const serviceTitle = cells[serviceItemIndex]
+    if (!isUsableCandidateTitle(serviceTitle)) continue
+
+    const sourceLineParts = [
+      serviceSceneIndex >= 0 && cells[serviceSceneIndex] ? `服务场景：${cells[serviceSceneIndex]}` : "",
+      serviceStageIndex >= 0 && cells[serviceStageIndex] ? `服务阶段：${cells[serviceStageIndex]}` : "",
+      `服务项目：${serviceTitle}`,
+      serviceCountIndex >= 0 && cells[serviceCountIndex] ? `服务次数：${cells[serviceCountIndex]}` : "",
+    ].filter(Boolean)
+
+    const sourceLine = sourceLineParts.length > 0 ? sourceLineParts.join("；") : line
+    const key = normalizeCoverageTitle(serviceTitle)
+    const existing = map.get(key)
+    if (existing) {
+      if (!existing.sourceLines.includes(sourceLine)) existing.sourceLines.push(sourceLine)
+      existing.entityType = "service_benefit"
+      existing.universalType = "entity"
+      existing.knowledgeDomain = "product"
+      existing.required = true
+      existing.confidence = Math.max(existing.confidence, 0.93)
+      continue
+    }
+
+    map.set(key, {
+      title: serviceTitle,
+      aliases: [],
+      knowledgeDomain: "product",
+      entityType: "service_benefit",
+      universalType: "entity",
+      required: true,
+      confidence: 0.93,
+      reason: "Service item extracted from a service-project table with service count/frequency.",
+      sourceLines: [sourceLine],
+    })
+  }
+}
+
 function extractSchemaDrivenCandidates(sourceContent: string): SchemaDrivenCandidate[] {
   const signals = detectSchemaCandidateSignals(sourceContent)
   const candidates = new Map<string, SchemaDrivenCandidate>()
   const sectionPath: string[] = []
   const lines = sourceContent.split(/\r?\n/)
+
+  addServiceTableCandidates(candidates, lines, signals)
 
   for (const rawLine of lines) {
     const line = rawLine.trim()
