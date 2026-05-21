@@ -1,7 +1,10 @@
 use axum::{
     Router,
     routing::{get, post},
-    http::Method,
+    http::{header, HeaderValue, Method},
+    middleware::{self, Next},
+    extract::Request,
+    response::Response,
     extract::DefaultBodyLimit,
 };
 use tower_http::{
@@ -115,6 +118,7 @@ async fn main() -> anyhow::Result<()> {
         .nest("/api", api)
         .fallback_service(spa)
         .layer(DefaultBodyLimit::max(200 * 1024 * 1024)) // 200 MB — covers large PDF uploads
+        .layer(middleware::from_fn(no_cache_headers))
         .layer(TraceLayer::new_for_http())
         .layer(cors);
 
@@ -124,4 +128,13 @@ async fn main() -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+async fn no_cache_headers(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, no-cache, must-revalidate, max-age=0"),
+    );
+    response
 }

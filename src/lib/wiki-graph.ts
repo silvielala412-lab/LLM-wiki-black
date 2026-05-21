@@ -1,6 +1,7 @@
 import { readFile, listDirectory } from "@/commands/fs"
 import type { FileNode } from "@/types/wiki"
 import { buildRetrievalGraph, calculateRelevance } from "./graph-relevance"
+import { buildKnowledgeRelationIndex } from "./knowledge-relation-index"
 import { normalizePath } from "@/lib/path-utils"
 import Graph from "graphology"
 import louvain from "graphology-communities-louvain"
@@ -9,6 +10,7 @@ export interface GraphNode {
   id: string
   label: string
   type: string
+  domain: string
   path: string
   linkCount: number // inbound + outbound
   community: number // community id from Louvain detection
@@ -142,6 +144,16 @@ function extractType(content: string): string {
   return "other"
 }
 
+function extractDomain(content: string): string {
+  const frontmatterMatch = content.match(/^---\r?\n([\s\S]*?)\r?\n---/m)
+  if (!frontmatterMatch) return "general"
+  const fm = frontmatterMatch[1]
+  const domainMatch =
+    fm.match(/^knowledge_domain:\s*["']?(.+?)["']?\s*$/m) ||
+    fm.match(/^domain:\s*["']?(.+?)["']?\s*$/m)
+  return domainMatch?.[1]?.trim().toLowerCase() || "general"
+}
+
 function extractWikilinks(content: string): string[] {
   const links: string[] = []
   const regex = new RegExp(WIKILINK_REGEX.source, "g")
@@ -152,8 +164,8 @@ function extractWikilinks(content: string): string[] {
   return links
 }
 
-function fileNameToId(fileName: string): string {
-  return fileName.replace(/\.md$/, "")
+function filePathToId(filePath: string, fileName: string): string {
+  return normalizePath(filePath).split("/wiki/").pop()?.replace(/\.md$/, "") ?? fileName.replace(/\.md$/, "")
 }
 
 export async function buildWikiGraph(
@@ -176,11 +188,11 @@ export async function buildWikiGraph(
   // Build a map of id -> node data
   const nodeMap = new Map<
     string,
-    { id: string; label: string; type: string; path: string; links: string[] }
+    { id: string; label: string; type: string; domain: string; path: string; links: string[] }
   >()
 
   for (const file of mdFiles) {
-    const id = fileNameToId(file.name)
+    const id = filePathToId(file.path, file.name)
     let content = ""
     try {
       content = await readFile(file.path)
@@ -193,6 +205,7 @@ export async function buildWikiGraph(
       id,
       label: extractTitle(content, file.name),
       type: extractType(content),
+      domain: extractDomain(content),
       path: file.path,
       links: extractWikilinks(content),
     })
@@ -215,19 +228,20 @@ export async function buildWikiGraph(
   }
 
   const rawEdges: GraphEdge[] = []
+  const relationIndex = await buildKnowledgeRelationIndex(projectPath)
 
-  for (const [sourceId, nodeData] of nodeMap) {
-    for (const targetRaw of nodeData.links) {
-      // Normalize target: try matching by id (case-insensitive, hyphen/space)
-      const targetId = resolveTarget(targetRaw, nodeMap)
-      if (targetId === null) continue
-      if (targetId === sourceId) continue
+  for (const relation of relationIndex.relations) {
+    if (!nodeMap.has(relation.source_id) || !nodeMap.has(relation.target_id)) continue
+    if (relation.source_id === relation.target_id) continue
 
-      rawEdges.push({ source: sourceId, target: targetId, weight: 1 })
+    rawEdges.push({
+      source: relation.source_id,
+      target: relation.target_id,
+      weight: relation.confidence || 1,
+    })
 
-      linkCounts.set(sourceId, (linkCounts.get(sourceId) ?? 0) + 1)
-      linkCounts.set(targetId, (linkCounts.get(targetId) ?? 0) + 1)
-    }
+    linkCounts.set(relation.source_id, (linkCounts.get(relation.source_id) ?? 0) + 1)
+    linkCounts.set(relation.target_id, (linkCounts.get(relation.target_id) ?? 0) + 1)
   }
 
   // Deduplicate edges
@@ -277,6 +291,7 @@ export async function buildWikiGraph(
     id: n.id,
     label: n.label,
     type: n.type,
+    domain: n.domain,
     path: n.path,
     linkCount: linkCounts.get(n.id) ?? 0,
     community: assignments.get(n.id) ?? 0,
@@ -285,20 +300,3 @@ export async function buildWikiGraph(
   return { nodes, edges, communities }
 }
 
-function resolveTarget(
-  raw: string,
-  nodeMap: Map<string, { id: string }>,
-): string | null {
-  // Direct match
-  if (nodeMap.has(raw)) return raw
-
-  // Normalize: lowercase, replace spaces with hyphens and vice versa
-  const normalized = raw.toLowerCase().replace(/\s+/g, "-")
-  for (const id of nodeMap.keys()) {
-    if (id.toLowerCase() === normalized) return id
-    if (id.toLowerCase() === raw.toLowerCase()) return id
-    if (id.toLowerCase().replace(/\s+/g, "-") === normalized) return id
-  }
-
-  return null
-}

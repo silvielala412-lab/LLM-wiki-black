@@ -1,9 +1,10 @@
-import { useEffect, useCallback, useState, useRef, type ChangeEvent } from "react"
+import { useEffect, useCallback, useMemo, useState, useRef, type ChangeEvent } from "react"
 import Graph from "graphology"
 import { SigmaContainer, useLoadGraph, useRegisterEvents, useSigma } from "@react-sigma/core"
+import { NodeCircleProgram } from "sigma/rendering"
 import "@react-sigma/core/lib/style.css"
 import forceAtlas2 from "graphology-layout-forceatlas2"
-import { Network, RefreshCw, ZoomIn, ZoomOut, Maximize, Layers, Tag, Lightbulb, AlertTriangle, Link2, X, Search, Loader2 } from "lucide-react"
+import { Network, RefreshCw, ZoomIn, ZoomOut, Maximize, Layers, Tag, BriefcaseBusiness, Lightbulb, AlertTriangle, Link2, X, Search, Loader2 } from "lucide-react"
 import { ErrorBoundary } from "@/components/error-boundary"
 import { useResearchStore } from "@/stores/research-store"
 import { Button } from "@/components/ui/button"
@@ -52,13 +53,41 @@ const COMMUNITY_COLORS = [
   "#fbbf24",  // amber-400
 ]
 
-type ColorMode = "type" | "community"
+const DOMAIN_COLORS: Record<string, string> = {
+  product: "#2563eb",
+  customer: "#059669",
+  method: "#d97706",
+  content: "#7c3aed",
+  activity: "#ea580c",
+  cases: "#e11d48",
+  compliance: "#dc2626",
+  general: "#64748b",
+}
+
+const DOMAIN_LABELS: Record<string, string> = {
+  product: "产品域",
+  customer: "客户画像域",
+  method: "销售方法域",
+  content: "销售内容域",
+  activity: "销售活动域",
+  cases: "案例经验域",
+  compliance: "合规风险域",
+  general: "通用知识",
+}
+
+const DOMAIN_ORDER = ["product", "customer", "method", "content", "activity", "cases", "compliance", "general"]
+
+type ColorMode = "type" | "community" | "domain"
 
 const BASE_NODE_SIZE = 8
 const MAX_NODE_SIZE = 28
 
 function nodeColor(type: string): string {
   return NODE_TYPE_COLORS[type] ?? NODE_TYPE_COLORS.other
+}
+
+function domainColor(domain: string): string {
+  return DOMAIN_COLORS[domain] ?? DOMAIN_COLORS.general
 }
 
 function hexToRgba(hex: string, alpha: number): string {
@@ -102,9 +131,12 @@ function GraphLoader({ nodes, edges, colorMode }: { nodes: GraphNode[]; edges: G
 
     for (const node of nodes) {
       const cached = positionCache.get(node.id)
-      const color = colorMode === "community"
-        ? COMMUNITY_COLORS[node.community % COMMUNITY_COLORS.length]
-        : nodeColor(node.type)
+      const color =
+        colorMode === "community"
+          ? COMMUNITY_COLORS[node.community % COMMUNITY_COLORS.length]
+          : colorMode === "domain"
+            ? domainColor(node.domain)
+            : nodeColor(node.type)
       graph.addNode(node.id, {
         x: cached?.x ?? Math.random() * 100,
         y: cached?.y ?? Math.random() * 100,
@@ -112,6 +144,7 @@ function GraphLoader({ nodes, edges, colorMode }: { nodes: GraphNode[]; edges: G
         color,
         label: node.label,
         nodeType: node.type,
+        nodeDomain: node.domain,
         nodePath: node.path,
         community: node.community,
       })
@@ -310,6 +343,7 @@ export function GraphView() {
   const [error, setError] = useState<string | null>(null)
   const [hoveredType, setHoveredType] = useState<string | null>(null)
   const [colorMode, setColorMode] = useState<ColorMode>("type")
+  const [activeDomain, setActiveDomain] = useState<string | null>(null)
   const [showInsights, setShowInsights] = useState(false)
   const [highlightedNodes, setHighlightedNodes] = useState<Set<string>>(new Set())
   const [dismissedInsights, setDismissedInsights] = useState<Set<string>>(new Set())
@@ -463,10 +497,77 @@ export function GraphView() {
   }, [])
 
   // Count nodes by type for legend
-  const typeCounts = nodes.reduce<Record<string, number>>((acc, n) => {
+  const visibleNodes = activeDomain ? nodes.filter((n) => n.domain === activeDomain) : nodes
+  const visibleNodeIds = new Set(visibleNodes.map((n) => n.id))
+  const visibleEdges = edges.filter((e) => visibleNodeIds.has(e.source) && visibleNodeIds.has(e.target))
+
+  const typeCounts = visibleNodes.reduce<Record<string, number>>((acc, n) => {
     acc[n.type] = (acc[n.type] ?? 0) + 1
     return acc
   }, {})
+
+  const domainCounts = nodes.reduce<Record<string, number>>((acc, n) => {
+    acc[n.domain] = (acc[n.domain] ?? 0) + 1
+    return acc
+  }, {})
+
+  const domainEntries = Object.keys(domainCounts).sort((a, b) => {
+    const ai = DOMAIN_ORDER.indexOf(a)
+    const bi = DOMAIN_ORDER.indexOf(b)
+    if (ai !== -1 || bi !== -1) return (ai === -1 ? 999 : ai) - (bi === -1 ? 999 : bi)
+    return a.localeCompare(b)
+  })
+
+  const sigmaSettings = useMemo(() => ({
+    renderEdgeLabels: true,
+    defaultEdgeColor: "#cbd5e1",
+    defaultNodeColor: "#94a3b8",
+    defaultNodeType: "circle",
+    nodeProgramClasses: {
+      circle: NodeCircleProgram,
+    },
+    labelSize: 13,
+    labelWeight: "bold",
+    labelColor: { color: "#1e293b" },
+    labelDensity: 0.4,
+    labelRenderedSizeThreshold: 6,
+    stagePadding: 30,
+    allowInvalidContainer: true,
+    nodeReducer: (_node: string, attrs: Record<string, any>) => {
+      const result = { ...attrs }
+      if (attrs.insightHighlight) {
+        result.size = (attrs.size ?? BASE_NODE_SIZE) * 1.5
+        result.zIndex = 10
+        result.forceLabel = true
+      }
+      if (attrs.hovering) {
+        result.size = (attrs.size ?? BASE_NODE_SIZE) * 1.4
+        result.zIndex = 10
+        result.forceLabel = true
+      }
+      if (attrs.dimmed) {
+        result.color = mixColor(attrs.color ?? "#94a3b8", "#e2e8f0", 0.75)
+        result.label = ""
+        result.size = (attrs.size ?? BASE_NODE_SIZE) * 0.6
+      }
+      return result
+    },
+    edgeReducer: (_edge: string, attrs: Record<string, any>) => {
+      const result = { ...attrs }
+      if (attrs.dimmed) {
+        result.color = "#f1f5f9"
+        result.size = 0.3
+      }
+      if (attrs.highlighted) {
+        const w = attrs.weight ?? 1
+        result.color = "#1e293b"
+        result.size = Math.max(2, (attrs.size ?? 1) * 1.5)
+        result.label = `relevance: ${w.toFixed(1)}`
+        result.forceLabel = true
+      }
+      return result
+    },
+  }), [])
 
   if (!project) {
     return (
@@ -509,6 +610,16 @@ export function GraphView() {
     )
   }
 
+  if (!loading && visibleNodes.length === 0 && activeDomain) {
+    return (
+      <div className="flex h-full flex-col items-center justify-center gap-3 text-muted-foreground">
+        <Network className="h-10 w-10 opacity-30" />
+        <p className="text-sm">{DOMAIN_LABELS[activeDomain] ?? activeDomain} 暂无节点</p>
+        <Button variant="outline" size="sm" onClick={() => setActiveDomain(null)}>显示全部域</Button>
+      </div>
+    )
+  }
+
   return (
     <div className="relative flex h-full flex-col">
       {/* Header */}
@@ -519,16 +630,26 @@ export function GraphView() {
             <span className="text-sm font-medium">Knowledge Graph</span>
           </div>
           <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-            <span className="rounded bg-muted px-1.5 py-0.5">{nodes.length} pages</span>
-            <span className="rounded bg-muted px-1.5 py-0.5">{edges.length} links</span>
+            <span className="rounded bg-muted px-1.5 py-0.5">{visibleNodes.length} pages</span>
+            <span className="rounded bg-muted px-1.5 py-0.5">{visibleEdges.length} links</span>
+            {activeDomain && (
+              <button
+                type="button"
+                onClick={() => setActiveDomain(null)}
+                className="rounded bg-primary/10 px-1.5 py-0.5 text-primary hover:bg-primary/15"
+                title="清除业务域筛选"
+              >
+                {DOMAIN_LABELS[activeDomain] ?? activeDomain} ×
+              </button>
+            )}
           </div>
         </div>
-        <div className="flex items-center gap-1">
+        <div className="flex min-w-0 items-center gap-1 overflow-x-auto">
           <Button
             variant={colorMode === "type" ? "secondary" : "ghost"}
             size="sm"
             onClick={() => setColorMode("type")}
-            className="text-xs gap-1 h-7"
+            className="h-7 shrink-0 gap-1 text-xs"
           >
             <Tag className="h-3 w-3" />
             Type
@@ -537,10 +658,20 @@ export function GraphView() {
             variant={colorMode === "community" ? "secondary" : "ghost"}
             size="sm"
             onClick={() => setColorMode("community")}
-            className="text-xs gap-1 h-7"
+            className="h-7 shrink-0 gap-1 text-xs"
           >
             <Layers className="h-3 w-3" />
             Community
+          </Button>
+          <Button
+            variant={colorMode === "domain" ? "secondary" : "ghost"}
+            size="sm"
+            onClick={() => setColorMode("domain")}
+            className="h-7 shrink-0 gap-1 text-xs"
+            title="按保险七大知识域展示"
+          >
+            <BriefcaseBusiness className="h-3 w-3" />
+            七大域
           </Button>
           {(surprisingConns.filter((c) => !dismissedInsights.has(c.key)).length > 0 || knowledgeGaps.length > 0) && (
             <Button
@@ -552,7 +683,7 @@ export function GraphView() {
                   return !v
                 })
               }}
-              className="text-xs gap-1 h-7"
+              className="h-7 shrink-0 gap-1 text-xs"
             >
               <Lightbulb className="h-3 w-3" />
               Insights
@@ -561,7 +692,7 @@ export function GraphView() {
               </span>
             </Button>
           )}
-          <Button variant="ghost" size="sm" onClick={loadGraph} className="text-xs gap-1 h-7">
+          <Button variant="ghost" size="sm" onClick={loadGraph} className="h-7 shrink-0 gap-1 text-xs">
             <RefreshCw className="h-3.5 w-3.5" />
           </Button>
         </div>
@@ -580,53 +711,9 @@ export function GraphView() {
           <SigmaContainer
             key={sigmaKey}
             style={{ width: "100%", height: "100%", background: "transparent" }}
-            settings={{
-              renderEdgeLabels: true,
-              defaultEdgeColor: "#cbd5e1",
-              defaultNodeColor: "#94a3b8",
-              labelSize: 13,
-              labelWeight: "bold",
-              labelColor: { color: "#1e293b" },
-              labelDensity: 0.4,
-              labelRenderedSizeThreshold: 6,
-              stagePadding: 30,
-              nodeReducer: (_node, attrs) => {
-                const result = { ...attrs }
-                if (attrs.insightHighlight) {
-                  result.size = (attrs.size ?? BASE_NODE_SIZE) * 1.5
-                  result.zIndex = 10
-                  result.forceLabel = true
-                }
-                if (attrs.hovering) {
-                  result.size = (attrs.size ?? BASE_NODE_SIZE) * 1.4
-                  result.zIndex = 10
-                  result.forceLabel = true
-                }
-                if (attrs.dimmed) {
-                  result.color = mixColor(attrs.color ?? "#94a3b8", "#e2e8f0", 0.75)
-                  result.label = ""
-                  result.size = (attrs.size ?? BASE_NODE_SIZE) * 0.6
-                }
-                return result
-              },
-              edgeReducer: (_edge, attrs) => {
-                const result = { ...attrs }
-                if (attrs.dimmed) {
-                  result.color = "#f1f5f9"
-                  result.size = 0.3
-                }
-                if (attrs.highlighted) {
-                  const w = attrs.weight ?? 1
-                  result.color = "#1e293b"
-                  result.size = Math.max(2, (attrs.size ?? 1) * 1.5)
-                  result.label = `relevance: ${w.toFixed(1)}`
-                  result.forceLabel = true
-                }
-                return result
-              },
-            }}
+            settings={sigmaSettings}
           >
-            <GraphLoader nodes={nodes} edges={edges} colorMode={colorMode} />
+            <GraphLoader nodes={visibleNodes} edges={visibleEdges} colorMode={colorMode} />
             <EventHandler onNodeClick={handleNodeClick} />
             <HighlightManager highlightedNodes={highlightedNodes} />
             <ZoomControls />
@@ -662,6 +749,52 @@ export function GraphView() {
                         <span className="text-muted-foreground/60 ml-auto">{typeCounts[type]}</span>
                       </div>
                     ))}
+                </div>
+              </>
+            ) : colorMode === "domain" ? (
+              <>
+                <div className="mb-1.5 flex items-center justify-between gap-3 font-semibold text-foreground">
+                  <span>业务域</span>
+                  {activeDomain && (
+                    <button
+                      type="button"
+                      onClick={() => setActiveDomain(null)}
+                      className="text-[11px] font-medium text-muted-foreground hover:text-foreground"
+                    >
+                      全部
+                    </button>
+                  )}
+                </div>
+                <div className="flex flex-col gap-0.5">
+                  {domainEntries.map((domain) => {
+                    const active = activeDomain === domain
+                    const color = domainColor(domain)
+                    return (
+                      <button
+                        key={domain}
+                        type="button"
+                        className={`flex items-center gap-2 rounded px-1 py-0.5 text-left transition-colors ${
+                          active ? "bg-accent text-foreground" : "hover:bg-accent/50"
+                        }`}
+                        onClick={() => setActiveDomain(active ? null : domain)}
+                        onMouseEnter={() => setHoveredType(domain)}
+                        onMouseLeave={() => setHoveredType(null)}
+                        title="点击筛选该业务域，再次点击恢复全图"
+                      >
+                        <span
+                          className="inline-block h-3 w-3 rounded-full shrink-0 shadow-sm"
+                          style={{
+                            backgroundColor: color,
+                            boxShadow: `0 0 4px ${hexToRgba(color, 0.4)}`,
+                          }}
+                        />
+                        <span className={hoveredType === domain || active ? "truncate font-medium" : "truncate text-muted-foreground"}>
+                          {DOMAIN_LABELS[domain] ?? domain}
+                        </span>
+                        <span className="ml-auto shrink-0 text-muted-foreground/60">{domainCounts[domain]}</span>
+                      </button>
+                    )
+                  })}
                 </div>
               </>
             ) : (

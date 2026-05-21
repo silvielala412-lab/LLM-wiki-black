@@ -79,6 +79,27 @@ function generateId(): string {
   return `ingest-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
 }
 
+function sourceExtension(sourcePath: string): string {
+  return sourcePath.split("?")[0]?.split(".").pop()?.toLowerCase() ?? ""
+}
+
+function ingestPriority(sourcePath: string): number {
+  const ext = sourceExtension(sourcePath)
+  if (["md", "mdx", "txt", "csv", "json", "yaml", "yml"].includes(ext)) return 0
+  if (["png", "jpg", "jpeg", "gif", "webp"].includes(ext)) return 1
+  if (["doc", "docx", "xls", "xlsx", "ppt", "pptx", "html", "htm", "rtf", "epub"].includes(ext)) return 2
+  if (ext === "pdf") return 3
+  return 2
+}
+
+function orderTasksForProcessing<T extends { sourcePath: string; addedAt?: number }>(tasks: T[]): T[] {
+  return [...tasks].sort((a, b) => {
+    const priority = ingestPriority(a.sourcePath) - ingestPriority(b.sourcePath)
+    if (priority !== 0) return priority
+    return (a.addedAt ?? 0) - (b.addedAt ?? 0)
+  })
+}
+
 /**
  * Delete files written by a cancelled / failed ingest, AND drop the
  * matching pages' chunks from LanceDB. Called from the cancel paths
@@ -156,7 +177,7 @@ export async function enqueueBatch(
   }
 
   const ids: string[] = []
-  for (const file of files) {
+  for (const file of orderTasksForProcessing(files)) {
     const task: IngestTask = {
       id: generateId(),
       projectId,
@@ -394,7 +415,7 @@ export async function restoreQueue(
     }
   }
 
-  queue = mine
+  queue = orderTasksForProcessing(mine)
   await saveQueue(pp)
 
   const pending = queue.filter((t) => t.status === "pending").length
@@ -409,6 +430,11 @@ export async function restoreQueue(
 // ── Processing ────────────────────────────────────────────────────────────
 
 const MAX_RETRIES = 3
+
+function retryDelayMs(message: string, retryCount: number): number {
+  if (!/(503|Service Unavailable|service is too busy|rate limit|429)/i.test(message)) return 0
+  return Math.min(60_000, 5_000 * 2 ** Math.max(0, retryCount - 1))
+}
 
 async function onQueueDrained(projectId: string, projectPath: string): Promise<void> {
   if (!processedSinceDrain) return
@@ -490,6 +516,7 @@ async function processNext(projectId: string): Promise<void> {
 
   currentAbortController = new AbortController()
   lastWrittenFiles = []
+  let delayBeforeNextMs = 0
 
   try {
     const writtenFiles = await autoIngest(pp, fullSourcePath, llmConfig, currentAbortController.signal, next.folderContext)
@@ -528,6 +555,7 @@ async function processNext(projectId: string): Promise<void> {
       console.log(`[Ingest Queue] Failed (${next.retryCount}x): ${next.sourcePath} — ${message}`)
     } else {
       next.status = "pending" // will retry
+      delayBeforeNextMs = retryDelayMs(message, next.retryCount)
       console.log(`[Ingest Queue] Error (retry ${next.retryCount}/${MAX_RETRIES}): ${next.sourcePath} — ${message}`)
     }
 
@@ -535,5 +563,10 @@ async function processNext(projectId: string): Promise<void> {
   }
 
   processing = false
-  processNext(projectId)
+  if (delayBeforeNextMs > 0) {
+    console.log(`[Ingest Queue] Waiting ${Math.round(delayBeforeNextMs / 1000)}s before retrying after upstream throttling`)
+    setTimeout(() => processNext(projectId), delayBeforeNextMs)
+  } else {
+    processNext(projectId)
+  }
 }

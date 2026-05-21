@@ -1,5 +1,5 @@
 import type { LlmConfig } from "@/stores/wiki-store"
-import { getProviderConfig, type RequestOverrides } from "./llm-providers"
+import { getProviderConfig, type ChatMessage, type ContentBlock, type RequestOverrides } from "./llm-providers"
 import { getHttpFetch, isFetchNetworkError } from "./tauri-fetch"
 
 export type { ChatMessage, RequestOverrides } from "./llm-providers"
@@ -223,6 +223,33 @@ async function streamChatViaProxy(
   )
 }
 
+type OpenAiCompatMessage = Omit<ChatMessage, "content"> & {
+  content: string | Array<
+    | { type: "text"; text: string }
+    | { type: "image_url"; image_url: { url: string } }
+  >
+}
+
+function toOpenAiCompatContent(content: string | ContentBlock[]): OpenAiCompatMessage["content"] {
+  if (typeof content === "string") return content
+  return content.map((block) => {
+    if (block.type === "text") return block
+    return {
+      type: "image_url",
+      image_url: {
+        url: `data:${block.mediaType};base64,${block.dataBase64}`,
+      },
+    }
+  })
+}
+
+export function toOpenAiCompatMessages(messages: ChatMessage[]): OpenAiCompatMessage[] {
+  return messages.map((message) => ({
+    ...message,
+    content: toOpenAiCompatContent(message.content),
+  }))
+}
+
 async function streamChatViaProxyEndpoint(
   endpoint: string,
   config: LlmConfig,
@@ -234,9 +261,9 @@ async function streamChatViaProxyEndpoint(
 ): Promise<void> {
   const { onToken, onDone, onError } = callbacks
 
-  const body: Record<string, unknown> = { messages }
+  const body: Record<string, unknown> = { messages: toOpenAiCompatMessages(messages) }
   if (requestOverrides?.temperature !== undefined) body.temperature = requestOverrides.temperature
-  if (requestOverrides?.maxTokens !== undefined) body.max_tokens = requestOverrides.maxTokens
+  if (requestOverrides?.max_tokens !== undefined) body.max_tokens = requestOverrides.max_tokens
   // Pass model name so the backend can respect it when allow_user_override=true
   if (config.model) body.model = config.model
 

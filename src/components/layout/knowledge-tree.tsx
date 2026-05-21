@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback } from "react"
 import {
-  FileText, Users, Lightbulb, BookOpen, HelpCircle, GitMerge, BarChart3, ChevronRight, ChevronDown, Layout, Globe,
+  FileText, Users, Lightbulb, BookOpen, HelpCircle, GitMerge, BarChart3, ChevronRight, ChevronDown, Layout, Globe, ShieldCheck, CalendarClock, BriefcaseBusiness,
 } from "lucide-react"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { useWikiStore } from "@/stores/wiki-store"
@@ -12,6 +12,7 @@ interface WikiPageInfo {
   path: string
   title: string
   type: string
+  domain: string
   tags: string[]
   origin?: string
 }
@@ -28,6 +29,17 @@ const TYPE_CONFIG: Record<string, { icon: typeof FileText; label: string; color:
 
 const DEFAULT_CONFIG = { icon: FileText, label: "Other", color: "text-muted-foreground", order: 99 }
 
+const DOMAIN_CONFIG: Record<string, { icon: typeof FileText; label: string; color: string; order: number }> = {
+  product:    { icon: BriefcaseBusiness, label: "产品域",     color: "text-blue-600",    order: 1 },
+  customer:   { icon: Users,             label: "客户画像域", color: "text-emerald-600", order: 2 },
+  method:     { icon: Lightbulb,         label: "销售方法域", color: "text-amber-600",   order: 3 },
+  content:    { icon: FileText,          label: "销售内容域", color: "text-violet-600",  order: 4 },
+  activity:   { icon: CalendarClock,     label: "销售活动域", color: "text-orange-600",  order: 5 },
+  cases:      { icon: BookOpen,          label: "案例经验域", color: "text-rose-600",    order: 6 },
+  compliance: { icon: ShieldCheck,       label: "合规风险域", color: "text-red-600",     order: 7 },
+  general:    { icon: FileText,          label: "通用知识",   color: "text-muted-foreground", order: 8 },
+}
+
 export function KnowledgeTree() {
   const project = useWikiStore((s) => s.project)
   const selectedFile = useWikiStore((s) => s.selectedFile)
@@ -36,7 +48,9 @@ export function KnowledgeTree() {
   const bumpDataVersion = useWikiStore((s) => s.bumpDataVersion)
   const fileTree = useWikiStore((s) => s.fileTree)
   const [pages, setPages] = useState<WikiPageInfo[]>([])
+  const [groupMode, setGroupMode] = useState<"type" | "domain">("type")
   const [expandedTypes, setExpandedTypes] = useState<Set<string>>(new Set(["overview", "entity", "concept", "source"]))
+  const [expandedDomains, setExpandedDomains] = useState<Set<string>>(new Set(["product", "customer", "method"]))
 
   // Multi-select state
   const [checkedPaths, setCheckedPaths] = useState<Set<string>>(new Set())
@@ -62,6 +76,7 @@ export function KnowledgeTree() {
             path: file.path,
             title: file.name.replace(".md", "").replace(/-/g, " "),
             type: "other",
+            domain: "general",
             tags: [],
           })
         }
@@ -111,19 +126,22 @@ export function KnowledgeTree() {
 
   const grouped = new Map<string, WikiPageInfo[]>()
   for (const page of pages) {
-    const list = grouped.get(page.type) ?? []
+    const key = groupMode === "domain" ? page.domain : page.type
+    const list = grouped.get(key) ?? []
     list.push(page)
-    grouped.set(page.type, list)
+    grouped.set(key, list)
   }
 
   const sortedGroups = [...grouped.entries()].sort((a, b) => {
-    const orderA = TYPE_CONFIG[a[0]]?.order ?? DEFAULT_CONFIG.order
-    const orderB = TYPE_CONFIG[b[0]]?.order ?? DEFAULT_CONFIG.order
+    const configMap = groupMode === "domain" ? DOMAIN_CONFIG : TYPE_CONFIG
+    const orderA = configMap[a[0]]?.order ?? DEFAULT_CONFIG.order
+    const orderB = configMap[b[0]]?.order ?? DEFAULT_CONFIG.order
     return orderA - orderB
   })
 
-  function toggleType(type: string) {
-    setExpandedTypes((prev) => {
+  function toggleGroup(type: string) {
+    const setExpanded = groupMode === "domain" ? setExpandedDomains : setExpandedTypes
+    setExpanded((prev) => {
       const next = new Set(prev)
       if (next.has(type)) next.delete(type)
       else next.add(type)
@@ -134,11 +152,26 @@ export function KnowledgeTree() {
   const checkedCount = checkedPaths.size
 
   return (
-    <div className="flex h-full flex-col">
-      <ScrollArea className="flex-1">
+    <div className="flex h-full min-h-0 flex-col overflow-hidden">
+      <ScrollArea className="min-h-0 flex-1">
         <div className="p-2">
           <div className="mb-2 px-2 text-xs font-semibold uppercase text-muted-foreground">
             {project.name}
+          </div>
+
+          <div className="mb-2 grid grid-cols-2 gap-1 px-1">
+            <button
+              onClick={() => setGroupMode("type")}
+              className={`rounded-md px-2 py-1 text-xs ${groupMode === "type" ? "bg-accent text-accent-foreground" : "text-muted-foreground hover:bg-accent/50"}`}
+            >
+              类型
+            </button>
+            <button
+              onClick={() => setGroupMode("domain")}
+              className={`rounded-md px-2 py-1 text-xs ${groupMode === "domain" ? "bg-accent text-accent-foreground" : "text-muted-foreground hover:bg-accent/50"}`}
+            >
+              七大域
+            </button>
           </div>
 
           {checkedCount > 0 && (
@@ -158,14 +191,14 @@ export function KnowledgeTree() {
           )}
 
           {sortedGroups.map(([type, items]) => {
-            const config = TYPE_CONFIG[type] ?? DEFAULT_CONFIG
+            const config = (groupMode === "domain" ? DOMAIN_CONFIG[type] : TYPE_CONFIG[type]) ?? DEFAULT_CONFIG
             const Icon = config.icon
-            const isExpanded = expandedTypes.has(type)
+            const isExpanded = (groupMode === "domain" ? expandedDomains : expandedTypes).has(type)
 
             return (
               <div key={type} className="mb-1">
                 <button
-                  onClick={() => toggleType(type)}
+                  onClick={() => toggleGroup(type)}
                   className="flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-sm hover:bg-accent/50"
                 >
                   {isExpanded ? (
@@ -359,7 +392,13 @@ function parsePageInfo(path: string, fileName: string, content: string): WikiPag
     else if (fileName === "overview.md") type = "overview"
   }
 
-  return { path, title, type, tags, origin }
+  let domain = "general"
+  if (fmMatch) {
+    const domainMatch = fmMatch[1].match(/^knowledge_domain:\s*["']?(.+?)["']?\s*$/m)
+    if (domainMatch) domain = domainMatch[1].trim().toLowerCase()
+  }
+
+  return { path, title, type, domain, tags, origin }
 }
 
 function flattenMdFiles(nodes: FileNode[]): FileNode[] {

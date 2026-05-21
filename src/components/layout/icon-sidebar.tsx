@@ -5,11 +5,13 @@ import {
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
 import { useWikiStore } from "@/stores/wiki-store"
 import { useReviewStore } from "@/stores/review-store"
+import { useGovernanceStore } from "@/stores/governance-store"
 import { useResearchStore } from "@/stores/research-store"
 import { useUpdateStore, hasAvailableUpdate } from "@/stores/update-store"
 import { useTranslation } from "react-i18next"
 import logoImg from "@/assets/logo.jpg"
 import type { WikiState } from "@/stores/wiki-store"
+import { normalizePath } from "@/lib/path-utils"
 
 type NavView = WikiState["activeView"]
 
@@ -29,8 +31,12 @@ interface IconSidebarProps {
 export function IconSidebar({ onSwitchProject }: IconSidebarProps) {
   const { t } = useTranslation()
   const activeView = useWikiStore((s) => s.activeView)
+  const project = useWikiStore((s) => s.project)
   const setActiveView = useWikiStore((s) => s.setActiveView)
-  const pendingCount = useReviewStore((s) => s.items.filter((i) => !i.resolved).length)
+  const aiPendingCount = useReviewStore((s) => s.items.filter((i) => !i.resolved).length)
+  const governancePendingCount = useGovernanceStore((s) => s.pendingCount)
+  const loadGovernanceQueue = useGovernanceStore((s) => s.loadQueue)
+  const pendingCount = aiPendingCount + governancePendingCount
   const researchPanelOpen = useResearchStore((s) => s.panelOpen)
   const researchActiveCount = useResearchStore((s) => s.tasks.filter((t) => t.status !== "done" && t.status !== "error").length)
   const toggleResearchPanel = useResearchStore((s) => s.setPanelOpen)
@@ -59,6 +65,11 @@ export function IconSidebar({ onSwitchProject }: IconSidebarProps) {
     const interval = setInterval(check, 30000)
     return () => clearInterval(interval)
   }, [])
+
+  useEffect(() => {
+    if (!project) return
+    loadGovernanceQueue(normalizePath(project.path)).catch(() => {})
+  }, [project, loadGovernanceQueue])
 
   return (
     <TooltipProvider delay={300}>

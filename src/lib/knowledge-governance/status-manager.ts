@@ -71,14 +71,13 @@ export async function setPageStatus(pagePath: string, status: KnowledgeStatus): 
 /**
  * Stamp a freshly generated page as "candidate".
  * Called by the ingest pipeline immediately after writing the file.
- * No-op if the file already has a status field.
+ * Ingested pages must remain candidate until a human explicitly approves them.
  */
 export async function stampCandidate(pagePath: string): Promise<void> {
   try {
     const content = await readFile(pagePath)
-    if (/^status:/m.test(content)) return   // Already has status — don't overwrite
     const updated = setStatusInContent(content, "candidate")
-    await writeFile(pagePath, updated)
+    if (updated !== content) await writeFile(pagePath, updated)
   } catch (err) {
     console.warn("[status-manager] Failed to stamp candidate:", pagePath, err)
   }

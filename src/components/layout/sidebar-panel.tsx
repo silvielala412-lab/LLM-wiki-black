@@ -6,7 +6,7 @@ export function SidebarPanel() {
   const [mode, setMode] = useState<"knowledge" | "files">("knowledge")
 
   return (
-    <div className="flex h-full flex-col">
+    <div className="flex h-full min-h-0 flex-col">
       <div className="flex shrink-0 border-b">
         <button
           onClick={() => setMode("knowledge")}
@@ -29,7 +29,7 @@ export function SidebarPanel() {
           Files
         </button>
       </div>
-      <div className="flex-1 overflow-hidden">
+      <div className="min-h-0 flex-1 overflow-hidden">
         {mode === "knowledge" ? <KnowledgeTree /> : <FileTree />}
       </div>
     </div>

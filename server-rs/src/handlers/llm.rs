@@ -55,6 +55,48 @@ pub struct EmbedUsage {
     pub total_tokens: u64,
 }
 
+fn normalize_openai_vision_messages(messages: Vec<Value>) -> Vec<Value> {
+    messages
+        .into_iter()
+        .map(|mut message| {
+            let Some(content) = message.get_mut("content") else {
+                return message;
+            };
+            let Some(blocks) = content.as_array_mut() else {
+                return message;
+            };
+
+            for block in blocks.iter_mut() {
+                let is_internal_image = block
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .map(|t| t == "image")
+                    .unwrap_or(false);
+                if !is_internal_image {
+                    continue;
+                }
+
+                let media_type = block
+                    .get("mediaType")
+                    .and_then(Value::as_str)
+                    .unwrap_or("image/jpeg");
+                let Some(data_base64) = block.get("dataBase64").and_then(Value::as_str) else {
+                    continue;
+                };
+
+                *block = json!({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": format!("data:{media_type};base64,{data_base64}")
+                    }
+                });
+            }
+
+            message
+        })
+        .collect()
+}
+
 // ── POST /api/llm/stream ─────────────────────────────────────────────────────
 
 /// Proxy an OpenAI-compatible chat completion stream to the configured
@@ -182,7 +224,7 @@ pub async fn stream_vision_chat(
 
     let mut req_body = json!({
         "model": model,
-        "messages": body.messages,
+        "messages": normalize_openai_vision_messages(body.messages),
         "stream": true,
     });
     if let Some(t) = body.temperature {

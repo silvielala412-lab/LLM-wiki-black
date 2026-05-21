@@ -85,6 +85,10 @@ export interface ExistingEntity {
   relativePath: string
   /** Display name (filename without .md) */
   name: string
+  /** Schema entity_type from frontmatter, when available. */
+  entityType?: string
+  /** Lightweight business signature used for schema-aware deduplication. */
+  businessSignature?: string
 }
 
 /**
@@ -103,10 +107,13 @@ export async function loadExistingEntities(
       for (const f of files) {
         if (f.is_dir || !f.name.endsWith(".md")) continue
         const relativePath = `${dir}/${f.name}`
+        const existingContent = await safeRead(`${projectPath}/${relativePath}`)
         results.push({
           fullPath: `${projectPath}/${relativePath}`,
           relativePath,
           name: nameFromPath(relativePath),
+          entityType: extractScalar(existingContent, "entity_type"),
+          businessSignature: inferBusinessSignature(existingContent, nameFromPath(relativePath)),
         })
       }
     } catch {
@@ -115,6 +122,14 @@ export async function loadExistingEntities(
   }
 
   return results
+}
+
+async function safeRead(path: string): Promise<string> {
+  try {
+    return await readFile(path)
+  } catch {
+    return ""
+  }
 }
 
 // ── Alias injection ───────────────────────────────────────────────────────────
@@ -196,12 +211,17 @@ export async function normalizeEntityBlock(
   }
 
   const newName = nameFromPath(relativePath)
+  const newSignature = inferBusinessSignature(content, newName)
+  const newEntityType = extractScalar(content, "entity_type")
 
   // Find the first existing entity that is "similar" but NOT the exact same path
   const match = existingEntities.find(
     (e) =>
       e.relativePath !== relativePath &&
-      isSimilar(e.name, newName),
+      (
+        (newSignature && e.businessSignature === newSignature && compatibleEntityTypes(e.entityType, newEntityType)) ||
+        (!newSignature && compatibleEntityTypes(e.entityType, newEntityType) && isSimilar(e.name, newName))
+      ),
   )
 
   if (!match) {
@@ -233,4 +253,54 @@ export async function normalizeEntityBlock(
     originalPath: relativePath,
     canonicalName: match.name,
   }
+}
+
+export function inferBusinessSignature(content: string, fallbackName: string): string {
+  const entityType = extractScalar(content, "entity_type")
+  const title = extractTitle(content) || fallbackName
+  const identityText = `${fallbackName}\n${title}`.toLowerCase()
+  const contentText = content.toLowerCase()
+
+  if (entityType === "objection_handling" || /异议处理|objection|医保异议|保费太贵/.test(identityText)) {
+    if (/医保|社保|医疗保险|补充医疗/.test(contentText)) return "method.objection.medical_insurance"
+    if (/保费太贵|太贵|预算|年收入.*5%|5%/.test(contentText)) return "method.objection.premium_too_expensive"
+    if (/身体很好|暂时不用|健康/.test(contentText)) return "method.objection.currently_healthy"
+  }
+
+  if (entityType === "persona" || /家庭经济支柱|30-45岁家庭支柱画像|高净值家庭健康管理客户|体检异常客户/.test(identityText)) {
+    if (/家庭经济支柱|家庭支柱|30-45岁家庭支柱/.test(identityText)) return "customer.persona.family_breadwinner"
+    if (/高净值|企业主|高管|健康管理体验/.test(identityText)) return "customer.persona.high_net_worth_health_management"
+    if (/体检异常/.test(identityText)) return "customer.persona.abnormal_physical_exam"
+  }
+
+  if (entityType === "service_benefit" || /家庭医生在线咨询服务|重疾绿通服务|健康档案管理服务/.test(identityText)) {
+    if (/家庭医生|在线咨询/.test(identityText)) return "product.service.family_doctor_online"
+    if (/重疾绿通|绿通|专家门诊/.test(identityText)) return "product.service.critical_illness_green_channel"
+    if (/健康档案/.test(identityText)) return "product.service.health_record_management"
+  }
+
+  if (entityType === "product" || /安心家庭守护重疾险/.test(identityText)) {
+    return "product.anxin_family_guard_critical_illness"
+  }
+
+  return ""
+}
+
+function compatibleEntityTypes(existingType = "", newType = ""): boolean {
+  if (!existingType || !newType) return true
+  if (existingType === newType) return true
+
+  const genericTypes = new Set(["general", "entity", "concept"])
+  if (genericTypes.has(existingType) || genericTypes.has(newType)) return true
+
+  return false
+}
+
+function extractTitle(content: string): string {
+  return extractScalar(content, "title").replace(/^source:\s*/i, "")
+}
+
+function extractScalar(content: string, key: string): string {
+  const match = content.match(new RegExp(`^${key}:\\s*"?([^"\\r\\n]+)"?\\s*$`, "m"))
+  return match ? match[1].trim().toLowerCase().replace(/[\s-]+/g, "_") : ""
 }

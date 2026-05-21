@@ -5,7 +5,7 @@
  * Loaded when the user clicks the review icon in the icon sidebar.
  */
 
-import { useEffect } from "react"
+import { useEffect, useState } from "react"
 import { ShieldCheck, Inbox } from "lucide-react"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { useWikiStore } from "@/stores/wiki-store"
@@ -14,11 +14,15 @@ import { setPageStatus } from "@/lib/knowledge-governance"
 import { ReviewItemCard } from "./review-item-card"
 import { normalizePath } from "@/lib/path-utils"
 import type { ReviewResolution } from "@/lib/knowledge-governance"
+import { listDirectory } from "@/commands/fs"
+import { mergeReviewPageIntoExisting } from "@/lib/knowledge-governance/review-actions"
 
 export function ReviewPanel() {
   const project = useWikiStore((s) => s.project)
   const bumpDataVersion = useWikiStore((s) => s.bumpDataVersion)
+  const setFileTree = useWikiStore((s) => s.setFileTree)
   const { items, isLoading, loadQueue, resolve, dismiss } = useGovernanceStore()
+  const [actionError, setActionError] = useState<string | null>(null)
 
   const pp = project ? normalizePath(project.path) : null
 
@@ -33,6 +37,7 @@ export function ReviewPanel() {
     if (!pp) return
     const item = items.find((i) => i.id === id)
     if (!item) return
+    setActionError(null)
 
     // Apply status change to the actual file
     try {
@@ -40,6 +45,8 @@ export function ReviewPanel() {
         await setPageStatus(item.newPagePath, "active")
       } else if (resolution === "rejected") {
         await setPageStatus(item.newPagePath, "rejected")
+      } else if (resolution === "unrelated") {
+        await setPageStatus(item.newPagePath, "active")
       } else if (resolution === "superseded" && item.existingPagePath) {
         await setPageStatus(item.existingPagePath, "superseded")
         await setPageStatus(item.newPagePath, "active")
@@ -84,14 +91,29 @@ export function ReviewPanel() {
             console.warn("[ReviewPanel] Failed to record transition:", err)
           }
         })()
+      } else if (resolution === "superseded" && !item.existingPagePath) {
+        throw new Error("缺少旧页面路径，无法执行替代旧版本")
       } else if (resolution === "merged") {
+        if (!item.existingPagePath) throw new Error("缺少旧页面路径，无法合并")
+        await mergeReviewPageIntoExisting(item.existingPagePath, item.newPagePath, item.newPageTitle)
+        await setPageStatus(item.existingPagePath, "active")
         await setPageStatus(item.newPagePath, "rejected")
       }
     } catch (err) {
       console.error("[ReviewPanel] Failed to update page status:", err)
+      const message = err instanceof Error ? err.message : String(err)
+      setActionError(`操作失败：${message}`)
+      window.alert(`审核操作失败：${message}`)
+      return
     }
 
     await resolve(pp, id, resolution)
+    await loadQueue(pp)
+    try {
+      setFileTree(await listDirectory(pp))
+    } catch {
+      // Non-critical; dataVersion still refreshes open previews.
+    }
     bumpDataVersion()  // Refresh WikiPageViewer status badge
   }
 
@@ -109,7 +131,7 @@ export function ReviewPanel() {
   }
 
   return (
-    <div className="flex h-full flex-col">
+    <div className="flex h-full min-h-0 flex-col overflow-hidden">
       {/* Header */}
       <div className="flex items-center gap-2 border-b px-4 py-3">
         <ShieldCheck className="h-4 w-4 text-amber-500" />
@@ -120,8 +142,13 @@ export function ReviewPanel() {
           </span>
         )}
       </div>
+      {actionError && (
+        <div className="border-b border-red-200 bg-red-50 px-4 py-2 text-xs text-red-700">
+          {actionError}
+        </div>
+      )}
 
-      <ScrollArea className="flex-1">
+      <ScrollArea className="min-h-0 flex-1">
         <div className="p-3 space-y-3">
           {isLoading && (
             <div className="flex justify-center py-8">
@@ -163,7 +190,7 @@ export function ReviewPanel() {
                 >
                   <span
                     className={`h-1.5 w-1.5 rounded-full flex-shrink-0 ${
-                      item.resolution === "accepted" || item.resolution === "superseded"
+                      item.resolution === "accepted" || item.resolution === "superseded" || item.resolution === "unrelated"
                         ? "bg-emerald-500"
                         : item.resolution === "rejected"
                         ? "bg-red-400"
@@ -172,7 +199,7 @@ export function ReviewPanel() {
                   />
                   <span className="truncate flex-1">{item.newPageTitle}</span>
                   <span className="flex-shrink-0 text-[10px]">
-                    {{ accepted: "已确认", rejected: "已拒绝", merged: "已合并", superseded: "已替代" }[item.resolution!] ?? ""}
+                    {{ accepted: "已采纳", rejected: "未采纳", merged: "已合并", superseded: "已替代", unrelated: "已取消关联" }[item.resolution!] ?? ""}
                   </span>
                 </div>
               ))}

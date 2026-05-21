@@ -9,12 +9,12 @@
  * Activated for any file under wiki/ — raw sources use FilePreview.
  */
 
-import { useMemo, useState, useCallback } from "react"
+import { useEffect, useMemo, useState, useCallback } from "react"
 import ReactMarkdown from "react-markdown"
 import remarkGfm from "remark-gfm"
 import remarkMath from "remark-math"
 import rehypeKatex from "rehype-katex"
-import { Pencil, Trash2, Plus } from "lucide-react"
+import { ChevronDown, ChevronRight, Pencil, Trash2, Plus } from "lucide-react"
 import { useWikiStore } from "@/stores/wiki-store"
 import { resolveMarkdownImageSrc } from "@/lib/markdown-image-resolver"
 import type { FileNode } from "@/types/wiki"
@@ -25,6 +25,8 @@ import { ConfirmDialog } from "@/components/ui/confirm-dialog"
 import { StatusBadge } from "@/components/review/status-badge"
 import { setPageStatus, parseStatusFromContent } from "@/lib/knowledge-governance"
 import type { KnowledgeStatus } from "@/lib/knowledge-governance"
+import { DOMAIN_LABELS } from "@/lib/knowledge-schema"
+import { buildKnowledgeRelationIndex, relationsForPage, type KnowledgeRelationView } from "@/lib/knowledge-relation-index"
 
 // ── Type icons & colours ─────────────────────────────────────────────────────
 
@@ -43,6 +45,8 @@ interface Frontmatter {
   type: string
   tags: string[]
   related: string[]
+  parent: string
+  children: string[]
   sources: string[]
   created: string
   updated: string
@@ -50,13 +54,43 @@ interface Frontmatter {
   ingested_by: string
   ingested_by_user: string
   status: string
+  schema_version: string
+  industry: string
+  domain: string
+  knowledge_domain: string
+  taxonomy_path: string[]
+  entity_type: string
+  business_phase: string
+  dedup_key: string
+  summary: string
+  keywords: string[]
+  source_files: string[]
+  confidence: string
+  needs_review: string
+  created_at: string
+  updated_at: string
+  created_by: string
+  attributes: string
+  claims: string[]
+  relations: string[]
+  ingest_processing_mode: string
+  ingest_source_chars: string
+  ingest_context_chars: string
+  ingest_chunk_count: string
+  ingest_quality_confidence: string
 }
 
 
 function parseFrontmatter(content: string): { fm: Frontmatter; body: string } {
   const fm: Frontmatter = {
-    title: "", type: "default", tags: [], related: [], sources: [],
+    title: "", type: "default", tags: [], related: [], parent: "", children: [], sources: [],
     created: "", updated: "", ingested_at: "", ingested_by: "", ingested_by_user: "", status: "",
+    schema_version: "", industry: "", domain: "", knowledge_domain: "", taxonomy_path: [],
+    entity_type: "", business_phase: "", dedup_key: "", summary: "",
+    keywords: [], source_files: [], confidence: "", needs_review: "", created_at: "", updated_at: "",
+    created_by: "", attributes: "", claims: [], relations: [],
+    ingest_processing_mode: "", ingest_source_chars: "", ingest_context_chars: "",
+    ingest_chunk_count: "", ingest_quality_confidence: "",
   }
 
   const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/m)
@@ -107,9 +141,45 @@ function parseFrontmatter(content: string): { fm: Frontmatter; body: string } {
   }
   fm.tags = asList(fm.tags)
   fm.related = asList(fm.related)
+  fm.children = asList(fm.children)
   fm.sources = asList(fm.sources)
+  fm.keywords = asList(fm.keywords)
+  fm.source_files = asList(fm.source_files)
+  fm.taxonomy_path = asList(fm.taxonomy_path)
+  fm.claims = asList(fm.claims)
+  fm.relations = asList(fm.relations)
+
+  fm.attributes = rawYamlValue(yamlStr, "attributes") || fm.attributes
+  if (fm.claims.length === 0) fm.claims = rawYamlBlockList(yamlStr, "claims")
+  if (fm.relations.length === 0) fm.relations = rawYamlBlockList(yamlStr, "relations")
 
   return { fm, body }
+}
+
+function rawYamlValue(yaml: string, key: string): string {
+  const lines = yaml.split(/\r?\n/)
+  const start = lines.findIndex(line => new RegExp(`^${key}:\\s*`).test(line))
+  if (start < 0) return ""
+
+  const first = lines[start].replace(new RegExp(`^${key}:\\s*`), "").trim()
+  const block: string[] = []
+  for (let i = start + 1; i < lines.length; i++) {
+    const line = lines[i]
+    if (/^\w+:\s*/.test(line)) break
+    if (line.trim()) block.push(line)
+  }
+
+  const value = [first, ...block].filter(Boolean).join("\n").trim()
+  return value.replace(/^["']|["']$/g, "")
+}
+
+function rawYamlBlockList(yaml: string, key: string): string[] {
+  const raw = rawYamlValue(yaml, key)
+  if (!raw) return []
+  return raw
+    .split(/\r?\n/)
+    .map(line => line.trim().replace(/^-\s*/, "").replace(/^["']|["']$/g, ""))
+    .filter(Boolean)
 }
 
 // ── Section splitter ─────────────────────────────────────────────────────────
@@ -222,8 +292,8 @@ function SourceChip({ src }: { src: string }) {
 }
 
 function WikiLinkCard({
-  name, onClick, exists,
-}: { name: string; onClick: () => void; exists: boolean }) {
+  name, onClick, exists, detail,
+}: { name: string; onClick: () => void; exists: boolean; detail?: string }) {
   const icons = ["💎", "📊", "👥", "🏆", "⚡", "🔗", "📌", "🗂️"]
   const icon = icons[Math.abs(name.charCodeAt(0)) % icons.length]
 
@@ -241,7 +311,7 @@ function WikiLinkCard({
         }}
       >
         <div style={{ fontSize: 11, fontWeight: 700, color: "#E53935" }}>🔴 {name}</div>
-        <div style={{ fontSize: 10, color: "#E53935", marginTop: 2 }}>页面待创建</div>
+        <div style={{ fontSize: 10, color: "#E53935", marginTop: 2 }}>{detail ?? "页面待创建"}</div>
       </div>
     )
   }
@@ -267,9 +337,197 @@ function WikiLinkCard({
       }}
     >
       <div style={{ fontSize: 11, fontWeight: 700, color: "#2B5CE6" }}>{icon} {name}</div>
-      <div style={{ fontSize: 10, color: "#8B92A0", marginTop: 2 }}>点击跳转</div>
+      <div style={{ fontSize: 10, color: "#8B92A0", marginTop: 2 }}>{detail ?? "点击跳转"}</div>
     </div>
   )
+}
+
+function relationLabel(relation: KnowledgeRelationView): string {
+  const direction = relation.direction === "inbound" ? "反向" : "正向"
+  return `${direction} · ${relation.display_type}`
+}
+
+function extractKnowledgeGaps(attributes: string): string[] {
+  if (!attributes) return []
+  try {
+    const parsed = JSON.parse(attributes)
+    const gaps = parsed?.knowledge_gaps
+    if (Array.isArray(gaps)) {
+      return gaps.map((gap) => String(gap).trim()).filter(Boolean)
+    }
+    if (typeof gaps === "string" && gaps.trim()) return [gaps.trim()]
+  } catch {
+    const match = attributes.match(/"knowledge_gaps"\s*:\s*\[([^\]]*)]/)
+    if (!match) return []
+    return match[1]
+      .split(",")
+      .map((item) => item.replace(/^["'\s]+|["'\s]+$/g, "").trim())
+      .filter(Boolean)
+  }
+  return []
+}
+
+function KnowledgeGapsPanel({ gaps }: { gaps: string[] }) {
+  if (gaps.length === 0) return null
+  return (
+    <div style={{ marginBottom: 28 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+        <div style={{ width: 4, height: 16, borderRadius: 2, background: "#F59E0B" }} />
+        <h2 style={{ fontSize: 14, fontWeight: 700, color: "#15181E", margin: 0, borderLeft: "none", paddingLeft: 0 }}>
+          缺失知识 / 待补全信息
+        </h2>
+      </div>
+      <div
+        style={{
+          background: "#FFF7ED",
+          border: "1px solid #FED7AA",
+          borderRadius: 8,
+          padding: "12px 16px",
+        }}
+      >
+        <div style={{ fontSize: 12, color: "#9A3412", marginBottom: 8 }}>
+          以下字段或知识点未从当前材料中确认，建议进入审核或补充资料流程。
+        </div>
+        <ul style={{ margin: 0, paddingLeft: 18, color: "#7C2D12", fontSize: 12, lineHeight: 1.8 }}>
+          {gaps.map((gap) => (
+            <li key={gap}>{gap}</li>
+          ))}
+        </ul>
+      </div>
+    </div>
+  )
+}
+
+function SchemaInfoPanel({ fm }: { fm: Frontmatter }) {
+  const [open, setOpen] = useState(false)
+  const groups = [
+    {
+      title: "通用层",
+      rows: [
+        ["Schema Version", fm.schema_version],
+        ["Industry", fm.industry],
+        ["Knowledge Domain", fm.knowledge_domain || fm.domain],
+        ["Taxonomy Path", fm.taxonomy_path.join(" / ")],
+        ["Universal Type", fm.type],
+        ["Entity Type", fm.entity_type],
+        ["Business Phase", fm.business_phase],
+        ["Dedup Key", fm.dedup_key],
+        ["Confidence", fm.confidence],
+        ["Needs Review", fm.needs_review],
+        ["Status", fm.status],
+        ["Keywords", fm.keywords.join(", ")],
+        ["Summary", fm.summary],
+      ],
+    },
+    {
+      title: "领域扩展层",
+      rows: [
+        ["Attributes", formatJsonLike(fm.attributes)],
+      ],
+    },
+    {
+      title: "关系层",
+      rows: [
+        ["Related", fm.related.join(", ")],
+        ["Relations", fm.relations.join(" | ")],
+        ["Parent", fm.parent],
+        ["Children", fm.children.join(", ")],
+      ],
+    },
+    {
+      title: "证据与治理层",
+      rows: [
+        ["Source Files", (fm.source_files.length > 0 ? fm.source_files : fm.sources).join(", ")],
+        ["Claims", fm.claims.join(" | ")],
+        ["Created At", fm.created_at || fm.created],
+        ["Updated At", fm.updated_at || fm.updated],
+        ["Created By", fm.created_by || fm.ingested_by_user],
+      ],
+    },
+  ].map(group => ({
+    ...group,
+    rows: group.rows.filter(([, value]) => String(value ?? "").trim().length > 0),
+  })).filter(group => group.rows.length > 0)
+  const rowCount = groups.reduce((sum, group) => sum + group.rows.length, 0)
+
+  if (rowCount === 0) return null
+
+  return (
+    <div style={{
+      border: "1px solid #D8DEE8",
+      borderRadius: 8,
+      background: "#F8FAFC",
+      marginBottom: 22,
+      overflow: "hidden",
+    }}>
+      <button
+        type="button"
+        onClick={() => setOpen(v => !v)}
+        style={{
+          width: "100%",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          gap: 10,
+          padding: "10px 12px",
+          border: "none",
+          background: "transparent",
+          cursor: "pointer",
+          color: "#334155",
+          fontSize: 12,
+          fontWeight: 700,
+          textAlign: "left",
+        }}
+      >
+        <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          {open ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+          Schema 信息
+        </span>
+        <span style={{ fontSize: 10, color: "#64748B", fontWeight: 500 }}>
+          {rowCount} fields
+        </span>
+      </button>
+      {open && (
+        <div style={{ borderTop: "1px solid #E2E8F0", padding: 12, fontSize: 11 }}>
+          {groups.map((group) => (
+            <div key={group.title} style={{ marginBottom: 12 }}>
+              <div style={{ color: "#0F172A", fontWeight: 800, marginBottom: 8 }}>{group.title}</div>
+              <div style={{
+                display: "grid",
+                gridTemplateColumns: "minmax(120px, 180px) 1fr",
+                gap: "8px 12px",
+              }}>
+                {group.rows.map(([label, value]) => (
+                  <div key={`${group.title}-${label}`} style={{ display: "contents" }}>
+                    <div style={{ color: "#64748B", fontWeight: 700 }}>{label}</div>
+                    <div style={{
+                      color: "#1E293B",
+                      minWidth: 0,
+                      overflowWrap: "anywhere",
+                      whiteSpace: String(value).length > 120 ? "pre-wrap" : "normal",
+                    }}>
+                      {String(value)}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function formatJsonLike(value: string): string {
+  const trimmed = value.trim()
+  if (!trimmed) return ""
+  if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return trimmed
+  try {
+    return JSON.stringify(JSON.parse(trimmed), null, 2)
+  } catch {
+    return trimmed
+  }
 }
 
 // ── Rich Markdown renderer ────────────────────────────────────────────────────
@@ -352,18 +610,25 @@ function findWikiPage(name: string, allPaths: string[]): string | null {
 export function WikiPageViewer({ filePath, content, onEditRequest, onDeleteComplete }: WikiPageViewerProps) {
   const projectPath = useWikiStore(s => s.project?.path ?? null)
   const fileTree = useWikiStore(s => s.fileTree)
+  const dataVersion = useWikiStore(s => s.dataVersion)
   const setSelectedFile = useWikiStore(s => s.setSelectedFile)
   const setFileTree = useWikiStore(s => s.setFileTree)
   const bumpDataVersion = useWikiStore(s => s.bumpDataVersion)
 
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
   const [showCreateMenu, setShowCreateMenu] = useState(false)
+  const [indexedRelations, setIndexedRelations] = useState<KnowledgeRelationView[]>([])
 
   const { fm, sections } = useMemo(() => {
     const { fm, body } = parseFrontmatter(content)
     const sections = splitSections(body).filter(s => s.heading !== fm.title)
     return { fm, sections }
   }, [content])
+  const knowledgeGaps = useMemo(() => extractKnowledgeGaps(fm.attributes), [fm.attributes])
+  const bodyAlreadyShowsGaps = useMemo(
+    () => sections.some((sec) => /知识缺口|缺失知识|待补全|待补充/.test(`${sec.heading}\n${sec.content}`)),
+    [sections],
+  )
 
   const typeMeta = TYPE_META[fm.type] ?? TYPE_META.default
 
@@ -377,6 +642,27 @@ export function WikiPageViewer({ filePath, content, onEditRequest, onDeleteCompl
       path: findWikiPage(name, allPaths),
     }))
   }, [fm.related, allPaths])
+
+  useEffect(() => {
+    let cancelled = false
+    if (!projectPath) {
+      setIndexedRelations([])
+      return
+    }
+
+    buildKnowledgeRelationIndex(projectPath)
+      .then((index) => {
+        if (!cancelled) setIndexedRelations(relationsForPage(index, filePath))
+      })
+      .catch((err) => {
+        console.warn("[WikiPageViewer] Failed to build relation index:", err)
+        if (!cancelled) setIndexedRelations([])
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [projectPath, filePath, dataVersion])
 
   const status: KnowledgeStatus = (parseStatusFromContent(content) as KnowledgeStatus)
 
@@ -425,13 +711,35 @@ export function WikiPageViewer({ filePath, content, onEditRequest, onDeleteCompl
     const dateStr = now.toISOString().slice(0, 10)
     const template = [
       "---",
+      `schema_version: "2.1"`,
+      `industry: insurance`,
+      `knowledge_domain: general`,
+      `domain: general`,
+      `taxonomy_path: [general, ${type}]`,
       `type: ${type}`,
+      `entity_type: ${type}`,
+      `business_phase: general`,
+      `dedup_key: ${slug || name.trim()}`,
       `title: "${name.trim()}"`,
+      `summary: ""`,
+      `created_at: ${dateStr}`,
+      `updated_at: ${dateStr}`,
       `created: ${dateStr}`,
       `updated: ${dateStr}`,
       `tags: []`,
+      `keywords: []`,
       `related: []`,
+      `relations: []`,
+      `parent: ""`,
+      `children: []`,
+      `source_files: ["手动创建"]`,
+      `source_chunks: []`,
       `sources: ["手动创建"]`,
+      `confidence: 1`,
+      `status: active`,
+      `needs_review: false`,
+      `attributes: {}`,
+      `claims: []`,
       `ingested_at: "${now.toISOString()}"`,
       `ingested_by: "manual"`,
       "---",
@@ -586,8 +894,44 @@ export function WikiPageViewer({ filePath, content, onEditRequest, onDeleteCompl
               <Badge color={typeMeta.color} bg={typeMeta.bg}>
                 {fm.type}
               </Badge>
+              {(fm.knowledge_domain || fm.domain) && (
+                <Badge color="#0F766E" bg="#CCFBF1">
+                  {DOMAIN_LABELS[fm.knowledge_domain || fm.domain] ?? (fm.knowledge_domain || fm.domain)}
+                </Badge>
+              )}
+              {fm.entity_type && fm.entity_type !== fm.type && (
+                <Badge color="#4338CA" bg="#EEF2FF">
+                  {fm.entity_type}
+                </Badge>
+              )}
+              {fm.business_phase && fm.business_phase !== "general" && (
+                <Badge color="#A16207" bg="#FEF3C7">
+                  {fm.business_phase}
+                </Badge>
+              )}
               {/* Knowledge status badge */}
               <StatusBadge status={status} />
+              {fm.ingest_quality_confidence && (
+                <Badge
+                  color={
+                    fm.ingest_quality_confidence === "high" ? "#047857"
+                    : fm.ingest_quality_confidence === "medium" ? "#B45309"
+                    : "#B91C1C"
+                  }
+                  bg={
+                    fm.ingest_quality_confidence === "high" ? "#ECFDF5"
+                    : fm.ingest_quality_confidence === "medium" ? "#FFFBEB"
+                    : "#FEF2F2"
+                  }
+                >
+                  Quality: {fm.ingest_quality_confidence}
+                </Badge>
+              )}
+              {fm.ingest_processing_mode === "hierarchical-long-document" && (
+                <Badge color="#2563EB" bg="#EFF6FF">
+                  Long doc: {fm.ingest_chunk_count || "?"} chunks
+                </Badge>
+              )}
               {status === "candidate" && (
                 <button
                   onClick={handleMarkActive}
@@ -635,6 +979,8 @@ export function WikiPageViewer({ filePath, content, onEditRequest, onDeleteCompl
           </div>
         )}
 
+        {!bodyAlreadyShowsGaps && <KnowledgeGapsPanel gaps={knowledgeGaps} />}
+
         {/* ── Body sections ── */}
         {sections.map((sec, idx) => (
           <div key={idx} style={{ marginBottom: 28 }}>
@@ -674,8 +1020,34 @@ export function WikiPageViewer({ filePath, content, onEditRequest, onDeleteCompl
           </div>
         ))}
 
-        {/* ── Related pages (wikilinks) ── */}
-        {fm.related.length > 0 && (
+        {/* ── Structured relations ── */}
+        {indexedRelations.length > 0 ? (
+          <div style={{ marginBottom: 28 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+              <div style={{ width: 4, height: 16, borderRadius: 2, background: "#0891B2" }} />
+              <h2 style={{ fontSize: 14, fontWeight: 700, color: "#15181E", margin: 0, borderLeft: "none", paddingLeft: 0 }}>
+                结构化关联
+              </h2>
+            </div>
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))",
+                gap: 8,
+              }}
+            >
+              {indexedRelations.map((relation) => (
+                <WikiLinkCard
+                  key={`${relation.id}-${relation.direction}`}
+                  name={relation.display_title}
+                  detail={relationLabel(relation)}
+                  exists={Boolean(relation.display_path)}
+                  onClick={() => relation.display_path && openRelated(relation.display_path)}
+                />
+              ))}
+            </div>
+          </div>
+        ) : fm.related.length > 0 && (
           <div style={{ marginBottom: 28 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
               <div style={{ width: 4, height: 16, borderRadius: 2, background: "#0891B2" }} />
@@ -714,6 +1086,8 @@ export function WikiPageViewer({ filePath, content, onEditRequest, onDeleteCompl
             {fm.sources.map(src => <SourceChip key={src} src={src} />)}
           </div>
         )}
+
+        <SchemaInfoPanel fm={fm} />
 
         {/* ── Tags footer ── */}
         {fm.tags.length > 0 && (

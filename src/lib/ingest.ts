@@ -6,6 +6,9 @@ import { useChatStore } from "@/stores/chat-store"
 import { useActivityStore } from "@/stores/activity-store"
 import { useReviewStore, type ReviewItem } from "@/stores/review-store"
 import { getFileName, normalizePath } from "@/lib/path-utils"
+import { schemaGuidance } from "@/lib/knowledge-schema"
+import { normalizeSchemaFrontmatter, shouldNormalizeKnowledgePage } from "@/lib/knowledge-schema-normalizer"
+import { cleanupKnowledgeFrontmatter } from "@/lib/knowledge-frontmatter-cleanup"
 import { checkIngestCache, saveIngestCache } from "@/lib/ingest-cache"
 import { withProjectLock } from "@/lib/project-mutex"
 import {
@@ -19,6 +22,7 @@ import { loadExistingEntities, normalizeEntityBlock } from "@/lib/entity-normali
 import type { MultimodalConfig } from "@/stores/wiki-store"
 import type { ChunkingConfig } from "@/types/wiki"
 import { useAuthStore } from "@/stores/auth-store"
+import { chunkMarkdown } from "@/lib/text-chunker"
 
 /** Read the logged-in username without using a React hook (safe to call in lib code). */
 function _getUploaderUsername(): string {
@@ -26,10 +30,273 @@ function _getUploaderUsername(): string {
 }
 
 const OCR_IMAGE_EXTS = new Set(["png", "jpg", "jpeg", "webp", "gif", "bmp", "tiff", "tif"])
+const DIRECT_SOURCE_CHAR_LIMIT = 50000
+const LONG_SOURCE_DIGEST_LIMIT = 48000
+const LONG_SOURCE_MERGE_BATCH_CHARS = 30000
+const OCR_DETAIL_SECTION_MARKER = "<!-- LLM_WIKI_OCR_DETAIL_START -->"
+const OCR_DETAIL_SECTION_END_MARKER = "<!-- LLM_WIKI_OCR_DETAIL_END -->"
+const OCR_DETAIL_CHAR_LIMIT = 120000
+
+type IngestProcessingMode = "direct" | "hierarchical-long-document"
+type IngestSourceOrigin = "raw" | "ocr-image" | "ocr-pdf"
+const ocrSourceContentCache = new Map<string, { content: string; origin: IngestSourceOrigin }>()
+
+function sourceFingerprint(content: string): string {
+  let h1 = 0xdeadbeef ^ content.length
+  let h2 = 0x41c6ce57 ^ content.length
+  for (let i = 0; i < content.length; i++) {
+    const ch = content.charCodeAt(i)
+    h1 = Math.imul(h1 ^ ch, 2654435761)
+    h2 = Math.imul(h2 ^ ch, 1597334677)
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909)
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909)
+  return `${(h2 >>> 0).toString(16).padStart(8, "0")}${(h1 >>> 0).toString(16).padStart(8, "0")}`
+}
+
+function safeCacheName(name: string): string {
+  const base = name.replace(/\.[^.]+$/, "").replace(/[^\p{L}\p{N}_-]+/gu, "-").replace(/^-+|-+$/g, "")
+  return (base || "source").slice(0, 48)
+}
+
+interface PreparedIngestSource {
+  content: string
+  originalChars: number
+  contextChars: number
+  chunkCount: number
+  processingMode: IngestProcessingMode
+  qualityConfidence: "high" | "medium" | "low"
+  qualityNotes: string[]
+}
+
+const INSURANCE_SERVICE_MANUAL_NODES = [
+  { title: "家庭医生服务", kind: "service_benefit", aliases: ["家庭医生"] },
+  { title: "在线问诊", kind: "service_benefit", aliases: ["在线问诊"] },
+  { title: "音视频问诊", kind: "service_benefit", aliases: ["音视频问诊", "音视频随访", "音视频首访"] },
+  { title: "名医大咖", kind: "service_benefit", aliases: ["名医大咖"] },
+  { title: "特色体检", kind: "service_benefit", aliases: ["特色体检", "深度检查", "报告解读"] },
+  { title: "21天社群训练营", kind: "service_benefit", aliases: ["21天社群训练营"] },
+  { title: "用药服务", kind: "service_benefit", aliases: ["用药服务"] },
+  { title: "数字化慢病管理", kind: "service_benefit", aliases: ["数字化管理", "慢病管理"] },
+  { title: "门诊预约协助", kind: "service_benefit", aliases: ["门诊预约协助"] },
+  { title: "就医陪诊", kind: "service_benefit", aliases: ["就医陪诊"] },
+  { title: "重疾专案管理", kind: "service_benefit", aliases: ["重疾专案管理"] },
+  { title: "心理咨询", kind: "service_benefit", aliases: ["心理咨询"] },
+  { title: "检查安排协助", kind: "service_benefit", aliases: ["检查安排协助"] },
+  { title: "专家会诊", kind: "service_benefit", aliases: ["专家会诊"] },
+  { title: "海外远程书面咨询", kind: "service_benefit", aliases: ["海外远程书面咨询"] },
+  { title: "国内住院安排协助", kind: "service_benefit", aliases: ["国内住院安排协助", "住院安排协助"] },
+  { title: "手术安排协助", kind: "service_benefit", aliases: ["手术安排协助"] },
+  { title: "海外重疾住院安排协助", kind: "service_benefit", aliases: ["海外重疾住院安排协助"] },
+  { title: "住院照护", kind: "service_benefit", aliases: ["住院照护"] },
+  { title: "出院安排协助", kind: "service_benefit", aliases: ["出院安排协助"] },
+  { title: "康复门诊协助", kind: "service_benefit", aliases: ["康复门诊协助"] },
+  { title: "康复住院协助", kind: "service_benefit", aliases: ["康复住院协助"] },
+  { title: "上门护理", kind: "service_benefit", aliases: ["上门护理"] },
+  { title: "康复训练管理", kind: "service_benefit", aliases: ["康复训练管理"] },
+  { title: "服务激活流程", kind: "process", aliases: ["激活权益", "绑定家庭医生", "健康测评", "首访", "建档"] },
+  { title: "服务中止规则", kind: "rule", aliases: ["服务中止"] },
+  { title: "服务终止规则", kind: "rule", aliases: ["服务终止", "服务终止时间/情形"] },
+  { title: "重疾服务等待期与非共享规则", kind: "rule", aliases: ["90天等待期", "非共享", "仅限1人使用"] },
+  { title: "合规免责说明", kind: "compliance_rule", aliases: ["不承担", "仅供参考", "最终决定权", "法律责任", "免责"] },
+] as const
+
+function detectedServiceManualNodes(sourceContent: string): typeof INSURANCE_SERVICE_MANUAL_NODES[number][] {
+  if (!/(服务手册|服务体系|服务内容及标准|服务流程|服务期限|常见问题|家庭医生|重疾全程服务)/i.test(sourceContent)) {
+    return []
+  }
+  return INSURANCE_SERVICE_MANUAL_NODES.filter((node) =>
+    node.aliases.some((alias) => sourceContent.includes(alias)),
+  )
+}
+
+function buildServiceManualNodeDirective(sourceContent: string): string {
+  const nodes = detectedServiceManualNodes(sourceContent)
+  if (nodes.length === 0) return ""
+  const serviceNodes = nodes.filter((node) => node.kind === "service_benefit")
+  const ruleNodes = nodes.filter((node) => node.kind !== "service_benefit")
+  return [
+    "## Service Manual Node Extraction Requirements",
+    "This source appears to be an insurance service manual. Treat service benefits, process rules, and compliance disclaimers as first-class reusable knowledge nodes.",
+    "",
+    `Detected service/rule candidates (${nodes.length}): ${nodes.map((node) => node.title).join("、")}.`,
+    "",
+    "Required generation policy:",
+    "- Create the main service plan page, but do not stop there.",
+    "- For each independent service benefit, generate a dedicated `wiki/entities/*.md` page with `knowledge_domain: product`, `entity_type: service_benefit`, and `type: entity`.",
+    "- For service activation, suspension, termination, waiting-period/non-sharing, and disclaimer content, generate dedicated `process`, `rule`, or `compliance_rule` pages.",
+    "- Each service_benefit page body must include: 服务定义、适用对象、服务次数、服务流程/申请方式、响应/完成时效、覆盖范围、使用限制、合规提醒、来源依据、待补全信息.",
+    "- Each rule/process/compliance page body must include: 规则定义、触发条件、影响范围、业务含义、销售提示、来源依据、待补全信息.",
+    "- Link the main service plan page to every generated service/rule page using `has_part`, `governed_by`, `requires`, or `uses_process` relations.",
+    "- If output budget prevents generating all pages, generate the top business-critical pages first and emit REVIEW missing-page items for every omitted node.",
+    "",
+    serviceNodes.length > 0 ? `Service benefit pages expected: ${serviceNodes.map((node) => node.title).join("、")}.` : "",
+    ruleNodes.length > 0 ? `Rule/process/compliance pages expected: ${ruleNodes.map((node) => node.title).join("、")}.` : "",
+  ].filter(Boolean).join("\n")
+}
 
 function isImageSourcePath(path: string): boolean {
   const ext = path.split(".").pop()?.toLowerCase() ?? ""
   return OCR_IMAGE_EXTS.has(ext)
+}
+
+function countUniqueProductLikeCodes(content: string): number {
+  return new Set(content.match(/\b\d{4}[A-Z]?\b/g) ?? []).size
+}
+
+function estimateTableLikeRowCount(content: string): number {
+  const lines = content.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
+  const numberedRows = lines.filter((line) =>
+    /^(?:\|?\s*)\d{1,4}(?:\s*\||[、.．\s])/.test(line),
+  ).length
+  if (numberedRows > 0) return numberedRows
+
+  const codeRows = lines.filter((line) =>
+    /\b\d{4}[A-Z]?\b/.test(line) &&
+    /(是|否|1\*|1|N|产品|险|渠道|交期|备注)/i.test(line),
+  ).length
+  return codeRows
+}
+
+function isTableLikeSource(content: string): boolean {
+  const hasTableVocabulary = /(序号|产品名称|产品代码|主险代码|渠道|交期|是否|清单|准入|备注|1\+N|PVMargin)/i.test(content)
+  const uniqueCodes = countUniqueProductLikeCodes(content)
+  const rowCount = estimateTableLikeRowCount(content)
+  const markdownRows = (content.match(/^\s*\|.+\|\s*$/gm) ?? []).length
+  return hasTableVocabulary && (uniqueCodes >= 20 || rowCount >= 20 || markdownRows >= 20)
+}
+
+function buildInsuranceExtractionChecklist(sourceContent: string): string {
+  const signals: string[] = []
+  if (/(准入|清单|产品代码|主险代码|是否|1\+N|PVMargin|渠道|交期)/i.test(sourceContent)) signals.push("product_access_list")
+  if (/(服务手册|服务权益|服务内容|服务流程|预约|申请|次数|有效期|适用对象|不适用|限制|免责)/i.test(sourceContent)) signals.push("service_manual")
+  if (/(投保年龄|等待期|保险责任|责任免除|缴费期间|保障期间|基本保险金额|理赔|核保|健康告知)/i.test(sourceContent)) signals.push("product_terms")
+  if (/(宣传|海报|卖点|客户|场景|话术|异议|促成|转介绍|邀约|面访)/i.test(sourceContent)) signals.push("sales_material")
+  const detected = signals.length > 0 ? signals.join(", ") : "general_insurance_source"
+
+  return [
+    "## Insurance Extraction Completeness Standard",
+    `Detected document signals: ${detected}.`,
+    "",
+    "This ingestion is for a business demo. The generated Markdown body must be useful when compared with the original document in the frontend.",
+    "Do not only write high-level summaries. Extract and display concrete facts, rules, limits, exceptions, and gaps.",
+    "",
+    "Mandatory source-page sections:",
+    "- `原文事实清单`: enumerate the important facts from the source. Use compact tables/lists and keep the original wording where it matters.",
+    "- `结构化抽取结果`: map facts into Product / Customer / Method / Content / Activity / Cases / Compliance / General.",
+    "- `覆盖审计`: state what has been structured, what is only preserved in the source page, and what is missing or uncertain.",
+    "- `待补全信息`: list missing fields from the insurance schema instead of hiding them in frontmatter only.",
+    "",
+    "If the source is a product access list or service eligibility list:",
+    "- Preserve every identifiable row/item on the source page when the list is within a few hundred rows.",
+    "- Extract product name, product code, main product code, channel, delivery/payment period, yes/no/1/1*/N flags, service eligibility, remarks, and exceptions.",
+    "- Create entity pages for meaningful products, service benefits, eligibility rules, and limitation rules. Do not create hundreds of shallow pages for every row.",
+    "- Add claims for representative and business-critical rows; put the full row inventory on the source page.",
+    "",
+    "If the source is a service manual:",
+    "- Extract service name, service category, target product/customer, eligibility, service frequency, time limits, service process, required materials, provider/network, exclusions, disclaimers, customer-facing value, and compliance reminders.",
+    "- Split independent services into `service_benefit`, `process`, `limitation`, and `compliance_rule` pages when they have reusable business value.",
+    "- A service manual should usually generate many pages, not only one service-plan page. If it contains family doctor, online consultation, famous-doctor, medical appointment, escort, hospitalization, surgery, nursing, rehabilitation, activation, suspension, termination, waiting-period, non-sharing, or disclaimer rules, these must become dedicated nodes or explicit review gaps.",
+    "",
+    "If the source is product terms or a product brochure:",
+    "- Extract positioning, product category, status, effective date, regulatory filing number if present, age range, waiting period, payment periods, coverage periods, responsibilities, exclusions, claim trigger, underwriting basics, service packages, selling points, and compliance limits.",
+    "",
+    "If the source is sales material:",
+    "- Extract target persona, scenario, business phase, pitch, objection, content asset, recommended product, risk wording, and customer-facing claims.",
+    "",
+    "Coverage rule:",
+    "- Any important source fact that is not converted into an entity attribute, relation, or claim must appear either in the source page `原文事实清单` or in `待补全信息` / review items.",
+  ].join("\n")
+}
+
+function buildFactLayerHints(sourceContent: string, sourceOrigin: IngestSourceOrigin): string {
+  const rowCount = estimateTableLikeRowCount(sourceContent)
+  const codeCount = countUniqueProductLikeCodes(sourceContent)
+  const tableLike = isTableLikeSource(sourceContent)
+  const shouldPreserveFacts = sourceOrigin !== "raw" || tableLike || rowCount >= 20 || codeCount >= 20
+  if (!shouldPreserveFacts) return ""
+
+  return [
+    "## Evidence/Facts Layer Required",
+    `Detected source_origin=${sourceOrigin}, estimated_table_rows=${rowCount}, unique_code_count=${codeCount}.`,
+    "",
+    "This source must be handled as two layers:",
+    "1. Source evidence layer: preserve row-level/table-level facts on the source page for exact review and RAG retrieval.",
+    "2. Domain entity layer: create concise Product/Customer/Method/etc. pages that link back to the source evidence.",
+    "",
+    "Rules:",
+    "- Do not compress a long product/service eligibility table into only a few sample rows.",
+    "- If the source is a product access list, service entitlement list, or eligibility sheet, keep raw rows/items available on wiki/sources/*.md.",
+    "- The source summary page must visibly include `原文事实清单` and `覆盖审计`; these sections are required for frontend review.",
+    "- For lists within a few hundred rows, include every identifiable row/item on the source page in a compact table or numbered list.",
+    "- Add source-page attributes such as raw_item_count, table_columns, row_level_facts_preserved, product_codes, eligibility_rules, service_items when supported by the source.",
+    "- Entity pages should summarize business meaning and include claims that cite the source, not duplicate every table row unless the row is itself a major entity.",
+    "- If row count or columns are uncertain, set needs_review: true and add knowledge_gaps for manual review.",
+  ].join("\n")
+}
+
+function buildOcrDetailSection(
+  sourceContent: string,
+  sourceOrigin: IngestSourceOrigin,
+): string {
+  const clipped = sourceContent.length > OCR_DETAIL_CHAR_LIMIT
+  const preserved = clipped ? sourceContent.slice(0, OCR_DETAIL_CHAR_LIMIT) : sourceContent
+  const originLabel = sourceOrigin === "ocr-pdf" ? "图片型 PDF OCR" : "图片 OCR"
+  const rowCount = estimateTableLikeRowCount(sourceContent)
+  const codeCount = countUniqueProductLikeCodes(sourceContent)
+
+  return [
+    "",
+    OCR_DETAIL_SECTION_MARKER,
+    "",
+    "## 原始OCR明细（自动保留）",
+    "",
+    `来源类型：${originLabel}`,
+    `OCR字符数：${sourceContent.length}`,
+    `疑似表格行数：${rowCount}`,
+    `识别到的唯一产品/代码数：${codeCount}`,
+    "",
+    "> 这部分是系统自动保留的 OCR 原文，用于演示、人工复核、RAG 精确检索和后续结构化抽取。上方知识卡可以摘要化，但这里不应省略长表格明细。",
+    "",
+    preserved.trim(),
+    "",
+    clipped ? `[OCR 明细过长，仅保留前 ${OCR_DETAIL_CHAR_LIMIT} 字符；完整内容请查看原始上传文件。]` : "",
+    "",
+    OCR_DETAIL_SECTION_END_MARKER,
+    "",
+  ].filter((line) => line !== "").join("\n")
+}
+
+async function preserveOcrDetailsInSourcePage(
+  sourceSummaryFullPath: string,
+  sourceContent: string,
+  sourceOrigin: IngestSourceOrigin,
+): Promise<void> {
+  if (sourceOrigin === "raw" && !isTableLikeSource(sourceContent)) return
+  if (!sourceContent.trim()) return
+
+  try {
+    let content = await readFile(sourceSummaryFullPath)
+    content = upsertFrontmatterField(content, "ingest_source_origin", sourceOrigin)
+    content = upsertFrontmatterField(content, "ocr_text_chars", sourceContent.length)
+    content = upsertFrontmatterField(content, "ocr_estimated_table_rows", estimateTableLikeRowCount(sourceContent))
+    content = upsertFrontmatterField(content, "ocr_unique_code_count", countUniqueProductLikeCodes(sourceContent))
+    content = upsertFrontmatterField(content, "ocr_detail_preserved", "true")
+
+    const detailSection = buildOcrDetailSection(sourceContent, sourceOrigin)
+    if (content.includes(OCR_DETAIL_SECTION_MARKER)) {
+      content = content.replace(
+        new RegExp(`${OCR_DETAIL_SECTION_MARKER}[\\s\\S]*?${OCR_DETAIL_SECTION_END_MARKER}`),
+        detailSection.trim(),
+      )
+    } else {
+      content = `${content.trimEnd()}\n\n${detailSection.trim()}\n`
+    }
+
+    await writeFile(sourceSummaryFullPath, content)
+  } catch (err) {
+    console.warn("[ingest:ocr] Failed to preserve OCR details:", err)
+  }
 }
 
 /**
@@ -263,6 +530,354 @@ export function languageRule(sourceContent: string = ""): string {
   return buildLanguageDirective(sourceContent)
 }
 
+function clampInt(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, Math.floor(value)))
+}
+
+async function streamText(
+  llmConfig: LlmConfig,
+  messages: Parameters<typeof streamChat>[1],
+  signal: AbortSignal | undefined,
+  overrides?: Parameters<typeof streamChat>[4],
+): Promise<string> {
+  let out = ""
+  let streamError: Error | null = null
+  await streamChat(
+    llmConfig,
+    messages,
+    {
+      onToken: (token) => { out += token },
+      onDone: () => {},
+      onError: (err) => { streamError = err },
+    },
+    signal,
+    overrides,
+  )
+  if (streamError) throw streamError
+  return out.trim()
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err)
+}
+
+function isTransientLlmError(err: unknown): boolean {
+  return /(503|Service Unavailable|service is too busy|429|rate limit|temporarily|timeout|timed out)/i.test(errorMessage(err))
+}
+
+function llmLabel(config: LlmConfig): string {
+  return config.model || config.provider || "LLM"
+}
+
+async function streamTextWithCompileFallback(
+  primaryConfig: LlmConfig,
+  messages: Parameters<typeof streamChat>[1],
+  signal: AbortSignal | undefined,
+  overrides: Parameters<typeof streamChat>[4] | undefined,
+  activityId: string,
+  stageLabel: string,
+): Promise<string> {
+  try {
+    return await streamText(primaryConfig, messages, signal, overrides)
+  } catch (err) {
+    if (!isTransientLlmError(err)) throw err
+
+    const fallbackConfig = buildVisionLlmConfig()
+    if (!fallbackConfig) throw err
+
+    useActivityStore.getState().updateItem(activityId, {
+      detail: `${stageLabel}: ${llmLabel(primaryConfig)} is busy; falling back to ${llmLabel(fallbackConfig)}...`,
+    })
+
+    try {
+      return await streamText(fallbackConfig, messages, signal, overrides)
+    } catch (fallbackErr) {
+      throw new Error(
+        `${stageLabel} failed. primary=${errorMessage(err)}; fallback=${errorMessage(fallbackErr)}`,
+      )
+    }
+  }
+}
+
+interface LongSourceChunk {
+  text: string
+  headingPath: string
+  charStart: number
+  charEnd: number
+}
+
+function hardSplitLongChunk(chunk: LongSourceChunk, maxChars: number, overlapChars: number): LongSourceChunk[] {
+  if (chunk.text.length <= maxChars) return [chunk]
+  const out: LongSourceChunk[] = []
+  const step = Math.max(1, maxChars - Math.max(0, overlapChars))
+  for (let offset = 0; offset < chunk.text.length; offset += step) {
+    const text = chunk.text.slice(offset, offset + maxChars)
+    if (!text.trim()) continue
+    out.push({
+      text,
+      headingPath: chunk.headingPath,
+      charStart: chunk.charStart + offset,
+      charEnd: chunk.charStart + offset + text.length,
+    })
+  }
+  return out
+}
+
+function buildLongSourceChunks(content: string, llmConfig: LlmConfig): LongSourceChunk[] {
+  const contextSize = llmConfig.maxContextSize || 100000
+  const targetChars = clampInt(contextSize * 0.12, 10000, 22000)
+  const maxChars = clampInt(targetChars * 1.25, targetChars, 26000)
+  const overlapChars = clampInt(targetChars * 0.08, 600, 1400)
+
+  const semanticChunks = chunkMarkdown(content, {
+    targetChars,
+    maxChars,
+    minChars: 1200,
+    overlapChars,
+  })
+
+  if (semanticChunks.length === 0 && content.trim()) {
+    return hardSplitLongChunk({
+      text: content,
+      headingPath: "",
+      charStart: 0,
+      charEnd: content.length,
+    }, maxChars, overlapChars)
+  }
+
+  return semanticChunks.flatMap((chunk) =>
+    hardSplitLongChunk({
+      text: chunk.text,
+      headingPath: chunk.headingPath,
+      charStart: chunk.charStart,
+      charEnd: chunk.charEnd,
+    }, maxChars, overlapChars),
+  )
+}
+
+function buildChunkDigestPrompt(fileName: string, chunkNumber: number, totalChunks: number): string {
+  return [
+    "You are extracting durable knowledge from one chunk of a long source document.",
+    "Return a compact, factual digest. Do not invent facts.",
+    "Preserve exact names, dates, numeric data, versions, constraints, and source wording when important.",
+    "Resolve local pronouns only when the referent is explicit inside this chunk; otherwise record the unresolved reference.",
+    "Use the same language as the source where practical.",
+    "",
+    "Output Markdown with exactly these sections:",
+    "## Entities",
+    "- name | type | role | aliases",
+    "## Concepts",
+    "- name | definition | why it matters",
+    "## Claims And Evidence",
+    "- claim | evidence text or data | confidence: high/medium/low",
+    "## Relations",
+    "- subject | relation | object | evidence",
+    "## Updates Or Conflicts",
+    "- item | update/conflict/uncertain | evidence",
+    "## Open References",
+    "- phrase | possible referent | uncertainty",
+    "",
+    `Source file: ${fileName}`,
+    `Chunk: ${chunkNumber}/${totalChunks}`,
+  ].join("\n")
+}
+
+function buildDigestMergePrompt(fileName: string): string {
+  return [
+    "You are merging chunk-level knowledge digests from a long source document.",
+    "Canonicalize duplicate entities and concepts, preserve meaningful aliases, and keep temporal/version differences explicit.",
+    "Do not drop niche but important facts, numbers, dates, rules, exclusions, or definitions.",
+    "When facts conflict, keep both and label the conflict instead of choosing silently.",
+    "Use the same language as the source where practical.",
+    "",
+    "Output Markdown with these sections:",
+    "## Global Entities",
+    "## Global Concepts",
+    "## Core Claims And Evidence",
+    "## Cross-Chunk Relations",
+    "## Temporal Or Version Changes",
+    "## Conflicts And Review Candidates",
+    "## Recommended Wiki Pages",
+    "",
+    `Source file: ${fileName}`,
+  ].join("\n")
+}
+
+async function mergeDigestBatch(
+  fileName: string,
+  llmConfig: LlmConfig,
+  digests: string[],
+  activityId: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  const body = digests.map((digest, idx) => `### Digest ${idx + 1}\n${digest}`).join("\n\n")
+  return streamTextWithCompileFallback(
+    llmConfig,
+    [
+      { role: "system", content: buildDigestMergePrompt(fileName) },
+      { role: "user", content: body },
+    ],
+    signal,
+    { temperature: 0.05, max_tokens: 2200 },
+    activityId,
+    "Long document digest merge",
+  )
+}
+
+async function mergeDigestsHierarchically(
+  fileName: string,
+  llmConfig: LlmConfig,
+  digests: string[],
+  activityId: string,
+  signal?: AbortSignal,
+): Promise<{ merged: string; failedMerges: number }> {
+  let level = digests.filter((d) => d.trim().length > 0)
+  let failedMerges = 0
+  if (level.length === 0) return { merged: "", failedMerges }
+
+  for (let depth = 0; depth < 5; depth++) {
+    const combined = level.join("\n\n")
+    if (combined.length <= LONG_SOURCE_DIGEST_LIMIT || level.length === 1) {
+      return { merged: combined, failedMerges }
+    }
+
+    const next: string[] = []
+    let batch: string[] = []
+    let batchChars = 0
+    for (const digest of level) {
+      if (batch.length > 0 && batchChars + digest.length > LONG_SOURCE_MERGE_BATCH_CHARS) {
+        try {
+          next.push(await mergeDigestBatch(fileName, llmConfig, batch, activityId, signal))
+        } catch (err) {
+          failedMerges++
+          console.warn(`[ingest:long] digest merge failed:`, err)
+          next.push(batch.join("\n\n"))
+        }
+        batch = []
+        batchChars = 0
+      }
+      batch.push(digest)
+      batchChars += digest.length
+    }
+    if (batch.length > 0) {
+      try {
+        next.push(await mergeDigestBatch(fileName, llmConfig, batch, activityId, signal))
+      } catch (err) {
+        failedMerges++
+        console.warn(`[ingest:long] digest merge failed:`, err)
+        next.push(batch.join("\n\n"))
+      }
+    }
+    level = next
+  }
+
+  return { merged: level.join("\n\n").slice(0, LONG_SOURCE_DIGEST_LIMIT), failedMerges }
+}
+
+function fitLongSourceContext(context: string): string {
+  if (context.length <= LONG_SOURCE_DIGEST_LIMIT) return context
+  return `${context.slice(0, LONG_SOURCE_DIGEST_LIMIT)}\n\n[...long-document synthesis clipped to fit generation context...]`
+}
+
+async function prepareSourceForIngest(
+  sourceContent: string,
+  fileName: string,
+  llmConfig: LlmConfig,
+  activityId: string,
+  signal?: AbortSignal,
+): Promise<PreparedIngestSource> {
+  if (sourceContent.length <= DIRECT_SOURCE_CHAR_LIMIT) {
+    return {
+      content: sourceContent,
+      originalChars: sourceContent.length,
+      contextChars: sourceContent.length,
+      chunkCount: 1,
+      processingMode: "direct",
+      qualityConfidence: "high",
+      qualityNotes: ["Full source content used directly."],
+    }
+  }
+
+  const activity = useActivityStore.getState()
+  const chunks = buildLongSourceChunks(sourceContent, llmConfig)
+  const digests: string[] = []
+  let failedChunkDigests = 0
+  activity.updateItem(activityId, {
+    detail: `Long document detected: extracting chunk digests 0/${chunks.length}...`,
+  })
+
+  for (let i = 0; i < chunks.length; i++) {
+    if (signal?.aborted) break
+    const chunk = chunks[i]
+    activity.updateItem(activityId, {
+      detail: `Long document: extracting chunk digest ${i + 1}/${chunks.length}...`,
+    })
+    const chunkHeader = [
+      `File: ${fileName}`,
+      `Chunk: ${i + 1}/${chunks.length}`,
+      chunk.headingPath ? `Heading path: ${chunk.headingPath}` : "",
+      `Character range: ${chunk.charStart}-${chunk.charEnd}`,
+      "",
+      chunk.text,
+    ].filter(Boolean).join("\n")
+
+    try {
+      const digest = await streamTextWithCompileFallback(
+        llmConfig,
+        [
+          { role: "system", content: buildChunkDigestPrompt(fileName, i + 1, chunks.length) },
+          { role: "user", content: chunkHeader },
+        ],
+        signal,
+        { temperature: 0.05, max_tokens: 1800 },
+        activityId,
+        `Long document chunk ${i + 1}/${chunks.length}`,
+      )
+      digests.push(`<!-- chunk:${i + 1} chars:${chunk.charStart}-${chunk.charEnd} -->\n${digest}`)
+    } catch (err) {
+      failedChunkDigests++
+      console.warn(`[ingest:long] chunk digest failed for ${fileName} #${i + 1}:`, err)
+      digests.push([
+        `<!-- chunk:${i + 1} chars:${chunk.charStart}-${chunk.charEnd} digest:fallback -->`,
+        `## Fallback Excerpt`,
+        chunk.headingPath ? `Heading path: ${chunk.headingPath}` : "",
+        chunk.text.slice(0, 3000),
+      ].filter(Boolean).join("\n"))
+    }
+  }
+
+  activity.updateItem(activityId, { detail: "Long document: merging chunk digests..." })
+  const { merged, failedMerges } = await mergeDigestsHierarchically(fileName, llmConfig, digests, activityId, signal)
+  const context = fitLongSourceContext([
+    `# Long-document synthesis for ${fileName}`,
+    "",
+    `Original characters: ${sourceContent.length}`,
+    `Chunks processed: ${chunks.length}`,
+    `Chunk digest failures: ${failedChunkDigests}`,
+    `Merge failures: ${failedMerges}`,
+    "",
+    "This is a hierarchical synthesis of the full source. It replaces raw truncation: every source chunk was processed into a digest before this global context was produced.",
+    "",
+    merged || digests.join("\n\n"),
+  ].join("\n"))
+
+  const qualityNotes = [
+    `Long source processed with hierarchical chunk digests (${chunks.length} chunks).`,
+    failedChunkDigests > 0 ? `${failedChunkDigests} chunk digest(s) used fallback excerpts.` : "All chunks produced LLM digests.",
+    failedMerges > 0 ? `${failedMerges} merge batch(es) used concatenation fallback.` : "Digest merge completed normally.",
+  ]
+
+  return {
+    content: context,
+    originalChars: sourceContent.length,
+    contextChars: context.length,
+    chunkCount: Math.max(1, chunks.length),
+    processingMode: "hierarchical-long-document",
+    qualityConfidence: failedChunkDigests === 0 && failedMerges === 0 ? "medium" : "low",
+    qualityNotes,
+  }
+}
+
 /**
  * Auto-ingest: reads source → LLM analyzes → LLM writes wiki pages, all in one go.
  * Used when importing new files.
@@ -319,18 +934,31 @@ async function autoIngestImpl(
 
   // ── Image-PDF OCR: detect scanned PDFs and run vision-model OCR ──
   let sourceContent = rawSourceContent
+  let sourceOrigin: IngestSourceOrigin = "raw"
+  const rawCacheKey = `${sp}|${rawSourceContent.length}`
   if (isImagePdf(rawSourceContent)) {
-    activity.updateItem(activityId, { detail: "Scanned PDF detected — running OCR..." })
-    const visionCfg = buildVisionLlmConfig()
-    if (visionCfg) {
+    const pdfOcrCacheDir = `${pp}/.llm-wiki/ocr-cache/${safeCacheName(fileName)}-${sourceFingerprint(rawSourceContent)}`
+    const cached = ocrSourceContentCache.get(rawCacheKey)
+    if (cached) {
+      sourceContent = cached.content
+      sourceOrigin = cached.origin
+      activity.updateItem(activityId, { detail: "Reusing cached PDF OCR text..." })
+      console.log(`[ingest:pdf-ocr] cache hit for "${fileName}": ${sourceContent.length} chars`)
+    } else {
+      activity.updateItem(activityId, { detail: "Scanned PDF detected — running OCR..." })
+      const visionCfg = buildVisionLlmConfig()
+      if (visionCfg) {
       try {
         sourceContent = await ocrImagePdf(rawSourceContent, visionCfg, {
           signal,
+          cacheDir: pdfOcrCacheDir,
           onProgress: (done, total) =>
             activity.updateItem(activityId, {
               detail: `OCR: page ${done}/${total}...`,
             }),
         })
+        sourceOrigin = "ocr-pdf"
+        ocrSourceContentCache.set(rawCacheKey, { content: sourceContent, origin: sourceOrigin })
         console.log(`[ingest:pdf-ocr] OCR complete for "${fileName}": ${sourceContent.length} chars`)
       } catch (err) {
         console.warn(`[ingest:pdf-ocr] OCR failed for "${fileName}":`, err)
@@ -342,26 +970,42 @@ async function autoIngestImpl(
         // at least generates a stub source-summary page.
         sourceContent = `(图片型 PDF — OCR 失败。请在服务器配置中设置 VISION_ENDPOINT 和 VISION_MODEL。文件: ${fileName})`
       }
-    } else {
+      } else {
       // Vision model not configured → friendly message in the wiki
       sourceContent = `(图片型 PDF — 服务器未配置视觉模型 VISION_ENDPOINT，无法 OCR。文件: ${fileName})`
       console.warn(`[ingest:pdf-ocr] No vision config for "${fileName}" — VISION_ENDPOINT not set`)
+      }
     }
   } else if (isImageSourcePath(sp)) {
     const visionCfg = buildVisionLlmConfig()
     if (visionCfg) {
       try {
-        activity.updateItem(activityId, { detail: "Image file detected - running OCR..." })
         const image = await readFileAsBase64(sp)
-        const ocrText = await ocrImageBytes(image.base64, image.mimeType, visionCfg, signal)
-        if (ocrText) {
-          sourceContent = `# OCR text extracted from ${fileName}\n\n${ocrText}`
+        const imageCacheKey = `${sp}|${image.base64.length}`
+        const cached = ocrSourceContentCache.get(imageCacheKey)
+        if (cached) {
+          sourceContent = cached.content
+          sourceOrigin = cached.origin
+          activity.updateItem(activityId, { detail: "Reusing cached image OCR text..." })
+          console.log(`[ingest:image-ocr] cache hit for "${fileName}": ${sourceContent.length} chars`)
+        } else {
+          activity.updateItem(activityId, { detail: "Image file detected - running OCR..." })
+          const ocrText = await ocrImageBytes(image.base64, image.mimeType, visionCfg, signal)
+          if (ocrText) {
+            sourceContent = `# OCR text extracted from ${fileName}\n\n${ocrText}`
+            sourceOrigin = "ocr-image"
+            ocrSourceContentCache.set(imageCacheKey, { content: sourceContent, origin: sourceOrigin })
+          }
         }
       } catch (err) {
         console.warn(`[ingest:image-ocr] OCR failed for "${fileName}":`, err)
       }
     }
   }
+
+  const sourceBaseName = fileName.replace(/\.[^.]+$/, "")
+  const sourceSummaryPath = `wiki/sources/${sourceBaseName}.md`
+  const sourceSummaryFullPath = `${pp}/${sourceSummaryPath}`
 
   // ── Cache check: skip re-ingest if source content hasn't changed ──
   //
@@ -447,6 +1091,7 @@ async function autoIngestImpl(
       detail: `Skipped (unchanged) — ${cachedFiles.length} files from previous ingest`,
       filesWritten: cachedFiles,
     })
+    await preserveOcrDetailsInSourcePage(sourceSummaryFullPath, sourceContent, sourceOrigin)
     return cachedFiles
   }
 
@@ -568,40 +1213,56 @@ async function autoIngestImpl(
     }
   }
 
-  const truncatedContent = enrichedSourceContent.length > 50000
-    ? enrichedSourceContent.slice(0, 50000) + "\n\n[...truncated...]"
-    : enrichedSourceContent
+  const preparedSource = await prepareSourceForIngest(
+    enrichedSourceContent,
+    fileName,
+    llmConfig,
+    activityId,
+    signal,
+  )
+  const sourceForPrompts = preparedSource.content
 
   // ── Step 1: Analysis ──────────────────────────────────────────
   // LLM reads the source and produces a structured analysis:
   // key entities, concepts, main arguments, connections to existing wiki, contradictions
-  activity.updateItem(activityId, { detail: "Step 1/2: Analyzing source..." })
+  activity.updateItem(activityId, {
+    detail: preparedSource.processingMode === "hierarchical-long-document"
+      ? "Step 1/2: Analyzing long-document synthesis..."
+      : "Step 1/2: Analyzing source...",
+  })
 
   let analysis = ""
-
-  await streamChat(
-    llmConfig,
-    [
-      { role: "system", content: buildAnalysisPrompt(purpose, index, truncatedContent, chunking) },
-      { role: "user", content: `Analyze this source document:\n\n**File:** ${fileName}${folderContext ? `\n**Folder context:** ${folderContext}` : ""}\n\n---\n\n${truncatedContent}` },
-    ],
+  const factLayerHints = buildFactLayerHints(enrichedSourceContent, sourceOrigin)
+  const analysisMessages: Parameters<typeof streamChat>[1] = [
+    { role: "system", content: buildAnalysisPrompt(purpose, index, sourceForPrompts, chunking, schemaGuidance(schema)) },
     {
-      onToken: (token) => { analysis += token },
-      onDone: () => {},
-      onError: (err) => {
-        activity.updateItem(activityId, { status: "error", detail: `Analysis failed: ${err.message}` })
-      },
+      role: "user",
+      content: [
+        "Analyze this source document:",
+        "",
+        `**File:** ${fileName}`,
+        folderContext ? `**Folder context:** ${folderContext}` : "",
+        `**Processing mode:** ${preparedSource.processingMode}`,
+        factLayerHints,
+        "---",
+        "",
+        sourceForPrompts,
+      ].filter(Boolean).join("\n"),
     },
-    signal,
-    { temperature: 0.1 },
-  )
+  ]
 
-  // A silent `return []` here would look like success to the queue
-  // runner and cause the task to be filter()'d out. Throw instead so
-  // processNext's catch-block path (retry / mark failed) engages.
-  const analysisActivity = useActivityStore.getState().items.find((i) => i.id === activityId)
-  if (analysisActivity?.status === "error") {
-    throw new Error(analysisActivity.detail || "Analysis stream failed")
+  try {
+    analysis = await streamTextWithCompileFallback(
+      llmConfig,
+      analysisMessages,
+      signal,
+      { temperature: 0.1 },
+      activityId,
+      "Analysis",
+    )
+  } catch (err) {
+    activity.updateItem(activityId, { status: "error", detail: `Analysis failed: ${errorMessage(err)}` })
+    throw err
   }
 
   // ── Step 2: Generation ────────────────────────────────────────
@@ -609,50 +1270,49 @@ async function autoIngestImpl(
   activity.updateItem(activityId, { detail: "Step 2/2: Generating wiki pages..." })
 
   let generation = ""
-
-  await streamChat(
-    llmConfig,
-    [
-      { role: "system", content: buildGenerationPrompt(schema, purpose, index, fileName, overview, truncatedContent, chunking, _getUploaderUsername()) },
-      {
-        role: "user",
-        content: [
-          `Source document to process: **${fileName}**`,
-          "",
-          "The Stage 1 analysis below is CONTEXT to inform your output. Do NOT echo",
-          "its tables, bullet points, or prose. Your output must be FILE/REVIEW",
-          "blocks as specified in the system prompt — nothing else.",
-          "",
-          "## Stage 1 Analysis (context only — do not repeat)",
-          "",
-          analysis,
-          "",
-          "## Original Source Content",
-          "",
-          truncatedContent,
-          "",
-          "---",
-          "",
-          `Now emit the FILE blocks for the wiki files derived from **${fileName}**.`,
-          "Your response MUST begin with `---FILE:` as the very first characters.",
-          "No preamble. No analysis prose. Start immediately.",
-        ].join("\n"),
-      },
-    ],
+  const generationMessages: Parameters<typeof streamChat>[1] = [
+    { role: "system", content: buildGenerationPrompt(schema, purpose, index, fileName, overview, sourceForPrompts, chunking, _getUploaderUsername(), preparedSource) },
     {
-      onToken: (token) => { generation += token },
-      onDone: () => {},
-      onError: (err) => {
-        activity.updateItem(activityId, { status: "error", detail: `Generation failed: ${err.message}` })
-      },
+      role: "user",
+      content: [
+        `Source document to process: **${fileName}**`,
+        factLayerHints,
+        "",
+        "The Stage 1 analysis below is CONTEXT to inform your output. Do NOT echo",
+        "its tables, bullet points, or prose. Your output must be FILE/REVIEW",
+        "blocks as specified in the system prompt - nothing else.",
+        "",
+        "## Stage 1 Analysis (context only - do not repeat)",
+        "",
+        analysis,
+        "",
+        preparedSource.processingMode === "hierarchical-long-document"
+          ? "## Long-Document Synthesis"
+          : "## Original Source Content",
+        "",
+        sourceForPrompts,
+        "",
+        "---",
+        "",
+        `Now emit the FILE blocks for the wiki files derived from **${fileName}**.`,
+        "Your response MUST begin with `---FILE:` as the very first characters.",
+        "No preamble. No analysis prose. Start immediately.",
+      ].filter(Boolean).join("\n"),
     },
-    signal,
-    { temperature: 0.1 },
-  )
+  ]
 
-  const generationActivity = useActivityStore.getState().items.find((i) => i.id === activityId)
-  if (generationActivity?.status === "error") {
-    throw new Error(generationActivity.detail || "Generation stream failed")
+  try {
+    generation = await streamTextWithCompileFallback(
+      llmConfig,
+      generationMessages,
+      signal,
+      { temperature: 0.1 },
+      activityId,
+      "Generation",
+    )
+  } catch (err) {
+    activity.updateItem(activityId, { status: "error", detail: `Generation failed: ${errorMessage(err)}` })
+    throw err
   }
 
   // ── Step 3: Write files ───────────────────────────────────────
@@ -666,7 +1326,9 @@ async function autoIngestImpl(
   for (const rel of writtenPaths) {
     const base = rel.split("/").pop() ?? ""
     if (!SKIP_STAMP.has(base) && rel.startsWith("wiki/")) {
-      stampCandidate(`${pp}/${rel}`).catch(() => {/* non-critical */})
+      const absPath = `${pp}/${rel}`
+      await stampCandidate(absPath).catch(() => {/* non-critical */})
+      await stampIngestQualityMetadata(absPath, preparedSource).catch(() => {/* non-critical */})
     }
   }
 
@@ -682,9 +1344,6 @@ async function autoIngestImpl(
   }
 
   // Ensure source summary page exists (LLM may not have generated it correctly)
-  const sourceBaseName = fileName.replace(/\.[^.]+$/, "")
-  const sourceSummaryPath = `wiki/sources/${sourceBaseName}.md`
-  const sourceSummaryFullPath = `${pp}/${sourceSummaryPath}`
   const hasSourceSummary = writtenPaths.some((p) => p.startsWith("wiki/sources/"))
 
   // If the signal was aborted (e.g. user switched projects / cancelled),
@@ -695,7 +1354,7 @@ async function autoIngestImpl(
   // task for retry rather than "success".
   if (!hasSourceSummary && !signal?.aborted) {
     const date = new Date().toISOString().slice(0, 10)
-    const fallbackContent = [
+    const fallbackContent = normalizeSchemaFrontmatter([
       "---",
       `type: source`,
       `title: "Source: ${fileName}"`,
@@ -710,13 +1369,22 @@ async function autoIngestImpl(
       "",
       analysis ? analysis.slice(0, 3000) : "(Analysis not available)",
       "",
-    ].join("\n")
+    ].join("\n"), {
+      relativePath: sourceSummaryPath,
+      sourceFileName: fileName,
+      defaultStatus: "candidate",
+      defaultCreatedBy: _getUploaderUsername(),
+    })
     try {
       await writeFile(sourceSummaryFullPath, fallbackContent)
       writtenPaths.push(sourceSummaryPath)
     } catch {
       // non-critical
     }
+  }
+
+  if (!signal?.aborted) {
+    await preserveOcrDetailsInSourcePage(sourceSummaryFullPath, sourceContent, sourceOrigin)
   }
 
   // ── Step 3.5: Append extracted images to the source-summary page ─
@@ -739,7 +1407,14 @@ async function autoIngestImpl(
   }
 
   // ── Step 4: Parse review items ────────────────────────────────
-  const reviewItems = parseReviewBlocks(generation, sp)
+  const deterministicReviewItems = [
+    ...(await buildMissingLinkReviewItems(pp)),
+    ...(await buildServiceManualCoverageReviewItems(pp, sourceContent, writtenPaths, sp)),
+  ]
+  const reviewItems = [
+    ...parseReviewBlocks(generation, sp),
+    ...deterministicReviewItems,
+  ]
   if (reviewItems.length > 0) {
     useReviewStore.getState().addItems(reviewItems)
   }
@@ -876,6 +1551,7 @@ async function autoIngestImpl(
     for (const rel of writtenPaths) {
       const base = rel.split("/").pop() ?? ""
       if (SKIP_GOV.has(base) || !rel.startsWith("wiki/")) continue
+      if (rel.startsWith("wiki/sources/") || rel.includes("/sources/")) continue
       const absPath = `${pp}/${rel}`
       // Read the content once and hand it off; don't await — fire-and-forget
       readFile(absPath).then((content) => {
@@ -941,6 +1617,113 @@ function contentMatchesTargetLanguage(content: string, target: string): boolean 
   return !detectedIsCjk && !["Arabic", "Hindi", "Thai", "Hebrew"].includes(detected)
 }
 
+function frontmatterBody(content: string): string {
+  return content.match(/^---\r?\n([\s\S]*?)\r?\n---/m)?.[1] ?? ""
+}
+
+function frontmatterScalar(content: string, key: string): string {
+  const fm = frontmatterBody(content)
+  const match = fm.match(new RegExp(`^${key}\\s*:\\s*["']?([^"'\\r\\n#]*?)["']?\\s*$`, "m"))
+  return match?.[1]?.trim() ?? ""
+}
+
+function frontmatterListValues(content: string, key: string): string[] {
+  const fm = frontmatterBody(content)
+  const inline = fm.match(new RegExp(`^${key}\\s*:\\s*\\[([^\\]]*)\\]`, "m"))
+  if (inline) {
+    return inline[1]
+      .split(",")
+      .map((item) => item.trim().replace(/^["']|["']$/g, ""))
+      .filter(Boolean)
+  }
+
+  const lines = fm.split(/\r?\n/)
+  const values: string[] = []
+  let active = false
+  for (const line of lines) {
+    if (new RegExp(`^${key}\\s*:\\s*$`).test(line)) {
+      active = true
+      continue
+    }
+    if (active) {
+      const item = line.match(/^\s*-\s+["']?(.+?)["']?\s*$/)
+      if (item) {
+        values.push(item[1].trim())
+        continue
+      }
+      if (/^\S/.test(line)) break
+    }
+  }
+  return values
+}
+
+function sourceNamesFromContent(content: string): string[] {
+  const sourceFiles = frontmatterListValues(content, "source_files")
+  return sourceFiles.length > 0 ? sourceFiles : frontmatterListValues(content, "sources")
+}
+
+function isMetaValidationSourceName(name: string): boolean {
+  const normalized = name.toLowerCase()
+  return normalized === "readme.md" ||
+    normalized.includes("readme") ||
+    normalized.includes("测试题") ||
+    normalized.includes("問答") ||
+    normalized.includes("问答") ||
+    normalized.includes("validation") ||
+    normalized.includes("验证框架") ||
+    normalized.includes("质量评估")
+}
+
+function comesFromMetaValidationSource(content: string): boolean {
+  const sources = sourceNamesFromContent(content)
+  return sources.length > 0 && sources.every(isMetaValidationSourceName)
+}
+
+function isBusinessKnowledgeDomain(content: string): boolean {
+  const domain = (frontmatterScalar(content, "knowledge_domain") || frontmatterScalar(content, "domain")).toLowerCase()
+  return ["product", "customer", "method", "content", "activity", "cases", "compliance"].includes(domain)
+}
+
+function isPlaceholderLikeContent(content: string): boolean {
+  const head = content.slice(0, 2500)
+  return /占位页|占位页面|知识缺口|尚未处理|待处理|尚无对应页面|未被处理|需要补充/.test(head)
+}
+
+function isSourceTypedEntityOrConcept(content: string): boolean {
+  return frontmatterScalar(content, "entity_type").toLowerCase() === "source" ||
+    frontmatterScalar(content, "type").toLowerCase() === "source"
+}
+
+export function shouldSkipUnsafeKnowledgeWrite(
+  relativePath: string,
+  incoming: string,
+  existing: string,
+): string | null {
+  const isEntity = relativePath.startsWith("wiki/entities/") || relativePath.includes("/entities/")
+  const isConcept = relativePath.startsWith("wiki/concepts/") || relativePath.includes("/concepts/")
+  if (!isEntity && !isConcept) return null
+
+  const fromMetaSource = comesFromMetaValidationSource(incoming)
+  const businessDomain = isBusinessKnowledgeDomain(incoming)
+
+  if (fromMetaSource && (isEntity || businessDomain)) {
+    return "meta validation source attempted to write business knowledge"
+  }
+
+  if (isEntity && isSourceTypedEntityOrConcept(incoming)) {
+    return "entity page attempted to use source entity_type"
+  }
+
+  if (!existing) return null
+
+  const existingIsBusiness = isBusinessKnowledgeDomain(existing) && !isSourceTypedEntityOrConcept(existing)
+  if (existingIsBusiness && isPlaceholderLikeContent(incoming)) {
+    return "placeholder content attempted to overwrite existing business page"
+  }
+
+  return null
+}
+
 async function writeFileBlocks(
   projectPath: string,
   text: string,
@@ -972,7 +1755,13 @@ async function writeFileBlocks(
       projectPath,
     )
     const relativePath = normalised.path
-    const content = normalised.content
+    const content = shouldNormalizeKnowledgePage(relativePath)
+      ? cleanupKnowledgeFrontmatter(normalizeSchemaFrontmatter(normalised.content, {
+          relativePath,
+          defaultStatus: "candidate",
+          defaultCreatedBy: _getUploaderUsername(),
+        }))
+      : normalised.content
     if (normalised.merged) {
       warnings.push(
         `Entity "${normalised.originalPath}" merged into canonical "${normalised.canonicalName}" (alias injected)`,
@@ -1008,8 +1797,16 @@ async function writeFileBlocks(
 
     const fullPath = `${projectPath}/${relativePath}`
     try {
+      const existing = await tryReadFile(fullPath)
+      const skipReason = shouldSkipUnsafeKnowledgeWrite(relativePath, content, existing)
+      if (skipReason) {
+        const msg = `Skipped "${relativePath}" because ${skipReason}.`
+        console.warn(`[ingest] ${msg}`)
+        warnings.push(msg)
+        continue
+      }
+
       if (relativePath === "wiki/log.md" || relativePath.endsWith("/log.md")) {
-        const existing = await tryReadFile(fullPath)
         const appended = existing ? `${existing}\n\n${content.trim()}` : content.trim()
         await writeFile(fullPath, appended)
       } else if (
@@ -1036,7 +1833,6 @@ async function writeFileBlocks(
         // See src/lib/sources-merge.ts for the merge semantics
         // (case-insensitive dedup, preserves existing order).
         const { mergeSourcesIntoContent } = await import("./sources-merge")
-        const existing = await tryReadFile(fullPath)
         const toWrite = mergeSourcesIntoContent(content, existing)
         await writeFile(fullPath, toWrite)
       }
@@ -1050,6 +1846,35 @@ async function writeFileBlocks(
   }
 
   return { writtenPaths, warnings, hardFailures }
+}
+
+function yamlScalar(value: string | number): string {
+  if (typeof value === "number") return String(value)
+  return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`
+}
+
+function upsertFrontmatterField(content: string, key: string, value: string | number): string {
+  const line = `${key}: ${yamlScalar(value)}`
+  if (!content.match(/^---\r?\n[\s\S]*?\r?\n---/m)) {
+    return `---\n${line}\n---\n\n${content}`
+  }
+  const re = new RegExp(`^${key}:.*$`, "m")
+  if (re.test(content)) return content.replace(re, line)
+  return content.replace(/^(---\r?\n)/, `$1${line}\n`)
+}
+
+async function stampIngestQualityMetadata(pagePath: string, preparedSource: PreparedIngestSource): Promise<void> {
+  try {
+    let content = await readFile(pagePath)
+    content = upsertFrontmatterField(content, "ingest_processing_mode", preparedSource.processingMode)
+    content = upsertFrontmatterField(content, "ingest_source_chars", preparedSource.originalChars)
+    content = upsertFrontmatterField(content, "ingest_context_chars", preparedSource.contextChars)
+    content = upsertFrontmatterField(content, "ingest_chunk_count", preparedSource.chunkCount)
+    content = upsertFrontmatterField(content, "ingest_quality_confidence", preparedSource.qualityConfidence)
+    await writeFile(pagePath, content)
+  } catch (err) {
+    console.warn("[ingest] Failed to stamp quality metadata:", pagePath, err)
+  }
 }
 
 const REVIEW_BLOCK_REGEX = /---REVIEW:\s*(\w[\w-]*)\s*\|\s*(.+?)\s*---\n([\s\S]*?)---END REVIEW---/g
@@ -1117,11 +1942,155 @@ function parseReviewBlocks(
   return items
 }
 
+async function buildMissingLinkReviewItems(
+  projectPath: string,
+): Promise<Omit<ReviewItem, "id" | "resolved" | "createdAt">[]> {
+  try {
+    const wikiRoot = `${projectPath}/wiki`
+    const files = flattenMarkdownNodes(await listDirectory(wikiRoot))
+    const knownTitles = new Set<string>()
+    const pageTexts: { relativePath: string; content: string }[] = []
+
+    for (const file of files) {
+      const relativePath = file.path.replace(projectPath.replace(/\\/g, "/") + "/", "").replace(/\\/g, "/")
+      const content = await readFile(file.path)
+      pageTexts.push({ relativePath, content })
+      const fileTitle = file.name.replace(/\.md$/i, "")
+      knownTitles.add(fileTitle)
+      const title = content.match(/^---\r?\n[\s\S]*?\r?\n---/m)?.[0].match(/^title:\s*["']?(.+?)["']?\s*$/m)?.[1]?.trim()
+      if (title) knownTitles.add(title)
+    }
+
+    const missing = new Map<string, Set<string>>()
+    for (const page of pageTexts) {
+      const matches = page.content.matchAll(/\[\[([^\]|#]+)(?:[#|][^\]]*)?]]/g)
+      for (const match of matches) {
+        const target = match[1].trim()
+        if (!target || target.startsWith("wiki/") || knownTitles.has(target)) continue
+        if (!missing.has(target)) missing.set(target, new Set())
+        missing.get(target)!.add(page.relativePath)
+      }
+    }
+
+    return Array.from(missing.entries()).map(([target, pages]) => ({
+      type: "missing-page" as const,
+      title: `缺失页面：${target}`,
+      description: `页面中引用了 [[${target}]]，但当前 wiki 尚未生成对应知识页。请确认是创建新页面、改为已有页面别名，还是删除该链接。`,
+      affectedPages: Array.from(pages),
+      searchQueries: [`${target} 保险 知识`, `${target} 销售 方法`, `${target} 合规 要点`],
+      options: [
+        { label: "Create Page", action: "Create Page" },
+        { label: "Skip", action: "Skip" },
+      ],
+    }))
+  } catch (err) {
+    console.warn("[ingest] Missing-link review scan failed:", err)
+    return []
+  }
+}
+
+function normalizeCoverageTitle(value: string): string {
+  return value
+    .replace(/\.md$/i, "")
+    .replace(/["'“”‘’《》【】\[\]（）()_\-\s]/g, "")
+    .toLowerCase()
+}
+
+async function collectWikiPageTitles(projectPath: string): Promise<Set<string>> {
+  const wikiRoot = `${projectPath}/wiki`
+  const files = flattenMarkdownNodes(await listDirectory(wikiRoot))
+  const titles = new Set<string>()
+
+  for (const file of files) {
+    const baseName = file.name.replace(/\.md$/i, "")
+    titles.add(normalizeCoverageTitle(baseName))
+    try {
+      const content = await readFile(file.path)
+      const titleMatch = content.match(/^title:\s*["']?(.+?)["']?\s*$/m)
+      if (titleMatch) titles.add(normalizeCoverageTitle(titleMatch[1]))
+    } catch {
+      // Ignore unreadable files; coverage review is best-effort.
+    }
+  }
+
+  return titles
+}
+
+async function buildServiceManualCoverageReviewItems(
+  projectPath: string,
+  sourceContent: string,
+  writtenPaths: string[],
+  sourcePath: string,
+): Promise<Omit<ReviewItem, "id" | "resolved" | "createdAt">[]> {
+  const detected = detectedServiceManualNodes(sourceContent)
+  if (detected.length < 6) return []
+
+  try {
+    const knownTitles = await collectWikiPageTitles(projectPath)
+    const missing = detected.filter((node) => {
+      const expected = normalizeCoverageTitle(node.title)
+      for (const title of knownTitles) {
+        if (title === expected) return false
+      }
+      return true
+    })
+
+    if (missing.length < Math.max(3, Math.ceil(detected.length * 0.35))) return []
+
+    const missingServices = missing.filter((node) => node.kind === "service_benefit")
+    const missingRules = missing.filter((node) => node.kind !== "service_benefit")
+    const sourceBaseName = getFileName(sourcePath).replace(/\.[^.]+$/, "")
+    const affectedPages = [
+      `wiki/sources/${sourceBaseName}.md`,
+      ...writtenPaths.filter((path) => path.startsWith("wiki/entities/") || path.startsWith("wiki/concepts/")).slice(0, 8),
+    ]
+
+    return [{
+      type: "missing-page",
+      title: `抽取覆盖不足：服务手册缺少 ${missing.length} 个服务/规则节点`,
+      description: [
+        "系统在源文档中识别到多个独立服务权益、流程规则或合规免责条款，但本次编译没有生成对应的独立知识页。",
+        "",
+        missingServices.length > 0 ? `缺少服务权益页：${missingServices.map((node) => node.title).join("、")}` : "",
+        missingRules.length > 0 ? `缺少流程/规则/合规页：${missingRules.map((node) => node.title).join("、")}` : "",
+        "",
+        "建议重新编译或手工补页。服务手册不应只生成主服务计划页；每个可复用服务项目至少应有 service_benefit 页面，激活/中止/终止/等待期/免责应有 process/rule/compliance_rule 页面。",
+      ].filter(Boolean).join("\n"),
+      sourcePath,
+      affectedPages,
+      searchQueries: [
+        "保险 服务手册 服务权益 结构化抽取",
+        "健康服务权益 服务流程 等待期 非共享规则",
+        "保险销售 服务权益 合规免责 知识图谱",
+      ],
+      options: [
+        { label: "Create Page", action: "Create Page" },
+        { label: "Skip", action: "Skip" },
+      ],
+    }]
+  } catch (err) {
+    console.warn("[ingest] Service-manual coverage review failed:", err)
+    return []
+  }
+}
+
+function flattenMarkdownNodes(nodes: { name: string; path: string; is_dir: boolean; children?: { name: string; path: string; is_dir: boolean; children?: any[] }[] }[]): { name: string; path: string }[] {
+  const files: { name: string; path: string }[] = []
+  for (const node of nodes) {
+    if (node.is_dir) {
+      files.push(...flattenMarkdownNodes(node.children ?? []))
+    } else if (node.name.endsWith(".md")) {
+      files.push({ name: node.name, path: node.path })
+    }
+  }
+  return files
+}
+
 /**
  * Step 1 prompt: AI reads the source and produces a structured analysis.
  * This is the "discussion" step — the AI reasons about the source before writing wiki pages.
  */
-export function buildAnalysisPrompt(purpose: string, index: string, sourceContent: string = "", chunking?: ChunkingConfig): string {
+export function buildAnalysisPrompt(purpose: string, index: string, sourceContent: string = "", chunking?: ChunkingConfig, schema: string = ""): string {
   return [
     "You are an expert research analyst. Read the source document and produce a structured analysis.",
     "",
@@ -1129,7 +2098,15 @@ export function buildAnalysisPrompt(purpose: string, index: string, sourceConten
     "",
     buildChunkingDirective(chunking),
     "",
+    buildInsuranceExtractionChecklist(sourceContent),
+    "",
+    buildServiceManualNodeDirective(sourceContent),
+    "",
     "Your analysis should cover:",
+    "",
+    "## Source Fact Inventory",
+    "Before summarizing, enumerate source facts at the finest useful business granularity. Include rules, rows, thresholds, service items, eligibility conditions, exceptions, time limits, counts, product codes, channels, and remarks.",
+    "For OCR/table/list documents, count the apparent rows/items and identify the columns. If there are many rows, group them only after preserving the row-level inventory for the source page.",
     "",
     "## Key Entities",
     "List people, organizations, products, datasets, tools mentioned. For each:",
@@ -1161,11 +2138,29 @@ export function buildAnalysisPrompt(purpose: string, index: string, sourceConten
     "- What should be emphasized vs. de-emphasized?",
     "- Any open questions worth flagging for the user?",
     "",
+    "## Insurance Schema Classification",
+    "If the source is about insurance sales knowledge, classify each important item with `industry / knowledge_domain / entity_type / schema_key`.",
+    "Separate universal fields, `attributes`, `relations`, `claims`, and missing fields. For Product, Customer, and Method sources, explicitly identify which Registry fields can be filled and which should become knowledge_gaps.",
+    "Do this classification for every reusable business fact, not just for the top-level document title.",
+    "",
+    "## Coverage Audit",
+    "- Which source facts will become entity pages?",
+    "- Which source facts will become attributes or claims only?",
+    "- Which source facts must remain on the source page as row-level inventory?",
+    "- Which schema fields are missing from the source and must be shown as knowledge gaps?",
+    "- What important facts would be lost if the output only created 1-3 summary pages?",
+    "",
+    "## OCR / Long Table Handling",
+    "If the source is OCR text from an image or scanned PDF, first judge whether it is a table/list/eligibility sheet.",
+    "For long tables, preserve row-level facts: row count, column meanings, product names/codes, yes/no flags, 1/1*/N markers, channels, dates, and remarks. Do not summarize a 100+ row table as a few examples.",
+    "Recommend a source summary page plus only the most important entity pages; row-level details should remain available on the source page for exact retrieval.",
+    "",
     "Be thorough but concise. Focus on what's genuinely important.",
     "",
     "If a folder context is provided, use it as a hint for categorization — the folder structure often reflects the user's organizational intent (e.g., 'papers/energy' suggests the file is an energy-related paper).",
     "",
     purpose ? `## Wiki Purpose (for context)\n${purpose}` : "",
+    schema ? `## Knowledge Schema\n${schema}` : "",
     index ? `## Current Wiki Index (for checking existing content)\n${index}` : "",
   ].filter(Boolean).join("\n")
 }
@@ -1196,7 +2191,7 @@ function buildChunkingDirective(cfg?: ChunkingConfig): string {
 /**
  * Step 2 prompt: AI takes its own analysis and generates wiki files + review items.
  */
-export function buildGenerationPrompt(schema: string, purpose: string, index: string, sourceFileName: string, overview?: string, sourceContent: string = "", chunking?: ChunkingConfig, uploaderUsername = "unknown"): string {
+export function buildGenerationPrompt(schema: string, purpose: string, index: string, sourceFileName: string, overview?: string, sourceContent: string = "", chunking?: ChunkingConfig, uploaderUsername = "unknown", preparedSource?: PreparedIngestSource): string {
   // Use original filename (without extension) as the source summary page name
   const sourceBaseName = sourceFileName.replace(/\.[^.]+$/, "")
 
@@ -1206,6 +2201,10 @@ export function buildGenerationPrompt(schema: string, purpose: string, index: st
     languageRule(sourceContent),
     "",
     buildChunkingDirective(chunking),
+    "",
+    buildInsuranceExtractionChecklist(sourceContent),
+    "",
+    buildServiceManualNodeDirective(sourceContent),
     "",
     `## IMPORTANT: Source File`,
     `The original source file is: **${sourceFileName}**`,
@@ -1220,29 +2219,103 @@ export function buildGenerationPrompt(schema: string, purpose: string, index: st
     "5. A log entry for wiki/log.md (just the new entry to append, format: ## [YYYY-MM-DD] ingest | Title)",
     "6. An updated wiki/overview.md — a high-level summary of what the entire wiki covers, updated to reflect the newly ingested source. This should be a comprehensive 2-5 paragraph overview of ALL topics in the wiki, not just the new source.",
     "",
+    "## Page Naming Requirements",
+    "",
+    "Use these naming rules for generated page titles and filenames:",
+    "- Service project pages: [服务名称]_[产品简称]. Example: 绿通住院_安有医尊享版",
+    "- General concepts: use the concept name directly. Example: 家庭医生服务流程",
+    "- Version comparison pages: [服务名称]_版本对比. Example: 专家会诊_版本对比",
+    "",
+    "The frontmatter `title` should use the exact human-readable page name above.",
+    "For Chinese titles, use the Chinese title directly as the filename under the correct wiki directory. Example: wiki/entities/安心家庭守护重疾险.md",
+    "Use ASCII kebab-case filenames only when the title is English/code-like or contains filesystem-unsafe characters.",
+    "",
     "## Frontmatter Rules (CRITICAL)",
     "",
     "Every page MUST have YAML frontmatter with these fields:",
     "```yaml",
     "---",
-    "type: source | entity | concept | comparison | query | synthesis",
+    "schema_version: \"2.1\"",
+    "industry: insurance",
+    "knowledge_domain: product | customer | method | content | activity | cases | compliance | general",
+    "domain: same value as knowledge_domain",
+    "taxonomy_path: []",
+    "type: concept | entity | event | process | rule | data | comparison | timeline | case | source",
+    "entity_type: product | regulatory_doc | product_clause | service_benefit | product_combo | selling_point | persona | life_stage | customer_signal | customer_relationship | selling_scenario | pitch | objection_handling | sales_path | sales_playbook | referral_method | needs_discovery | asset | asset_collection | content_template | presentation_kit | campaign | incentive | success_case | failure_case | customer_voice | referral_case | agent_feedback | competitive_insight | compliance_rule | source | general",
+    "business_phase: lead_generation | first_touch | appointment | conversion | signing | service | referral | general",
+    "dedup_key: stable-slug-or-business-key",
     "title: Human-readable title",
+    "summary: 200字以内摘要",
     "created: YYYY-MM-DD",
     "updated: YYYY-MM-DD",
     "tags: []",
+    "keywords: []",
     "related: []",
+    "relations: []",
+    "parent: \"\"",
+    "children: []",
+    `source_files: ["${sourceFileName}"]  # MUST contain the original source filename`,
+    "source_chunks: []",
     `sources: ["${sourceFileName}"]  # MUST contain the original source filename`,
+    "confidence: 0.0-1.0",
+    "status: candidate",
+    "needs_review: true | false",
+    "attributes: {}  # one-line JSON object following the Insurance Schema Registry for this entity_type",
+    "claims: []  # compact evidence strings, e.g. \"等待期为90天 | raw: 等待期：90天 | source: file.md | confidence: 0.95\"",
     `ingested_at: "${new Date().toISOString()}"  # timestamp of this ingestion`,
     `ingested_by: "file-upload"  # provenance: file-upload | deep-research | manual | chat`,
     `ingested_by_user: "${uploaderUsername}"  # who uploaded this`,
+    preparedSource ? `ingest_processing_mode: "${preparedSource.processingMode}"` : "",
+    preparedSource ? `ingest_source_chars: ${preparedSource.originalChars}` : "",
+    preparedSource ? `ingest_context_chars: ${preparedSource.contextChars}` : "",
+    preparedSource ? `ingest_chunk_count: ${preparedSource.chunkCount}` : "",
+    preparedSource ? `ingest_quality_confidence: "${preparedSource.qualityConfidence}"` : "",
     "---",
     "```",
     "",
     `The \`sources\` field MUST always contain "${sourceFileName}" — this links the wiki page back to the original uploaded document.`,
     "",
     "Other rules:",
+    "- Completeness is more important than brevity for this insurance demo. The frontend page should let a business reviewer compare extracted knowledge against the original source without feeling that key information disappeared.",
+    "- First generate a detailed source page, then generate concise entity pages. Do not sacrifice the source page's fact inventory to keep entity pages short.",
     "- Use [[wikilink]] syntax for cross-references between pages",
-    "- Use kebab-case filenames",
+    "- Prefer human-readable Chinese wikilinks that match generated page titles, e.g. [[安心家庭守护重疾险]] and [[家庭经济支柱]]. Do not turn Chinese titles into pinyin slugs for links.",
+    "- Also emit compact relation lines such as `recommended_for: target_key`, `applies_to: target_key`, `supports: target_key`, `has_part: target_key`, `complements: target_key`, `bundled_with: target_key`, `uses_asset: target_key`, and `governed_by: target_key`.",
+    "- Relation rule: `recommended_for` only points to customer personas, life stages, or customer signals. Product-to-product pairing must use `complements` or `bundled_with`. Product/service composition must use `has_part`.",
+    "- Customer pages must link back to suitable Product pages with `has_recommendation`, not `recommended_for`.",
+    "- Use the Insurance Schema Registry to choose a schema_key, then fill `attributes` with the entity-specific extension fields. Put unavailable fields as null or [] and mention important missing fields in `attributes.knowledge_gaps`.",
+    "- Keep universal governance status in `status` (candidate/active/superseded/rejected). Put business status such as 在售/已停售 in `attributes.product_status`, never in universal `status`.",
+    "- Do not let LLM invent auto_derived metrics such as usage_count, conversion_rate, sales_volume_trend, feedback_score, or average_premium_per_policy. Use null unless supplied by a business system.",
+    "- For uploaded documents, keep `status: candidate` by default. Do not mark generated knowledge as active unless the source explicitly says it has been human-approved.",
+    "- For Product pages, extract Product positioning, basic rules, core responsibilities, exclusions, service benefits, suitable customers, sales associations, and compliance limits into `attributes` when present.",
+    "- For Persona pages, extract demographic, psychology, behavior, pain points, objections, matching products, and purchase signals into `attributes`. A persona with no behavior signal should set needs_review: true.",
+    "- For Method pages, extract scenario, pitch, objection handling, sales path, business phase, applicable persona/product, scripts, constraints, and risk flags into `attributes`.",
+    "- For official/regulatory documents, use entity_type `regulatory_doc` under wiki/sources/ when it is the original truth source. Do not rewrite official clauses; cite them through claims.",
+    "- For the first demo, connect Product pages to Customer pages and Method pages whenever the source implies a sales use case.",
+    "- Create REVIEW missing-page items for obvious gaps, such as a product benefit without a matching customer persona, a customer objection without an objection handling method, or a method claim without supporting product evidence.",
+    "- Never use `entity_type: source` for pages under wiki/entities/ or wiki/concepts/. Source files must live under wiki/sources/.",
+    "- If the current source is README, validation framework material, a test-question file, or a quality checklist, do not create or overwrite Product/Customer/Method business entities. Keep it as source/query/general evaluation knowledge only.",
+    "- Do not create placeholder entity pages for other uploaded files. If a referenced source has not been processed, create a REVIEW missing-page item instead of a wiki/entities or wiki/concepts placeholder.",
+    "- Do not transliterate Chinese page titles into pinyin filenames.",
+    "- Demo readability rule: frontmatter is for machines only; the Markdown body is for business users. Do not put important content only in `attributes` or `claims`.",
+    "- Every Product/Customer/Method business page body should be a polished Chinese knowledge card with useful visible text: a short opening summary, structured sections, bullet lists or compact tables, applicable scenarios, cross-domain links, evidence/source notes, and knowledge gaps when relevant.",
+    "- If the source has enough information, write at least 5 visible sections in the body. Keep the prose factual and do not invent missing values; show unavailable values under a visible `待补全信息` section.",
+    "- Source page body requirements: include `原文事实清单`, `结构化抽取结果`, `覆盖审计`, `关联关系`, and `待补全信息` whenever the source has business knowledge.",
+    "- OCR/table source rule: if the source is an OCR table, eligibility list, product access list, catalogue, or spreadsheet-like document, the source summary page MUST visibly include a row-level section named `原始清单明细` or `原始OCR明细`; do not only list sample rows.",
+    "- For table/list documents, put row-count and column semantics into `attributes`, preserve all product names/codes and yes/no/1/1*/N flags on the source page body, and create only selected entity pages for meaningful products/services/rules instead of fabricating hundreds of shallow pages.",
+    "- For product access lists or service eligibility lists within a few hundred rows, the source page must include every identifiable row/item in a compact Markdown table or numbered list. If token budget prevents full table rendering, include a clear `未完全展开的清单范围` section and a REVIEW item; never silently omit rows.",
+    "- For service manuals, do not collapse multiple services into one generic paragraph. Extract independent service benefits, process steps, usage limits, exclusions, materials, time limits, and compliance disclaimers as separate visible bullets or tables.",
+    "- Service manual minimum node rule: if the source contains identifiable service items, generate dedicated pages for the service items and rules named in `Service Manual Node Extraction Requirements`. A service manual output with only the main service-plan page is incomplete.",
+    "- Service benefit pages should use `wiki/entities/[服务项目名].md`, `entity_type: service_benefit`, `knowledge_domain: product`, `business_phase: service`, and should link back to the main service plan.",
+    "- Service process pages should use `type: process`; service limitation/waiting-period/non-sharing pages should use `type: rule`; disclaimer pages should use `knowledge_domain: compliance` and `entity_type: compliance_rule`.",
+    "- For product terms, do not collapse responsibilities/exclusions/rules into a single summary. Extract age range, waiting period, payment period, coverage period, claim trigger, responsibility amounts, exclusions, underwriting basics, service packages, and official caveats separately.",
+    "- For sales/customer/method content, extract target personas, lifecycle triggers, customer signals, scenario, business phase, pitch, objection handling, content assets, and compliance-sensitive wording separately.",
+    "- Every entity page should include an `证据摘录` or `来源依据` section with 3-8 concrete source-backed facts when available. Do not rely only on frontmatter claims.",
+    "- If a field is absent in the source, do not invent it. Put it under visible `待补全信息` and in `attributes.knowledge_gaps`.",
+    "- Add REVIEW missing-page items when the source implies a reusable Product/Customer/Method/Compliance concept but there is not enough evidence to create a full page.",
+    "- For Product pages, visible body sections should include 产品定位、基础规则、核心保障/权益、适配客户、销售方法关联、合规提醒、待补全信息 when available.",
+    "- For Persona pages, visible body sections should include 画像定义、识别信号、核心痛点、适配产品/场景、典型异议、销售切入建议、待补全信息 when available.",
+    "- For Method pages, visible body sections should include 使用场景、适用客户、核心逻辑、推荐话术/步骤、注意事项、关联产品/证据、待补全信息 when available.",
     "- Follow the analysis recommendations on what to emphasize",
     "- If the analysis found connections to existing pages, add cross-references",
     "",
@@ -1272,7 +2345,7 @@ export function buildGenerationPrompt(schema: string, purpose: string, index: st
     "  SEARCH: automated technical debt detection AI generated code | software quality metrics LLM code generation | static analysis tools agentic software development",
     "",
     purpose ? `## Wiki Purpose\n${purpose}` : "",
-    schema ? `## Wiki Schema\n${schema}` : "",
+    `## Wiki Schema\n${schemaGuidance(schema)}`,
     index ? `## Current Wiki Index (preserve all existing entries, add new ones)\n${index}` : "",
     overview ? `## Current Overview (update this to reflect the new source)\n${overview}` : "",
     "",
@@ -1374,7 +2447,12 @@ async function injectImagesIntoSourceSummary(
         new RegExp(`\\n*${marker}[\\s\\S]*?${marker}\\n*`, "g"),
         "",
       )
-      await writeFile(sourceSummaryFullPath, stripped.trimEnd() + wrapped)
+      await writeFile(sourceSummaryFullPath, normalizeSchemaFrontmatter(stripped.trimEnd() + wrapped, {
+        relativePath: sourceSummaryPath,
+        sourceFileName: fileName,
+        defaultStatus: "candidate",
+        defaultCreatedBy: _getUploaderUsername(),
+      }))
     } else {
       // Page is missing — write a minimal stub so the user actually
       // sees the images in the file tree. Without this fallback, the
@@ -1383,7 +2461,7 @@ async function injectImagesIntoSourceSummary(
       // reaps the media directory (cascadeDeleteWikiPage triggered by
       // a missing source page) — silent loss of extracted images.
       const date = new Date().toISOString().slice(0, 10)
-      const stubFrontmatter = [
+      const stubFrontmatter = normalizeSchemaFrontmatter([
         "---",
         "type: source",
         `title: "Source: ${fileName}"`,
@@ -1396,7 +2474,12 @@ async function injectImagesIntoSourceSummary(
         "",
         `# Source: ${fileName}`,
         "",
-      ].join("\n")
+      ].join("\n"), {
+        relativePath: sourceSummaryPath,
+        sourceFileName: fileName,
+        defaultStatus: "candidate",
+        defaultCreatedBy: _getUploaderUsername(),
+      })
       await writeFile(sourceSummaryFullPath, stubFrontmatter + wrapped)
     }
     console.log(
@@ -1491,7 +2574,7 @@ export async function startIngest(
     languageRule(sourceContent),
     "",
     purpose ? `## Wiki Purpose\n${purpose}` : "",
-    schema ? `## Wiki Schema\n${schema}` : "",
+    `## Wiki Schema\n${schemaGuidance(schema)}`,
     index ? `## Current Wiki Index\n${index}` : "",
   ]
     .filter(Boolean)
@@ -1623,7 +2706,14 @@ export async function executeIngestWrites(
 
   for (const match of matches) {
     const relativePath = match[1].trim()
-    const content = match[2]
+    const rawContent = match[2]
+    const content = shouldNormalizeKnowledgePage(relativePath)
+      ? normalizeSchemaFrontmatter(rawContent, {
+          relativePath,
+          defaultStatus: "candidate",
+          defaultCreatedBy: _getUploaderUsername(),
+        })
+      : rawContent
 
     if (!relativePath) continue
 

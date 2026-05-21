@@ -55,6 +55,24 @@ function extractTitleAndExcerpt(content: string): { title: string; excerpt: stri
   return { title: title || "Untitled", excerpt }
 }
 
+function isSourcePagePath(path: string): boolean {
+  const normalized = path.replace(/\\/g, "/")
+  return normalized.includes("/wiki/sources/") ||
+    normalized.startsWith("wiki/sources/") ||
+    normalized.startsWith("sources/")
+}
+
+function frontmatterScalar(content: string, key: string): string {
+  const fm = content.match(/^---\r?\n([\s\S]*?)\r?\n---/m)?.[1] ?? ""
+  const match = fm.match(new RegExp(`^${key}\\s*:\\s*["']?([^"'\\r\\n#]*?)["']?\\s*$`, "m"))
+  return match?.[1]?.trim().toLowerCase() ?? ""
+}
+
+function isSourceTypedContent(content: string): boolean {
+  return frontmatterScalar(content, "type") === "source" ||
+    frontmatterScalar(content, "entity_type") === "source"
+}
+
 // ── Vector-based detection ───────────────────────────────────────────────────
 
 /**
@@ -79,6 +97,8 @@ export async function findSimilarByVector(
     const { searchByEmbedding } = await import("@/lib/embedding")
     const { normalizePath } = await import("@/lib/path-utils")
     const pp = normalizePath(projectPath)
+    const newIsSource = isSourcePagePath(newPageId) || isSourceTypedContent(newContent)
+    if (newIsSource) return []
 
     // Use the page's title + first 500 chars as the search query
     const { title, excerpt } = extractTitleAndExcerpt(newContent)
@@ -93,7 +113,7 @@ export async function findSimilarByVector(
       if (r.score < VECTOR_MIN_SIMILARITY) continue
 
       // Resolve to absolute path — try common wiki subdirs
-      const dirs = ["concepts", "entities", "queries", "sources"]
+      const dirs = ["concepts", "entities", "queries"]
       let pagePath = ""
       for (const dir of dirs) {
         const candidate = `${pp}/wiki/${dir}/${r.id}.md`
@@ -213,6 +233,7 @@ export async function findSimilarByTitle(
     const { listDirectory } = await import("@/commands/fs")
     const { normalizePath } = await import("@/lib/path-utils")
     const pp = normalizePath(projectPath)
+    if (isSourcePagePath(newPagePath)) return []
 
     // Flatten all .md files under wiki/
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -238,9 +259,11 @@ export async function findSimilarByTitle(
       const base = filePath.split(/[/\\]/).pop() ?? ""
       if (SKIP.has(base)) continue
       if (filePath === newPagePath) continue
+      if (isSourcePagePath(filePath)) continue
 
       try {
         const content = await readFile(filePath)
+        if (isSourceTypedContent(content)) continue
         const { title, excerpt } = extractTitleAndExcerpt(content)
         const titleNorm = title.toLowerCase().replace(/\s+/g, "")
 
@@ -300,6 +323,8 @@ export async function detectConflicts(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   embCfg: any,
 ): Promise<ConflictCandidate[]> {
+  if (isSourcePagePath(newPagePath) || isSourceTypedContent(newContent)) return []
+
   const embEnabled = embCfg?.enabled && embCfg?.model
 
   if (embEnabled) {

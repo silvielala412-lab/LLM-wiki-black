@@ -27,6 +27,12 @@ function generateId(): string {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
 }
 
+function lineageRelationForNotify(relation?: string): "updates" | null {
+  // Only an actual update should be recorded in the evolution timeline.
+  // same/complement/unrelated are review signals, not version-chain edges.
+  return relation === "update" ? "updates" : null
+}
+
 // ── Page ID from absolute path ────────────────────────────────────────────────
 function pageIdFromPath(pagePath: string, projectPath: string): string {
   const rel = pagePath.replace(projectPath, "").replace(/\\/g, "/").replace(/^\/+/, "")
@@ -85,6 +91,7 @@ export async function runGovernancePipeline(
 
   if (candidates.length === 0) {
     console.log(`[governance] No conflicts found for ${newPageId}`)
+    await setPageStatus(newPagePath, "candidate").catch(() => {})
     // Debug: show that we ran but found nothing
     await notifyUser(`[治理] ${newPageId.split("/").pop()} — 无相似页面，跳过`)
     return
@@ -143,44 +150,39 @@ export async function runGovernancePipeline(
 
   // ── Step 4: Act on decision ───────────────────────────────────────────────
   if (decision === "auto_accept") {
-    // Automatically confirm the new page as active
-    await setPageStatus(newPagePath, "active").catch(() => {})
-
-    // Record in lineage as AI auto-accepted (for auditability)
-    try {
-      const { recordTransition } = await import("./lineage-tracker")
-      await recordTransition(
-        projectPath, topCandidate.pagePath, topCandidate.title,
-        newPagePath, newTitle,
-        judgement ? { addedPoints: [], removedPoints: [], changedPoints: [], summary: judgement.reason ?? description } : null,
-        "supersedes", "auto_accept",
-      )
-    } catch { /* non-critical */ }
+    // Uploaded/generated pages remain candidate until explicit human approval.
+    await setPageStatus(newPagePath, "candidate").catch(() => {})
+    // auto_accept is currently used for high-confidence unrelated matches.
+    // Do not write a version-chain edge for unrelated pages.
     return
   }
 
   if (decision === "notify") {
-    // Notify the user but also record in lineage as AI-detected
+    // Notify without auto-promoting generated knowledge to active.
+    await setPageStatus(newPagePath, "candidate").catch(() => {})
     await notifyUser(description)
 
-    try {
-      const { recordTransition } = await import("./lineage-tracker")
-      // Generate diff for the lineage record
-      const { generateSemanticDiff } = await import("./diff-engine")
-      const { readFile } = await import("@/commands/fs")
-      const [oldContent, _newContent] = await Promise.all([
-        readFile(topCandidate.pagePath).catch(() => ""),
-        Promise.resolve(newContent),
-      ])
-      const diffResult = await generateSemanticDiff(llmConfig, topCandidate.title, oldContent, newTitle, newContent).catch(() => null)
+    const lineageRelation = lineageRelationForNotify(judgement?.relation)
+    if (lineageRelation) {
+      try {
+        const { recordTransition } = await import("./lineage-tracker")
+        // Generate diff for the lineage record
+        const { generateSemanticDiff } = await import("./diff-engine")
+        const { readFile } = await import("@/commands/fs")
+        const [oldContent, _newContent] = await Promise.all([
+          readFile(topCandidate.pagePath).catch(() => ""),
+          Promise.resolve(newContent),
+        ])
+        const diffResult = await generateSemanticDiff(llmConfig, topCandidate.title, oldContent, newTitle, newContent).catch(() => null)
 
-      await recordTransition(
-        projectPath, topCandidate.pagePath, topCandidate.title,
-        newPagePath, newTitle,
-        diffResult ?? { addedPoints: [], removedPoints: [], changedPoints: [], summary: description },
-        "updates", "auto_notify",
-      )
-    } catch { /* non-critical */ }
+        await recordTransition(
+          projectPath, topCandidate.pagePath, topCandidate.title,
+          newPagePath, newTitle,
+          diffResult ?? { addedPoints: [], removedPoints: [], changedPoints: [], summary: description },
+          lineageRelation, "auto_notify",
+        )
+      } catch { /* non-critical */ }
+    }
     return
   }
 

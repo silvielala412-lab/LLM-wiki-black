@@ -411,9 +411,18 @@ async fn extract_pdf_content_async(path: &str, state: &AppState) -> anyhow::Resu
         catch_unwind(|| pdf_extract::extract_text_from_mem(&bytes))
     }).await;
 
+    let mut short_text_fallback: Option<String> = None;
     match text_result {
         Ok(Ok(Ok(text))) if !text.trim().is_empty() => {
-            return Ok(text.trim().to_string());
+            let trimmed = text.trim().to_string();
+            let char_count = trimmed.chars().count();
+            if char_count >= 200 {
+                return Ok(trimmed);
+            }
+            short_text_fallback = Some(trimmed);
+            tracing::warn!(
+                "pdf-extract returned only {char_count} chars for {path}; trying image fallback in case this is a scanned/image PDF with a weak text layer"
+            );
         }
         Ok(Ok(Err(e))) => {
             tracing::warn!("pdf-extract failed for {path}: {e}, trying image fallback");
@@ -441,10 +450,10 @@ async fn extract_pdf_content_async(path: &str, state: &AppState) -> anyhow::Resu
                 });
                 Ok(format!("__PDF_IMAGE_PAGES__{}", marker))
             }
-            Ok(_) => Ok("(PDF has no extractable text and no pages could be rendered)".into()),
-            Err(e) => Ok(format!(
+            Ok(_) => Ok(short_text_fallback.unwrap_or_else(|| "(PDF has no extractable text and no pages could be rendered)".into())),
+            Err(e) => Ok(short_text_fallback.unwrap_or_else(|| format!(
                 "(PDF has no extractable text — install poppler-utils or configure OCR_ENDPOINT. Error: {e})"
-            )),
+            ))),
         }
     }).await??;
 

@@ -67,6 +67,7 @@ export type ReviewResolution =
   | "rejected"    // User rejected: new page marked rejected
   | "merged"      // User chose to merge into existing page
   | "superseded"  // User confirmed: old page becomes superseded, new becomes active
+  | "unrelated"   // User says the suggested A-B relation is wrong; keep the new page
 
 export type ReviewStatus = "pending" | "resolved" | "dismissed"
 
