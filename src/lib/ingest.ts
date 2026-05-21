@@ -1,4 +1,4 @@
-import { readFile, writeFile, listDirectory, readFileAsBase64 } from "@/commands/fs"
+import { createDirectory, readFile, writeFile, listDirectory, readFileAsBase64 } from "@/commands/fs"
 import { streamChat } from "@/lib/llm-client"
 import type { LlmConfig } from "@/stores/wiki-store"
 import { useWikiStore } from "@/stores/wiki-store"
@@ -105,6 +105,53 @@ interface SchemaCandidateSignals {
   productAccessList: boolean
   productTerms: boolean
   salesMaterial: boolean
+}
+
+type DocumentIntentDocType =
+  | "service_manual"
+  | "service_catalog"
+  | "product_terms"
+  | "product_manual"
+  | "product_access_list"
+  | "sales_script"
+  | "customer_persona"
+  | "case_study"
+  | "compliance_rule"
+  | "report"
+  | "other"
+
+type DocumentSplitStrategy = "by_item" | "by_section" | "by_table_row_group" | "by_page" | "whole"
+type DocumentCoverageUnit = "service_item" | "product_row" | "clause" | "section" | "page" | "document"
+
+interface DocumentIntent {
+  docType: DocumentIntentDocType
+  primaryDomain: string
+  secondaryDomains: string[]
+  splitStrategy: DocumentSplitStrategy
+  estimatedItemCount: number
+  targetSchemaKeys: string[]
+  coverageUnit: DocumentCoverageUnit
+  boundaryHints: {
+    headingPatterns: string[]
+    tableHeaders: string[]
+    itemColumnNames: string[]
+    rulePatterns: string[]
+  }
+}
+
+interface SmartIngestBatch {
+  batchId: string
+  batchType: "service_table" | "product_table" | "clause_section" | "section" | "page" | "whole"
+  title: string
+  text: string
+  sourcePages: number[]
+  targetSchemaKeys: string[]
+  expectedCandidateTypes: SchemaCandidateKind[]
+}
+
+interface SmartIngestPlan {
+  intent: DocumentIntent
+  batches: SmartIngestBatch[]
 }
 
 const ZH = {
@@ -281,6 +328,339 @@ function detectSchemaCandidateSignals(content: string): SchemaCandidateSignals {
       "\u8f6c\u4ecb\u7ecd",
       "\u9762\u8bbf",
     ]),
+  }
+}
+
+function estimateServiceTableItemCount(content: string): number {
+  const lines = content.split(/\r?\n/)
+  let inServiceTable = false
+  let itemIndex = -1
+  let count = 0
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim()
+    if (!line.includes("|")) {
+      inServiceTable = false
+      continue
+    }
+    const cells = parseMarkdownTableCells(line)
+    if (cells.length < 2 || isMarkdownSeparatorRow(cells)) continue
+
+    const possibleItemIndex = findHeaderIndex(cells, [ZH.service + "\u9879\u76ee", "\u6743\u76ca\u9879\u76ee", "\u9879\u76ee"])
+    const possibleCountIndex = findHeaderIndex(cells, [ZH.service + "\u6b21\u6570", ZH.frequency, "\u6b21/\u5e74", "\u6b21"])
+    if (possibleItemIndex >= 0 && possibleCountIndex >= 0) {
+      inServiceTable = true
+      itemIndex = possibleItemIndex
+      continue
+    }
+
+    if (inServiceTable && itemIndex >= 0 && cells.length > itemIndex && isUsableCandidateTitle(cells[itemIndex])) {
+      count++
+    }
+  }
+
+  return count
+}
+
+function recognizeDocumentIntent(sourceContent: string): DocumentIntent {
+  const signals = detectSchemaCandidateSignals(sourceContent)
+  const serviceItems = estimateServiceTableItemCount(sourceContent)
+  const productRows = estimateTableLikeRowCount(sourceContent)
+
+  if (signals.serviceManual || serviceItems >= 5) {
+    return {
+      docType: serviceItems >= 5 ? "service_catalog" : "service_manual",
+      primaryDomain: "product",
+      secondaryDomains: ["compliance", "method"],
+      splitStrategy: serviceItems >= 5 ? "by_table_row_group" : "by_section",
+      estimatedItemCount: Math.max(serviceItems, detectedServiceManualNodes(sourceContent).length),
+      targetSchemaKeys: ["insurance.product.Product", "insurance.product.SellingPoint"],
+      coverageUnit: serviceItems >= 5 ? "service_item" : "section",
+      boundaryHints: {
+        headingPatterns: ["^#{1,6}\\s+", "^第[一二三四五六七八九十0-9]+[章节部分]"],
+        tableHeaders: ["服务项目", "服务次数", "服务场景", "服务阶段"],
+        itemColumnNames: ["服务项目", "权益项目", "项目"],
+        rulePatterns: ["等待期", "非共享", "中止", "终止", "免责", "不承诺", "不保证"],
+      },
+    }
+  }
+
+  if (signals.productAccessList || productRows >= 20) {
+    return {
+      docType: "product_access_list",
+      primaryDomain: "product",
+      secondaryDomains: ["compliance"],
+      splitStrategy: "by_table_row_group",
+      estimatedItemCount: productRows,
+      targetSchemaKeys: ["insurance.product.Product", "insurance.product.RegulatoryDoc"],
+      coverageUnit: "product_row",
+      boundaryHints: {
+        headingPatterns: ["^#{1,6}\\s+"],
+        tableHeaders: ["产品名称", "产品代码", "主险代码", "渠道", "交期", "是否"],
+        itemColumnNames: ["产品名称", "产品代码", "服务项目"],
+        rulePatterns: ["1\\*", "N", "是", "否", "备注", "准入"],
+      },
+    }
+  }
+
+  if (signals.productTerms) {
+    return {
+      docType: "product_terms",
+      primaryDomain: "product",
+      secondaryDomains: ["compliance"],
+      splitStrategy: "by_section",
+      estimatedItemCount: 0,
+      targetSchemaKeys: ["insurance.product.Product", "insurance.product.RegulatoryDoc"],
+      coverageUnit: "clause",
+      boundaryHints: {
+        headingPatterns: ["^#{1,6}\\s+", "^第[一二三四五六七八九十0-9]+条"],
+        tableHeaders: ["保险责任", "责任免除", "等待期", "投保年龄"],
+        itemColumnNames: ["条款", "责任", "规则"],
+        rulePatterns: ["保险责任", "责任免除", "等待期", "缴费期间", "保障期间", "理赔"],
+      },
+    }
+  }
+
+  if (signals.salesMaterial) {
+    return {
+      docType: "sales_script",
+      primaryDomain: "method",
+      secondaryDomains: ["customer", "product", "compliance"],
+      splitStrategy: "by_section",
+      estimatedItemCount: 0,
+      targetSchemaKeys: ["insurance.method.SellingScenario", "insurance.method.Pitch", "insurance.method.ObjectionHandling"],
+      coverageUnit: "section",
+      boundaryHints: {
+        headingPatterns: ["^#{1,6}\\s+"],
+        tableHeaders: ["场景", "话术", "异议", "客户"],
+        itemColumnNames: ["场景", "话术", "异议"],
+        rulePatterns: ["保证", "收益", "一定", "不得"],
+      },
+    }
+  }
+
+  return {
+    docType: "other",
+    primaryDomain: "general",
+    secondaryDomains: [],
+    splitStrategy: sourceContent.length > 50000 ? "by_section" : "whole",
+    estimatedItemCount: 0,
+    targetSchemaKeys: [],
+    coverageUnit: sourceContent.length > 50000 ? "section" : "document",
+    boundaryHints: {
+      headingPatterns: ["^#{1,6}\\s+"],
+      tableHeaders: [],
+      itemColumnNames: [],
+      rulePatterns: [],
+    },
+  }
+}
+
+function pagesInText(text: string): number[] {
+  const pages = Array.from(text.matchAll(/<!--\s*Page\s+(\d+)\s*-->/gi))
+    .map((match) => Number(match[1]))
+    .filter((page) => Number.isFinite(page))
+  return Array.from(new Set(pages))
+}
+
+function buildWholeBatch(sourceContent: string, intent: DocumentIntent): SmartIngestBatch[] {
+  return [{
+    batchId: "whole-001",
+    batchType: "whole",
+    title: "Full document",
+    text: sourceContent,
+    sourcePages: pagesInText(sourceContent),
+    targetSchemaKeys: intent.targetSchemaKeys,
+    expectedCandidateTypes: [],
+  }]
+}
+
+function buildServiceTableBatches(sourceContent: string, intent: DocumentIntent): SmartIngestBatch[] {
+  const lines = sourceContent.split(/\r?\n/)
+  const batches: SmartIngestBatch[] = []
+  let activeRows: string[] = []
+  let activeTitle = "Service item table"
+  let activePage = 0
+  let seenHeader = false
+  let itemCount = 0
+
+  const flush = () => {
+    if (!seenHeader || activeRows.length === 0) return
+    batches.push({
+      batchId: `service-table-${String(batches.length + 1).padStart(3, "0")}`,
+      batchType: "service_table",
+      title: activeTitle,
+      text: activeRows.join("\n"),
+      sourcePages: activePage > 0 ? [activePage] : pagesInText(activeRows.join("\n")),
+      targetSchemaKeys: ["insurance.product.SellingPoint"],
+      expectedCandidateTypes: ["service_benefit", "rule", "process", "compliance_rule"],
+    })
+    activeRows = []
+    seenHeader = false
+    itemCount = 0
+  }
+
+  for (const rawLine of lines) {
+    const pageMatch = rawLine.match(/<!--\s*Page\s+(\d+)\s*-->/i)
+    if (pageMatch) activePage = Number(pageMatch[1])
+
+    const line = rawLine.trim()
+    if (!line.includes("|")) {
+      if (seenHeader) flush()
+      continue
+    }
+
+    const cells = parseMarkdownTableCells(line)
+    if (cells.length < 2) continue
+    const itemIndex = findHeaderIndex(cells, [ZH.service + "\u9879\u76ee", "\u6743\u76ca\u9879\u76ee", "\u9879\u76ee"])
+    const countIndex = findHeaderIndex(cells, [ZH.service + "\u6b21\u6570", ZH.frequency, "\u6b21/\u5e74", "\u6b21"])
+    if (itemIndex >= 0 && countIndex >= 0) {
+      if (seenHeader) flush()
+      seenHeader = true
+      activeTitle = "服务项目与次数"
+      activeRows = [line]
+      itemCount = 0
+      continue
+    }
+
+    if (!seenHeader) continue
+    activeRows.push(line)
+    if (!isMarkdownSeparatorRow(cells)) itemCount++
+    if (itemCount >= 8) flush()
+  }
+  flush()
+
+  return batches.length > 0 ? batches : buildWholeBatch(sourceContent, intent)
+}
+
+function buildSectionBatches(sourceContent: string, intent: DocumentIntent): SmartIngestBatch[] {
+  const lines = sourceContent.split(/\r?\n/)
+  const batches: SmartIngestBatch[] = []
+  let currentTitle = "Document section"
+  let currentLines: string[] = []
+  let currentPage = 0
+
+  const flush = () => {
+    const text = currentLines.join("\n").trim()
+    if (!text) return
+    batches.push({
+      batchId: `section-${String(batches.length + 1).padStart(3, "0")}`,
+      batchType: intent.docType === "product_terms" ? "clause_section" : "section",
+      title: currentTitle,
+      text,
+      sourcePages: currentPage > 0 ? [currentPage] : pagesInText(text),
+      targetSchemaKeys: intent.targetSchemaKeys,
+      expectedCandidateTypes: intent.docType === "product_terms" ? ["coverage_rule", "rule", "compliance_rule"] : ["service_benefit", "process", "rule", "compliance_rule"],
+    })
+  }
+
+  for (const rawLine of lines) {
+    const pageMatch = rawLine.match(/<!--\s*Page\s+(\d+)\s*-->/i)
+    if (pageMatch) currentPage = Number(pageMatch[1])
+
+    const heading = rawLine.match(/^(#{1,6})\s+(.+)$/)
+    const numberedClause = rawLine.match(/^(第[一二三四五六七八九十0-9]+[章节条部分].*)$/)
+    if ((heading || numberedClause) && currentLines.length > 0) {
+      flush()
+      currentLines = []
+    }
+    if (heading) currentTitle = normalizeCandidateTitle(heading[2])
+    if (numberedClause) currentTitle = normalizeCandidateTitle(numberedClause[1])
+    currentLines.push(rawLine)
+  }
+  flush()
+
+  return batches.length > 0 ? batches : buildWholeBatch(sourceContent, intent)
+}
+
+function buildPageBatches(sourceContent: string, intent: DocumentIntent): SmartIngestBatch[] {
+  const pageBlocks = sourceContent.split(/(?=<!--\s*Page\s+\d+\s*-->)/i).filter((block) => block.trim())
+  if (pageBlocks.length === 0) return buildWholeBatch(sourceContent, intent)
+  return pageBlocks.map((text, index) => ({
+    batchId: `page-${String(index + 1).padStart(3, "0")}`,
+    batchType: "page",
+    title: `Page batch ${index + 1}`,
+    text,
+    sourcePages: pagesInText(text),
+    targetSchemaKeys: intent.targetSchemaKeys,
+    expectedCandidateTypes: ["service_benefit", "process", "rule", "compliance_rule"],
+  }))
+}
+
+function buildSmartIngestPlan(sourceContent: string): SmartIngestPlan {
+  const intent = recognizeDocumentIntent(sourceContent)
+  let batches: SmartIngestBatch[]
+  if (intent.splitStrategy === "by_table_row_group") {
+    batches = intent.coverageUnit === "service_item"
+      ? buildServiceTableBatches(sourceContent, intent)
+      : buildSectionBatches(sourceContent, intent)
+  } else if (intent.splitStrategy === "by_section") {
+    batches = buildSectionBatches(sourceContent, intent)
+  } else if (intent.splitStrategy === "by_page") {
+    batches = buildPageBatches(sourceContent, intent)
+  } else {
+    batches = buildWholeBatch(sourceContent, intent)
+  }
+
+  return { intent, batches }
+}
+
+function buildSmartIngestPlanDigest(plan: SmartIngestPlan): string {
+  const lines = [
+    "## Smart Ingest Plan",
+    "",
+    `doc_type: ${plan.intent.docType}`,
+    `primary_domain: ${plan.intent.primaryDomain}`,
+    `secondary_domains: ${plan.intent.secondaryDomains.join(", ") || "none"}`,
+    `split_strategy: ${plan.intent.splitStrategy}`,
+    `coverage_unit: ${plan.intent.coverageUnit}`,
+    `estimated_item_count: ${plan.intent.estimatedItemCount}`,
+    `target_schema_keys: ${plan.intent.targetSchemaKeys.join(", ") || "none"}`,
+    `batch_count: ${plan.batches.length}`,
+    "",
+    "Batches:",
+  ]
+  for (const batch of plan.batches.slice(0, 20)) {
+    lines.push(`- ${batch.batchId} | ${batch.batchType} | pages=${batch.sourcePages.join(",") || "unknown"} | chars=${batch.text.length} | expected=${batch.expectedCandidateTypes.join(",") || "general"}`)
+  }
+  if (plan.batches.length > 20) lines.push(`- ... ${plan.batches.length - 20} additional batches omitted.`)
+  return lines.join("\n")
+}
+
+async function persistSmartCompileArtifacts(
+  projectPath: string,
+  sourceFileName: string,
+  plan: SmartIngestPlan,
+  candidates: SchemaDrivenCandidate[],
+): Promise<void> {
+  try {
+    const dir = `${projectPath}/.llm-wiki/compile`
+    await createDirectory(`${projectPath}/.llm-wiki`).catch(() => {})
+    await createDirectory(dir).catch(() => {})
+    const payload = {
+      sourceFileName,
+      generatedAt: new Date().toISOString(),
+      intent: plan.intent,
+      batches: plan.batches.map((batch) => ({
+        batchId: batch.batchId,
+        batchType: batch.batchType,
+        title: batch.title,
+        sourcePages: batch.sourcePages,
+        targetSchemaKeys: batch.targetSchemaKeys,
+        expectedCandidateTypes: batch.expectedCandidateTypes,
+        textChars: batch.text.length,
+      })),
+      candidates,
+      coverage: {
+        candidateCount: candidates.length,
+        requiredCandidateCount: candidates.filter((candidate) => candidate.required).length,
+        coverageUnit: plan.intent.coverageUnit,
+        estimatedItemCount: plan.intent.estimatedItemCount,
+      },
+    }
+    await writeFile(`${dir}/${safeCacheName(sourceFileName)}-compile-candidates.json`, JSON.stringify(payload, null, 2))
+  } catch (err) {
+    console.warn("[ingest] Failed to persist smart compile artifacts:", err)
   }
 }
 
@@ -527,13 +907,20 @@ function addServiceTableCandidates(
   }
 }
 
-function extractSchemaDrivenCandidates(sourceContent: string): SchemaDrivenCandidate[] {
+function extractSchemaDrivenCandidates(sourceContent: string, plan = buildSmartIngestPlan(sourceContent)): SchemaDrivenCandidate[] {
   const signals = detectSchemaCandidateSignals(sourceContent)
   const candidates = new Map<string, SchemaDrivenCandidate>()
   const sectionPath: string[] = []
   const lines = sourceContent.split(/\r?\n/)
 
-  addServiceTableCandidates(candidates, lines, signals)
+  for (const batch of plan.batches) {
+    if (batch.batchType === "service_table") {
+      addServiceTableCandidates(candidates, batch.text.split(/\r?\n/), signals)
+    }
+  }
+  if (plan.batches.every((batch) => batch.batchType !== "service_table")) {
+    addServiceTableCandidates(candidates, lines, signals)
+  }
 
   for (const rawLine of lines) {
     const line = rawLine.trim()
@@ -600,10 +987,12 @@ function candidateExcerpt(sourceContent: string, candidate: SchemaDrivenCandidat
   return snippets.join("\n\n---\n\n").slice(0, maxChars)
 }
 
-function buildSchemaCandidateManifest(candidates: SchemaDrivenCandidate[]): string {
-  if (candidates.length === 0) return ""
+function buildSchemaCandidateManifest(candidates: SchemaDrivenCandidate[], plan?: SmartIngestPlan): string {
+  if (candidates.length === 0 && !plan) return ""
   const required = candidates.filter((candidate) => candidate.required)
   const lines = [
+    plan ? buildSmartIngestPlanDigest(plan) : "",
+    "",
     "## Schema-Driven Candidate Manifest",
     "",
     "The system pre-scanned the source and found reusable knowledge candidates. Treat this manifest as a coverage contract, not as optional suggestions.",
@@ -612,7 +1001,7 @@ function buildSchemaCandidateManifest(candidates: SchemaDrivenCandidate[]): stri
     "",
     `Candidate count: ${candidates.length}. Required count: ${required.length}.`,
     "",
-  ]
+  ].filter(Boolean)
 
   for (const candidate of candidates.slice(0, 60)) {
     lines.push(
@@ -1845,11 +2234,13 @@ async function autoIngestImpl(
     signal,
   )
   const sourceForPrompts = preparedSource.content
-  const schemaCandidates = extractSchemaDrivenCandidates(enrichedSourceContent)
-  const schemaCandidateManifest = buildSchemaCandidateManifest(schemaCandidates)
+  const smartIngestPlan = buildSmartIngestPlan(enrichedSourceContent)
+  const schemaCandidates = extractSchemaDrivenCandidates(enrichedSourceContent, smartIngestPlan)
+  const schemaCandidateManifest = buildSchemaCandidateManifest(schemaCandidates, smartIngestPlan)
+  await persistSmartCompileArtifacts(pp, fileName, smartIngestPlan, schemaCandidates)
   if (schemaCandidates.length > 0) {
     activity.updateItem(activityId, {
-      detail: `Schema candidate scan: ${schemaCandidates.filter((candidate) => candidate.required).length}/${schemaCandidates.length} required candidates...`,
+      detail: `Smart ingest: ${smartIngestPlan.intent.docType}, ${smartIngestPlan.batches.length} batch(es), ${schemaCandidates.filter((candidate) => candidate.required).length}/${schemaCandidates.length} required candidates...`,
     })
   }
 

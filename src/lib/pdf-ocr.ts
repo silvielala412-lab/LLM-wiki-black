@@ -18,7 +18,8 @@ import { createDirectory, readFile, writeFile } from "@/commands/fs"
 
 const MARKER = "__PDF_IMAGE_PAGES__"
 const OCR_PAGE_TIMEOUT_MS = 180_000
-const OCR_PDF_PAGE_CONCURRENCY = 3
+const OCR_PDF_MIN_PAGE_CONCURRENCY = 3
+const OCR_PDF_MAX_PAGE_CONCURRENCY = 6
 
 const TABLE_OCR_PROMPT = [
   "请对这张图片做高精度 OCR，直接输出可供知识库入库的原文。",
@@ -214,7 +215,10 @@ export async function ocrImagePdf(
   const { pages } = payload
   const total = pages.length
   const results = new Array<string>(total)
-  const concurrency = Math.min(OCR_PDF_PAGE_CONCURRENCY, total)
+  const concurrency = Math.min(
+    total,
+    total >= 30 ? OCR_PDF_MAX_PAGE_CONCURRENCY : total >= 12 ? 4 : OCR_PDF_MIN_PAGE_CONCURRENCY,
+  )
   const pendingPages: number[] = []
   let nextIndex = 0
   let completed = 0
