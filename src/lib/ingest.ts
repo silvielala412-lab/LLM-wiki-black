@@ -35,6 +35,8 @@ const LONG_SOURCE_DIGEST_LIMIT = 48000
 const LONG_SOURCE_MERGE_BATCH_CHARS = 30000
 const OCR_DETAIL_SECTION_MARKER = "<!-- LLM_WIKI_OCR_DETAIL_START -->"
 const OCR_DETAIL_SECTION_END_MARKER = "<!-- LLM_WIKI_OCR_DETAIL_END -->"
+const SCHEMA_CANDIDATE_AUDIT_MARKER = "<!-- LLM_WIKI_SCHEMA_CANDIDATE_AUDIT_START -->"
+const SCHEMA_CANDIDATE_AUDIT_END_MARKER = "<!-- LLM_WIKI_SCHEMA_CANDIDATE_AUDIT_END -->"
 const OCR_DETAIL_CHAR_LIMIT = 120000
 
 type IngestProcessingMode = "direct" | "hierarchical-long-document"
@@ -67,6 +69,452 @@ interface PreparedIngestSource {
   processingMode: IngestProcessingMode
   qualityConfidence: "high" | "medium" | "low"
   qualityNotes: string[]
+}
+
+type SchemaCandidateKind =
+  | "product"
+  | "service_benefit"
+  | "coverage_rule"
+  | "process"
+  | "rule"
+  | "compliance_rule"
+  | "persona"
+  | "customer_signal"
+  | "selling_scenario"
+  | "pitch"
+  | "objection_handling"
+  | "asset"
+  | "source_inventory"
+
+interface SchemaDrivenCandidate {
+  title: string
+  aliases: string[]
+  knowledgeDomain: string
+  entityType: SchemaCandidateKind
+  universalType: UniversalTypeForCandidate
+  required: boolean
+  confidence: number
+  reason: string
+  sourceLines: string[]
+}
+
+type UniversalTypeForCandidate = "entity" | "concept" | "process" | "rule" | "data" | "source"
+
+interface SchemaCandidateSignals {
+  serviceManual: boolean
+  productAccessList: boolean
+  productTerms: boolean
+  salesMaterial: boolean
+}
+
+const ZH = {
+  service: "\u670d\u52a1",
+  serviceManual: "\u670d\u52a1\u624b\u518c",
+  serviceBenefit: "\u670d\u52a1\u6743\u76ca",
+  serviceContent: "\u670d\u52a1\u5185\u5bb9",
+  serviceFlow: "\u670d\u52a1\u6d41\u7a0b",
+  appointment: "\u9884\u7ea6",
+  application: "\u7533\u8bf7",
+  frequency: "\u6b21\u6570",
+  target: "\u9002\u7528\u5bf9\u8c61",
+  majorIllness: "\u91cd\u75be",
+  doctor: "\u533b\u751f",
+  consultation: "\u95ee\u8bca",
+  expert: "\u4e13\u5bb6",
+  famousDoctor: "\u540d\u533b",
+  checkup: "\u4f53\u68c0",
+  escort: "\u966a\u8bca",
+  hospitalization: "\u4f4f\u9662",
+  surgery: "\u624b\u672f",
+  nursing: "\u62a4\u7406",
+  rehab: "\u5eb7\u590d",
+  activation: "\u6fc0\u6d3b",
+  suspension: "\u4e2d\u6b62",
+  termination: "\u7ec8\u6b62",
+  waitingPeriod: "\u7b49\u5f85\u671f",
+  nonSharing: "\u975e\u5171\u4eab",
+  disclaimer: "\u514d\u8d23",
+  compliance: "\u5408\u89c4",
+  productCode: "\u4ea7\u54c1\u4ee3\u7801",
+  productName: "\u4ea7\u54c1\u540d\u79f0",
+  accessList: "\u51c6\u5165\u6e05\u5355",
+  persona: "\u5ba2\u6237\u753b\u50cf",
+  pitch: "\u8bdd\u672f",
+  objection: "\u5f02\u8bae",
+  scenario: "\u573a\u666f",
+}
+
+const SERVICE_LIKE_KEYWORDS = [
+  ZH.service,
+  ZH.doctor,
+  ZH.consultation,
+  ZH.expert,
+  ZH.famousDoctor,
+  ZH.checkup,
+  ZH.appointment,
+  ZH.escort,
+  ZH.hospitalization,
+  ZH.surgery,
+  ZH.nursing,
+  ZH.rehab,
+  ZH.majorIllness,
+  "\u5bb6\u533b",
+  "\u7eff\u901a",
+  "\u9662\u540e",
+  "\u8bad\u7ec3\u8425",
+]
+
+const RULE_LIKE_KEYWORDS = [
+  "\u89c4\u5219",
+  "\u9650\u5236",
+  "\u9002\u7528",
+  "\u4e0d\u9002\u7528",
+  ZH.frequency,
+  ZH.waitingPeriod,
+  ZH.nonSharing,
+  ZH.suspension,
+  ZH.termination,
+  "\u6709\u6548\u671f",
+  "\u6761\u4ef6",
+  "\u8303\u56f4",
+]
+
+const PROCESS_LIKE_KEYWORDS = [
+  ZH.serviceFlow,
+  "\u6d41\u7a0b",
+  ZH.activation,
+  "\u7ed1\u5b9a",
+  ZH.application,
+  ZH.appointment,
+  "\u64cd\u4f5c",
+  "\u6b65\u9aa4",
+]
+
+const COMPLIANCE_LIKE_KEYWORDS = [
+  ZH.disclaimer,
+  ZH.compliance,
+  "\u4e0d\u627f\u8bfa",
+  "\u4e0d\u4fdd\u8bc1",
+  "\u4e0d\u5f97",
+  "\u7981\u6b62",
+  "\u98ce\u9669\u63d0\u793a",
+  "\u6cd5\u5f8b\u8d23\u4efb",
+]
+
+const GENERIC_CANDIDATE_TITLES = new Set([
+  "overview",
+  "summary",
+  "introduction",
+  "\u76ee\u5f55",
+  "\u524d\u8a00",
+  "\u6982\u8ff0",
+  "\u80cc\u666f",
+  "\u9644\u5f55",
+  "\u5907\u6ce8",
+  "\u8bf4\u660e",
+  "\u5b9a\u4e49",
+  "\u5e38\u89c1\u95ee\u9898",
+])
+
+function hasAny(text: string, needles: string[]): boolean {
+  return needles.some((needle) => text.includes(needle))
+}
+
+function detectSchemaCandidateSignals(content: string): SchemaCandidateSignals {
+  return {
+    serviceManual: hasAny(content, [
+      ZH.serviceManual,
+      ZH.serviceBenefit,
+      ZH.serviceContent,
+      ZH.serviceFlow,
+      "\u670d\u52a1\u4f53\u7cfb",
+      "\u670d\u52a1\u671f\u9650",
+      ZH.appointment,
+      ZH.application,
+      ZH.frequency,
+      ZH.target,
+      "\u91cd\u75be\u5168\u7a0b",
+    ]),
+    productAccessList: hasAny(content, [
+      ZH.accessList,
+      ZH.productCode,
+      ZH.productName,
+      "\u4e3b\u9669\u4ee3\u7801",
+      "\u6e20\u9053",
+      "\u4ea4\u671f",
+      "\u662f\u5426",
+      "1+N",
+      "PVMargin",
+    ]),
+    productTerms: hasAny(content, [
+      "\u6295\u4fdd\u5e74\u9f84",
+      ZH.waitingPeriod,
+      "\u4fdd\u9669\u8d23\u4efb",
+      "\u8d23\u4efb\u514d\u9664",
+      "\u7f34\u8d39\u671f\u95f4",
+      "\u4fdd\u969c\u671f\u95f4",
+      "\u7406\u8d54",
+      "\u5065\u5eb7\u544a\u77e5",
+    ]),
+    salesMaterial: hasAny(content, [
+      "\u5ba3\u4f20",
+      "\u5356\u70b9",
+      ZH.persona,
+      ZH.scenario,
+      ZH.pitch,
+      ZH.objection,
+      "\u4fc3\u6210",
+      "\u8f6c\u4ecb\u7ecd",
+      "\u9762\u8bbf",
+    ]),
+  }
+}
+
+function normalizeCandidateTitle(title: string): string {
+  return title
+    .replace(/!\[[^\]]*]\([^)]*\)/g, " ")
+    .replace(/\[[^\]]*]\([^)]*\)/g, " ")
+    .replace(/^[\s#>*\-+|0-9.、:：;；()[\]【】"'“”‘’]+/g, "")
+    .replace(/[\s|:：;；()[\]【】"'“”‘’，。,./\\]+$/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+}
+
+function splitCandidateTitle(raw: string): string[] {
+  const cleaned = normalizeCandidateTitle(raw)
+  if (!cleaned) return []
+  const parts = cleaned.split(/\s*(?:\/|、|，|,|；|;|\t)\s*/g)
+  return parts
+    .map(normalizeCandidateTitle)
+    .filter((part) => part.length >= 2 && part.length <= 40)
+}
+
+function isUsableCandidateTitle(title: string): boolean {
+  if (!title || title.length < 2 || title.length > 40) return false
+  if (/^[\d\s.\-_/]+$/.test(title)) return false
+  if (/^(第?\d+[章节页]?|page\s*\d+)$/i.test(title)) return false
+  if (GENERIC_CANDIDATE_TITLES.has(title.toLowerCase())) return false
+  if (/^(true|false|null|yes|no|1|0|n)$/i.test(title)) return false
+  return /[\p{L}\p{N}]/u.test(title)
+}
+
+function inferCandidateKind(
+  title: string,
+  line: string,
+  sectionPath: string[],
+  signals: SchemaCandidateSignals,
+): Pick<SchemaDrivenCandidate, "knowledgeDomain" | "entityType" | "universalType" | "required" | "reason" | "confidence"> | null {
+  const context = `${sectionPath.join(" ")} ${line} ${title}`
+  if (hasAny(context, COMPLIANCE_LIKE_KEYWORDS)) {
+    return {
+      knowledgeDomain: "compliance",
+      entityType: "compliance_rule",
+      universalType: "rule",
+      required: true,
+      confidence: 0.88,
+      reason: "Compliance/disclaimer wording detected.",
+    }
+  }
+  if (hasAny(context, PROCESS_LIKE_KEYWORDS)) {
+    return {
+      knowledgeDomain: "product",
+      entityType: "process",
+      universalType: "process",
+      required: true,
+      confidence: 0.84,
+      reason: "Reusable process or application flow detected.",
+    }
+  }
+  if (hasAny(context, RULE_LIKE_KEYWORDS)) {
+    return {
+      knowledgeDomain: "product",
+      entityType: "rule",
+      universalType: "rule",
+      required: true,
+      confidence: 0.82,
+      reason: "Reusable limit, eligibility, frequency, waiting-period, or lifecycle rule detected.",
+    }
+  }
+  if (hasAny(context, SERVICE_LIKE_KEYWORDS) || (signals.serviceManual && hasAny(sectionPath.join(" "), [ZH.service, ZH.serviceContent, ZH.serviceBenefit]))) {
+    return {
+      knowledgeDomain: "product",
+      entityType: "service_benefit",
+      universalType: "entity",
+      required: true,
+      confidence: 0.86,
+      reason: "Independent service benefit detected in a service-oriented document.",
+    }
+  }
+  if (signals.productTerms && hasAny(context, ["\u4ea7\u54c1", "\u4fdd\u969c", "\u8d23\u4efb", "\u6761\u6b3e"])) {
+    return {
+      knowledgeDomain: "product",
+      entityType: "coverage_rule",
+      universalType: "rule",
+      required: true,
+      confidence: 0.78,
+      reason: "Product responsibility or clause-like item detected.",
+    }
+  }
+  if (signals.salesMaterial && hasAny(context, [ZH.pitch, "\u8bf4\u6cd5", "\u8bdd\u672f"])) {
+    return {
+      knowledgeDomain: "method",
+      entityType: "pitch",
+      universalType: "process",
+      required: true,
+      confidence: 0.8,
+      reason: "Reusable sales pitch detected.",
+    }
+  }
+  if (signals.salesMaterial && hasAny(context, [ZH.objection, "\u62d2\u7edd", "\u592a\u8d35", "\u533b\u4fdd"])) {
+    return {
+      knowledgeDomain: "method",
+      entityType: "objection_handling",
+      universalType: "process",
+      required: true,
+      confidence: 0.8,
+      reason: "Reusable objection handling detected.",
+    }
+  }
+  if (signals.salesMaterial && hasAny(context, [ZH.persona, "\u5ba2\u6237", "\u5bb6\u5ead\u652f\u67f1", "\u9ad8\u51c0\u503c"])) {
+    return {
+      knowledgeDomain: "customer",
+      entityType: "persona",
+      universalType: "entity",
+      required: true,
+      confidence: 0.75,
+      reason: "Customer persona-like item detected.",
+    }
+  }
+  return null
+}
+
+function addSchemaCandidate(
+  map: Map<string, SchemaDrivenCandidate>,
+  title: string,
+  line: string,
+  sectionPath: string[],
+  signals: SchemaCandidateSignals,
+): void {
+  const cleaned = normalizeCandidateTitle(title)
+  if (!isUsableCandidateTitle(cleaned)) return
+  const inferred = inferCandidateKind(cleaned, line, sectionPath, signals)
+  if (!inferred) return
+
+  const key = normalizeCoverageTitle(cleaned)
+  const existing = map.get(key)
+  const sourceLine = line.trim().slice(0, 500)
+  if (existing) {
+    if (!existing.sourceLines.includes(sourceLine)) existing.sourceLines.push(sourceLine)
+    existing.confidence = Math.max(existing.confidence, inferred.confidence)
+    existing.required = existing.required || inferred.required
+    return
+  }
+
+  map.set(key, {
+    title: cleaned,
+    aliases: [],
+    knowledgeDomain: inferred.knowledgeDomain,
+    entityType: inferred.entityType,
+    universalType: inferred.universalType,
+    required: inferred.required,
+    confidence: inferred.confidence,
+    reason: inferred.reason,
+    sourceLines: sourceLine ? [sourceLine] : [],
+  })
+}
+
+function extractSchemaDrivenCandidates(sourceContent: string): SchemaDrivenCandidate[] {
+  const signals = detectSchemaCandidateSignals(sourceContent)
+  const candidates = new Map<string, SchemaDrivenCandidate>()
+  const sectionPath: string[] = []
+  const lines = sourceContent.split(/\r?\n/)
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim()
+    if (!line) continue
+
+    const heading = line.match(/^(#{1,6})\s+(.+)$/)
+    if (heading) {
+      const depth = heading[1].length
+      sectionPath.length = Math.max(0, depth - 1)
+      sectionPath[depth - 1] = normalizeCandidateTitle(heading[2])
+      addSchemaCandidate(candidates, heading[2], line, sectionPath, signals)
+      continue
+    }
+
+    const bullet = line.match(/^(?:[-*+]\s+|\d{1,3}[.、)]\s+|[一二三四五六七八九十]+[、.]\s*)(.+)$/)
+    if (bullet) {
+      for (const part of splitCandidateTitle(bullet[1])) {
+        addSchemaCandidate(candidates, part, line, sectionPath, signals)
+      }
+      continue
+    }
+
+    if (line.includes("|")) {
+      const cells = line.split("|").map(normalizeCandidateTitle).filter(Boolean)
+      for (const cell of cells.slice(0, 8)) {
+        addSchemaCandidate(candidates, cell, line, sectionPath, signals)
+      }
+    }
+  }
+
+  if (signals.productAccessList || isTableLikeSource(sourceContent)) {
+    candidates.set("source_inventory", {
+      title: "\u539f\u59cb\u6e05\u5355\u660e\u7ec6",
+      aliases: ["row_inventory", "table_inventory"],
+      knowledgeDomain: "general",
+      entityType: "source_inventory",
+      universalType: "source",
+      required: true,
+      confidence: 0.9,
+      reason: "Table/list-like source requires row-level preservation on the source page.",
+      sourceLines: [],
+    })
+  }
+
+  return Array.from(candidates.values())
+    .sort((a, b) => Number(b.required) - Number(a.required) || b.confidence - a.confidence || a.title.localeCompare(b.title))
+    .slice(0, 80)
+}
+
+function candidateExcerpt(sourceContent: string, candidate: SchemaDrivenCandidate, maxChars = 1600): string {
+  const needles = [candidate.title, ...candidate.aliases].filter(Boolean)
+  const snippets: string[] = []
+  for (const needle of needles) {
+    const idx = sourceContent.indexOf(needle)
+    if (idx < 0) continue
+    const start = Math.max(0, idx - 500)
+    const end = Math.min(sourceContent.length, idx + needle.length + 900)
+    snippets.push(sourceContent.slice(start, end).trim())
+    if (snippets.join("\n\n").length >= maxChars) break
+  }
+  if (snippets.length === 0 && candidate.sourceLines.length > 0) {
+    snippets.push(candidate.sourceLines.join("\n").slice(0, maxChars))
+  }
+  return snippets.join("\n\n---\n\n").slice(0, maxChars)
+}
+
+function buildSchemaCandidateManifest(candidates: SchemaDrivenCandidate[]): string {
+  if (candidates.length === 0) return ""
+  const required = candidates.filter((candidate) => candidate.required)
+  const lines = [
+    "## Schema-Driven Candidate Manifest",
+    "",
+    "The system pre-scanned the source and found reusable knowledge candidates. Treat this manifest as a coverage contract, not as optional suggestions.",
+    "For every REQUIRED candidate, either generate a dedicated page or create a REVIEW missing-page item explaining why the source evidence is insufficient.",
+    "Do not collapse many required service/rule/process candidates into one generic page.",
+    "",
+    `Candidate count: ${candidates.length}. Required count: ${required.length}.`,
+    "",
+  ]
+
+  for (const candidate of candidates.slice(0, 60)) {
+    lines.push(
+      `- ${candidate.required ? "REQUIRED" : "OPTIONAL"} | ${candidate.title} | domain=${candidate.knowledgeDomain} | entity_type=${candidate.entityType} | type=${candidate.universalType} | confidence=${candidate.confidence.toFixed(2)} | ${candidate.reason}`,
+    )
+  }
+  if (candidates.length > 60) lines.push(`- ... ${candidates.length - 60} additional candidates omitted from prompt display.`)
+  return lines.join("\n")
 }
 
 const INSURANCE_SERVICE_MANUAL_NODES = [
@@ -296,6 +744,76 @@ async function preserveOcrDetailsInSourcePage(
     await writeFile(sourceSummaryFullPath, content)
   } catch (err) {
     console.warn("[ingest:ocr] Failed to preserve OCR details:", err)
+  }
+}
+
+function buildSchemaCandidateAuditSection(
+  candidates: SchemaDrivenCandidate[],
+  missingAfterBackfill: SchemaDrivenCandidate[],
+  projectPath: string,
+): string {
+  const required = candidates.filter((candidate) => candidate.required)
+  const missingKeys = new Set(missingAfterBackfill.map((candidate) => normalizeCoverageTitle(candidate.title)))
+  const rows = required.slice(0, 120).map((candidate) => {
+    const status = candidate.entityType === "source_inventory"
+      ? "source-page"
+      : missingKeys.has(normalizeCoverageTitle(candidate.title))
+        ? "missing-review"
+        : "page-generated-or-existing"
+    const pagePath = candidate.entityType === "source_inventory" ? "" : `wiki/entities/${candidate.title}.md`
+    return `| ${candidate.title.replace(/\|/g, "\\|")} | ${candidate.knowledgeDomain} | ${candidate.entityType} | ${status} | ${pagePath} |`
+  })
+
+  return [
+    SCHEMA_CANDIDATE_AUDIT_MARKER,
+    "",
+    "## 结构化候选覆盖审计（自动生成）",
+    "",
+    `候选知识点总数：${candidates.length}`,
+    `必须覆盖候选数：${required.length}`,
+    `补页后仍缺失：${missingAfterBackfill.length}`,
+    "",
+    "> 这部分用于演示和人工审核：系统会先从原文/OCR 中枚举服务、规则、流程、合规等可复用知识点，再检查是否已生成独立知识页。它不是最终业务结论，而是知识编译覆盖率审计。",
+    "",
+    "| 候选知识点 | 所属域 | 实体类型 | 覆盖状态 | 预期页面 |",
+    "|---|---|---|---|---|",
+    ...rows,
+    required.length > 120 ? `| ... | ... | ... | 还有 ${required.length - 120} 项未展开 | ... |` : "",
+    "",
+    missingAfterBackfill.length > 0
+      ? `仍缺失候选：${missingAfterBackfill.map((candidate) => candidate.title).join("、")}`
+      : "所有必须候选已生成页面、已有页面或保留在源清单层。",
+    "",
+    `项目路径：${projectPath}`,
+    "",
+    SCHEMA_CANDIDATE_AUDIT_END_MARKER,
+  ].filter(Boolean).join("\n")
+}
+
+async function preserveSchemaCandidateAuditInSourcePage(
+  sourceSummaryFullPath: string,
+  candidates: SchemaDrivenCandidate[],
+  missingAfterBackfill: SchemaDrivenCandidate[],
+  projectPath: string,
+): Promise<void> {
+  if (candidates.length === 0) return
+  try {
+    let content = await tryReadFile(sourceSummaryFullPath)
+    if (!content) return
+
+    const auditSection = buildSchemaCandidateAuditSection(candidates, missingAfterBackfill, projectPath)
+    if (content.includes(SCHEMA_CANDIDATE_AUDIT_MARKER)) {
+      content = content.replace(
+        new RegExp(`${SCHEMA_CANDIDATE_AUDIT_MARKER}[\\s\\S]*?${SCHEMA_CANDIDATE_AUDIT_END_MARKER}`),
+        auditSection.trim(),
+      )
+    } else {
+      content = `${content.trimEnd()}\n\n${auditSection.trim()}\n`
+    }
+
+    await writeFile(sourceSummaryFullPath, content)
+  } catch (err) {
+    console.warn("[ingest] Failed to preserve schema candidate audit in source page:", err)
   }
 }
 
@@ -1221,6 +1739,13 @@ async function autoIngestImpl(
     signal,
   )
   const sourceForPrompts = preparedSource.content
+  const schemaCandidates = extractSchemaDrivenCandidates(enrichedSourceContent)
+  const schemaCandidateManifest = buildSchemaCandidateManifest(schemaCandidates)
+  if (schemaCandidates.length > 0) {
+    activity.updateItem(activityId, {
+      detail: `Schema candidate scan: ${schemaCandidates.filter((candidate) => candidate.required).length}/${schemaCandidates.length} required candidates...`,
+    })
+  }
 
   // ── Step 1: Analysis ──────────────────────────────────────────
   // LLM reads the source and produces a structured analysis:
@@ -1244,6 +1769,7 @@ async function autoIngestImpl(
         folderContext ? `**Folder context:** ${folderContext}` : "",
         `**Processing mode:** ${preparedSource.processingMode}`,
         factLayerHints,
+        schemaCandidateManifest,
         "---",
         "",
         sourceForPrompts,
@@ -1277,6 +1803,7 @@ async function autoIngestImpl(
       content: [
         `Source document to process: **${fileName}**`,
         factLayerHints,
+        schemaCandidateManifest,
         "",
         "The Stage 1 analysis below is CONTEXT to inform your output. Do NOT echo",
         "its tables, bullet points, or prose. Your output must be FILE/REVIEW",
@@ -1343,6 +1870,23 @@ async function autoIngestImpl(
     activity.updateItem(activityId, { detail: summary })
   }
 
+  const schemaBackfill = await backfillMissingSchemaCandidatePages(
+    pp,
+    fileName,
+    enrichedSourceContent,
+    schemaCandidates,
+    llmConfig,
+    activityId,
+    preparedSource,
+    signal,
+  )
+  if (schemaBackfill.writtenPaths.length > 0) {
+    writtenPaths.push(...schemaBackfill.writtenPaths)
+  }
+  if (schemaBackfill.warnings.length > 0) {
+    console.warn("[ingest] Schema backfill warnings:", schemaBackfill.warnings)
+  }
+
   // Ensure source summary page exists (LLM may not have generated it correctly)
   const hasSourceSummary = writtenPaths.some((p) => p.startsWith("wiki/sources/"))
 
@@ -1385,6 +1929,7 @@ async function autoIngestImpl(
 
   if (!signal?.aborted) {
     await preserveOcrDetailsInSourcePage(sourceSummaryFullPath, sourceContent, sourceOrigin)
+    await preserveSchemaCandidateAuditInSourcePage(sourceSummaryFullPath, schemaCandidates, schemaBackfill.missingAfterBackfill, pp)
   }
 
   // ── Step 3.5: Append extracted images to the source-summary page ─
@@ -1409,6 +1954,7 @@ async function autoIngestImpl(
   // ── Step 4: Parse review items ────────────────────────────────
   const deterministicReviewItems = [
     ...(await buildMissingLinkReviewItems(pp)),
+    ...buildSchemaCandidateCoverageReviewItems(schemaBackfill.missingAfterBackfill, writtenPaths, sp),
     ...(await buildServiceManualCoverageReviewItems(pp, sourceContent, writtenPaths, sp)),
   ]
   const reviewItems = [
@@ -1848,6 +2394,167 @@ async function writeFileBlocks(
   return { writtenPaths, warnings, hardFailures }
 }
 
+function candidatePageCovered(candidate: SchemaDrivenCandidate, knownTitles: Set<string>): boolean {
+  if (candidate.entityType === "source_inventory") return true
+  const expected = normalizeCoverageTitle(candidate.title)
+  if (knownTitles.has(expected)) return true
+  return candidate.aliases.some((alias) => knownTitles.has(normalizeCoverageTitle(alias)))
+}
+
+function batchCandidates<T>(items: T[], size: number): T[][] {
+  const batches: T[][] = []
+  for (let i = 0; i < items.length; i += size) batches.push(items.slice(i, i + size))
+  return batches
+}
+
+function buildCandidateBackfillPrompt(sourceFileName: string, preparedSource: PreparedIngestSource): string {
+  return [
+    "You are a schema-driven insurance knowledge compiler.",
+    "",
+    "The main generation pass missed required knowledge candidates. Generate dedicated wiki pages for the candidate batch provided by the user.",
+    "This is a backfill pass: do not create index, log, overview, or source pages. Emit only FILE blocks under wiki/entities/ or wiki/concepts/.",
+    "Use the same language as the source. For Chinese insurance documents, write polished Chinese business-facing Markdown bodies.",
+    "",
+    "Required behavior:",
+    "- Create one page per candidate unless the evidence is clearly insufficient.",
+    "- Do not merge multiple service benefits, process rules, or compliance rules into a single generic page.",
+    "- Fill universal frontmatter plus entity-specific attributes. Put missing extension fields into attributes.knowledge_gaps and a visible knowledge-gap section.",
+    "- Every page body must include visible business content, not only frontmatter.",
+    "- Every page must cite the source filename and evidence excerpt.",
+    "- Keep status: candidate and needs_review true when evidence is partial.",
+    "",
+    "Minimal frontmatter contract:",
+    "schema_version: \"2.1\"",
+    "industry: insurance",
+    "knowledge_domain: product | customer | method | content | activity | cases | compliance | general",
+    "domain: same as knowledge_domain",
+    "type: entity | concept | process | rule | data",
+    "entity_type: service_benefit | process | rule | compliance_rule | coverage_rule | product | persona | pitch | objection_handling",
+    "business_phase: service | conversion | signing | general",
+    "dedup_key: stable key",
+    "title: human-readable title",
+    "summary: short summary",
+    "source_files: [source filename]",
+    "sources: [source filename]",
+    "confidence: 0.0-1.0",
+    "status: candidate",
+    "needs_review: true | false",
+    "attributes: one-line JSON object",
+    "claims: compact evidence strings",
+    "",
+    "Body sections for service_benefit pages should include: service definition, eligibility/target users, frequency/limits, process, time limits, exclusions, customer value, compliance reminders, source evidence, and knowledge gaps.",
+    "Body sections for process/rule/compliance pages should include: rule definition, trigger conditions, impact scope, sales meaning, risk reminder, source evidence, and knowledge gaps.",
+    "",
+    `Source file: ${sourceFileName}`,
+    `Ingest mode: ${preparedSource.processingMode}; source chars: ${preparedSource.originalChars}; context chars: ${preparedSource.contextChars}.`,
+    "",
+    "Output format only:",
+    "---FILE: wiki/entities/Page Title.md---",
+    "(complete markdown file)",
+    "---END FILE---",
+  ].join("\n")
+}
+
+function buildCandidateBackfillUserContent(
+  sourceFileName: string,
+  sourceContent: string,
+  candidates: SchemaDrivenCandidate[],
+): string {
+  const blocks = candidates.map((candidate, index) => [
+    `## Candidate ${index + 1}: ${candidate.title}`,
+    `domain: ${candidate.knowledgeDomain}`,
+    `entity_type: ${candidate.entityType}`,
+    `type: ${candidate.universalType}`,
+    `required: ${candidate.required}`,
+    `confidence: ${candidate.confidence.toFixed(2)}`,
+    `reason: ${candidate.reason}`,
+    candidate.aliases.length > 0 ? `aliases: ${candidate.aliases.join(", ")}` : "",
+    "",
+    "Evidence excerpt:",
+    "```",
+    candidateExcerpt(sourceContent, candidate, 1800) || "(No direct excerpt found; use the candidate source lines and keep needs_review true.)",
+    "```",
+  ].filter(Boolean).join("\n"))
+
+  return [
+    `Backfill missing pages from source: ${sourceFileName}`,
+    "",
+    "Generate exactly one dedicated page for each candidate below. Start with ---FILE: as the first characters.",
+    "",
+    blocks.join("\n\n"),
+  ].join("\n")
+}
+
+async function backfillMissingSchemaCandidatePages(
+  projectPath: string,
+  sourceFileName: string,
+  sourceContent: string,
+  candidates: SchemaDrivenCandidate[],
+  llmConfig: LlmConfig,
+  activityId: string,
+  preparedSource: PreparedIngestSource,
+  signal?: AbortSignal,
+): Promise<{ writtenPaths: string[]; missingAfterBackfill: SchemaDrivenCandidate[]; warnings: string[] }> {
+  const required = candidates.filter((candidate) => candidate.required && candidate.entityType !== "source_inventory")
+  if (required.length === 0 || signal?.aborted) return { writtenPaths: [], missingAfterBackfill: [], warnings: [] }
+
+  let knownTitles = await collectWikiPageTitles(projectPath)
+  const missingBefore = required.filter((candidate) => !candidatePageCovered(candidate, knownTitles))
+  if (missingBefore.length === 0) return { writtenPaths: [], missingAfterBackfill: [], warnings: [] }
+
+  const activity = useActivityStore.getState()
+  const allWritten: string[] = []
+  const allWarnings: string[] = []
+  const batches = batchCandidates(missingBefore.slice(0, 48), 6)
+
+  for (let i = 0; i < batches.length; i++) {
+    if (signal?.aborted) break
+    const batch = batches[i]
+    activity.updateItem(activityId, {
+      detail: `Schema backfill: generating missing candidate pages ${i + 1}/${batches.length} (${batch.length} items)...`,
+    })
+
+    let generation = ""
+    try {
+      generation = await streamTextWithCompileFallback(
+        llmConfig,
+        [
+          { role: "system", content: buildCandidateBackfillPrompt(sourceFileName, preparedSource) },
+          { role: "user", content: buildCandidateBackfillUserContent(sourceFileName, sourceContent, batch) },
+        ],
+        signal,
+        { temperature: 0.05, max_tokens: 4200 },
+        activityId,
+        `Schema backfill batch ${i + 1}/${batches.length}`,
+      )
+    } catch (err) {
+      const msg = `Schema backfill batch ${i + 1} failed: ${errorMessage(err)}`
+      console.warn(`[ingest] ${msg}`)
+      allWarnings.push(msg)
+      continue
+    }
+
+    const { writtenPaths, warnings } = await writeFileBlocks(projectPath, generation)
+    allWritten.push(...writtenPaths)
+    allWarnings.push(...warnings)
+    knownTitles = await collectWikiPageTitles(projectPath)
+
+    const { stampCandidate } = await import("@/lib/knowledge-governance")
+    for (const rel of writtenPaths) {
+      if (!rel.startsWith("wiki/")) continue
+      const base = rel.split("/").pop() ?? ""
+      if (base === "index.md" || base === "log.md" || base === "overview.md") continue
+      const absPath = `${projectPath}/${rel}`
+      await stampCandidate(absPath).catch(() => {/* non-critical */})
+      await stampIngestQualityMetadata(absPath, preparedSource).catch(() => {/* non-critical */})
+    }
+  }
+
+  knownTitles = await collectWikiPageTitles(projectPath)
+  const missingAfterBackfill = missingBefore.filter((candidate) => !candidatePageCovered(candidate, knownTitles))
+  return { writtenPaths: allWritten, missingAfterBackfill, warnings: allWarnings }
+}
+
 function yamlScalar(value: string | number): string {
   if (typeof value === "number") return String(value)
   return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`
@@ -2014,6 +2721,52 @@ async function collectWikiPageTitles(projectPath: string): Promise<Set<string>> 
   }
 
   return titles
+}
+
+function buildSchemaCandidateCoverageReviewItems(
+  missingCandidates: SchemaDrivenCandidate[],
+  writtenPaths: string[],
+  sourcePath: string,
+): Omit<ReviewItem, "id" | "resolved" | "createdAt">[] {
+  const actionableMissing = missingCandidates.filter((candidate) => candidate.entityType !== "source_inventory")
+  if (actionableMissing.length === 0) return []
+
+  const sourceBaseName = getFileName(sourcePath).replace(/\.[^.]+$/, "")
+  const byType = new Map<string, SchemaDrivenCandidate[]>()
+  for (const candidate of actionableMissing) {
+    if (!byType.has(candidate.entityType)) byType.set(candidate.entityType, [])
+    byType.get(candidate.entityType)!.push(candidate)
+  }
+
+  const grouped = Array.from(byType.entries())
+    .map(([type, items]) => `${type}: ${items.map((item) => item.title).join("、")}`)
+    .join("\n")
+
+  return [{
+    type: "missing-page",
+    title: `抽取覆盖不足：仍缺少 ${actionableMissing.length} 个 schema 候选知识页`,
+    description: [
+      "系统已完成 schema 候选扫描和自动补页，但仍有部分必须覆盖的服务、流程、规则或合规知识点没有独立页面。",
+      "",
+      grouped,
+      "",
+      "这通常说明原文证据不足、OCR 分段不清、模型输出预算不足，或候选名称需要人工归并。演示前建议补齐这些页面或确认它们应合并到已有页面。",
+    ].join("\n"),
+    sourcePath,
+    affectedPages: [
+      `wiki/sources/${sourceBaseName}.md`,
+      ...writtenPaths.filter((path) => path.startsWith("wiki/entities/") || path.startsWith("wiki/concepts/")).slice(0, 10),
+    ],
+    searchQueries: [
+      "保险 服务权益 知识抽取 覆盖率",
+      "保险服务手册 服务项目 流程 规则 合规",
+      "知识编译 schema 候选实体 覆盖审计",
+    ],
+    options: [
+      { label: "Create Page", action: "Create Page" },
+      { label: "Skip", action: "Skip" },
+    ],
+  }]
 }
 
 async function buildServiceManualCoverageReviewItems(

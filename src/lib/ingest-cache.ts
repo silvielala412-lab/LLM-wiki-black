@@ -9,6 +9,7 @@ import { normalizePath, isAbsolutePath } from "@/lib/path-utils"
 
 interface CacheEntry {
   hash: string
+  pipelineVersion?: string
   timestamp: number
   filesWritten: string[]
 }
@@ -16,6 +17,8 @@ interface CacheEntry {
 interface CacheData {
   entries: Record<string, CacheEntry> // keyed by source filename
 }
+
+const INGEST_PIPELINE_VERSION = "schema-driven-candidates-v1"
 
 async function sha256(content: string): Promise<string> {
   if (!globalThis.crypto?.subtle) {
@@ -83,6 +86,7 @@ export async function checkIngestCache(
   if (!entry) return null
 
   const currentHash = await sha256(sourceContent)
+  if (entry.pipelineVersion !== INGEST_PIPELINE_VERSION) return null
   if (entry.hash !== currentHash) return null
 
   const pp = normalizePath(projectPath)
@@ -121,6 +125,7 @@ export async function saveIngestCache(
   const newEntries = { ...cache.entries }
   newEntries[sourceFileName] = {
     hash,
+    pipelineVersion: INGEST_PIPELINE_VERSION,
     timestamp: Date.now(),
     filesWritten,
   }
