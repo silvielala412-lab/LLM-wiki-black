@@ -112,6 +112,22 @@ const FIELD_ALIASES: Record<string, Record<string, string[]>> = {
     response_strategy: ["strategy", "应对策略"],
     response_script: ["script", "应对话术"],
   },
+  success_case: {
+    customer_profile_brief: ["customer_profile", "客户画像", "客户背景"],
+    product_or_combo_sold: ["product", "service", "关联产品", "关联服务"],
+    approach_summary: ["approach", "服务路径", "销售路径", "核心做法"],
+    key_moments: ["turning_points", "关键转折", "关键时刻"],
+  },
+  customer_voice: {
+    raw_text: ["客户原话", "客户反馈", "反馈原文"],
+    context: ["场景", "情境", "上下文"],
+    related_persona: ["客户画像", "关联画像"],
+  },
+  compliance_rule: {
+    rule_name: ["name", "规则名称", "合规规则"],
+    rule_content: ["content", "规则内容", "合规说明"],
+    risk_type: ["risk", "风险类型"],
+  },
 }
 
 const SOURCE_TYPE_WEIGHTS: Record<string, number> = {
@@ -228,6 +244,42 @@ export const INSURANCE_SCHEMA_REGISTRY: InsuranceEntitySchemaSpec[] = [
       f("immutable", "不可改写", "固定 true。", "critical"),
     ],
     relationHints: ["related_product 用 describes 或 applies_to"],
+  },
+  {
+    schemaKey: "insurance.product.ServiceBenefit",
+    label: "服务权益",
+    domain: "product",
+    entityType: "service_benefit",
+    universalType: "entity",
+    purpose: "保险产品附带或独立配置的服务权益，是保单服务、客户经营和销售价值表达的重要产品知识。",
+    fields: [
+      f("service_name", "服务名称", "官方或材料中的服务/权益名称。", "critical"),
+      f("related_product", "关联产品/计划", "服务权益归属的产品、健康服务计划或权益包。", "critical"),
+      f("service_category", "服务类别", "家庭医生/问诊/就医协助/住院照护/康复/海外医疗等。", "critical"),
+      f("core_value", "核心价值", "这项服务解决客户什么问题。", "critical"),
+      f("eligible_customers", "适用对象", "可使用服务的人群、保单/产品条件、权益人范围。", "high_confidence"),
+      f("service_frequency", "服务次数", "不限次、每年N次、首年每人N次、服务期内N次等。", "high_confidence"),
+      f("application_process", "申请/使用流程", "入口、申请步骤、预约/响应方式。", "high_confidence"),
+      f("time_limits", "响应/完成时效", "T+N、工作日、服务窗口、有效期等。", "high_confidence"),
+      f("service_provider", "服务提供方", "平安健康、北医医院管理等实际服务方。", "high_confidence"),
+      f("coverage_scope", "覆盖范围", "地区、医院、服务内容边界、是否线上/线下。", "high_confidence"),
+      f("service_limits", "使用限制", "不适用情形、非共享、等待期、次数限制等。", "high_confidence"),
+      f("compliance_notes", "合规提醒", "免责、不保证、不等同保险责任或诊疗承诺等。", "high_confidence"),
+      f("customer_scenarios", "客户使用场景", "哪些客户/业务阶段适合讲这项服务。", "recommended"),
+      f("related_methods", "关联销售方法", "可关联的话术、异议处理或服务经营方法。", "recommended"),
+      f("knowledge_gaps", "待补全信息", "材料未提供但业务需要补齐的字段。", "recommended"),
+    ],
+    relationHints: [
+      "related_product 用 has_part 或 applies_to",
+      "Compliance.ComplianceRule 用 governed_by",
+      "Method.Pitch / ObjectionHandling 用 supports 或 used_by_pitch",
+      "Cases.SuccessCase 用 supported_by",
+    ],
+    lintRules: [
+      "service_name 和 related_product 缺失时不能进入 active。",
+      "服务次数、适用对象、使用限制、合规提醒至少应有一类明确证据。",
+      "服务权益不能被描述为保险金责任。",
+    ],
   },
   {
     schemaKey: "insurance.customer.Persona",
@@ -479,6 +531,89 @@ export const INSURANCE_SCHEMA_REGISTRY: InsuranceEntitySchemaSpec[] = [
     ],
     relationHints: ["Persona 用 applies_to", "SellingScenario 用 supports", "Compliance.Rule 用 governed_by"],
   },
+  {
+    schemaKey: "insurance.cases.SuccessCase",
+    label: "成交/服务成功案例",
+    domain: "cases",
+    entityType: "success_case",
+    universalType: "case",
+    purpose: "真实发生且可复用的成功案例，沉淀客户背景、关键动作、结果和可复制经验。",
+    fields: [
+      f("customer_profile_brief", "客户画像简述", "脱敏后的客户年龄、地区、家庭/健康/财富背景。", "critical"),
+      f("product_or_combo_sold", "关联产品/服务", "成交或服务案例中涉及的产品、服务权益或组合。", "critical"),
+      f("premium_amount_band", "保费区间", "如涉及成交，脱敏到区间；没有则 null。", "critical"),
+      f("approach_summary", "核心做法", "代理人或服务团队的关键做法。", "critical"),
+      f("key_moments", "关键转折点", "案例中最有复用价值的转折。", "critical"),
+      f("life_stage_at_time", "当时生命周期阶段", "如疾病疑似确诊、治疗期、家庭责任高峰等。", "high_confidence"),
+      f("background_context", "背景情境", "客户问题、触发事件、时间/地点。", "high_confidence"),
+      f("first_contact_to_close_duration", "推进周期", "从首次接触/服务触发到结果的时间。", "high_confidence"),
+      f("difficulty_level", "难度评估", "顺水推舟/常规/挑战/极难。", "high_confidence"),
+      f("related_personas", "关联画像", "可匹配的客户画像。", "high_confidence"),
+      f("related_scenarios", "关联场景", "关联的服务经营、促成、转介绍等场景。", "high_confidence"),
+      f("related_pitches", "关联话术", "案例中可复用的话术或解释。", "recommended"),
+      f("related_objections", "处理过的异议", "案例中客户提出过的问题或异议。", "recommended"),
+      f("related_assets", "使用素材", "如海报、说明页、QA、服务手册。", "recommended"),
+      f("lessons_learned", "经验教训", "对代理人/服务人员可复用的经验。", "recommended"),
+      f("knowledge_gaps", "待补全信息", "缺失但影响复用的信息。", "recommended"),
+    ],
+    relationHints: [
+      "Product/ServiceBenefit 用 applies_to 或 supported_by",
+      "Method.SalesPath/Pitch/ObjectionHandling 用 supports",
+      "Customer.Persona 用 applies_to",
+      "Compliance.Rule 用 governed_by",
+    ],
+  },
+  {
+    schemaKey: "insurance.cases.CustomerVoice",
+    label: "客户原声",
+    domain: "cases",
+    entityType: "customer_voice",
+    universalType: "data",
+    purpose: "来自客户的真实反馈、表达或原话，是异议库、需求库和画像库的证据来源。",
+    fields: [
+      f("voice_type", "原声类型", "正面认可/犹豫/异议/拒绝/转介绍意愿/投诉/咨询。", "critical"),
+      f("raw_text", "原话/反馈", "脱敏后的客户原话或尽量贴近原文的转述。", "critical"),
+      f("context", "发生情境", "客户在什么场景下说出这句话。", "critical"),
+      f("related_persona", "关联画像", "客户对应的画像或人群。", "high_confidence"),
+      f("capture_date", "捕获日期", "材料提供则抽取。", "high_confidence"),
+      f("emotional_tone", "情绪基调", "认可/焦虑/怀疑/感谢/抗拒等。", "high_confidence"),
+      f("is_verbatim", "是否逐字记录", "true/false/unknown。", "high_confidence"),
+      f("what_triggered_it", "触发原因", "是什么服务、话术或事件触发了反馈。", "recommended"),
+      f("agent_response_at_time", "当时回应", "代理人/服务人员如何回应。", "recommended"),
+      f("subsequent_outcome", "后续结果", "成交、继续服务、拒绝、转介绍等。", "recommended"),
+      f("related_objection", "关联异议", "如果是异议，链接到 ObjectionHandling。", "recommended"),
+    ],
+    relationHints: [
+      "ObjectionHandling 用 has_evidence",
+      "SuccessCase 用 supported_by",
+      "Persona 用 applies_to",
+      "Product/ServiceBenefit 用 applies_to",
+    ],
+  },
+  {
+    schemaKey: "insurance.compliance.ComplianceRule",
+    label: "合规与风险规则",
+    domain: "compliance",
+    entityType: "compliance_rule",
+    universalType: "rule",
+    purpose: "销售、宣传、服务说明中必须遵守的合规边界和风险提示。",
+    fields: [
+      f("rule_name", "规则名称", "规则或风险点名称。", "critical"),
+      f("rule_content", "规则内容", "禁止、限制、必须说明或免责内容。", "critical"),
+      f("risk_type", "风险类型", "收益承诺/服务承诺/医疗诊断/隐私/误导宣传等。", "critical"),
+      f("applicable_entities", "适用对象", "适用的产品、服务、话术、素材或场景。", "high_confidence"),
+      f("prohibited_wording", "禁用表达", "保证、一定、承诺等具体风险表达。", "high_confidence"),
+      f("required_disclaimer", "必要声明", "对外说明中必须补充的免责或边界。", "high_confidence"),
+      f("review_required", "是否需要审核", "true/false/conditional。", "high_confidence"),
+      f("source_basis", "来源依据", "来自条款、手册、监管文件或总部材料。", "recommended"),
+      f("knowledge_gaps", "待补全信息", "缺失的合规来源或审核口径。", "recommended"),
+    ],
+    relationHints: [
+      "Product/ServiceBenefit 用 governs 或 governed_by",
+      "Method.Pitch/ObjectionHandling 用 governs",
+      "Content.Asset 用 governs",
+    ],
+  },
 ]
 
 const importanceLabel: Record<FieldImportance, string> = {
@@ -525,7 +660,7 @@ export function renderInsuranceSchemaRegistryPrompt(): string {
   }
 
   lines.push("## Deferred domains")
-  lines.push("Content、Activity、Cases、Compliance can use the same pattern, but the first demo should prioritize Product + Customer + Method. If these domains appear, classify them correctly and create conservative attributes rather than forcing them into product/customer/method.")
+  lines.push("Content、Activity can use the same pattern and remain conservative for this demo. Cases and Compliance are enabled for service cases, customer voice, and risk/disclaimer extraction; do not force those facts into Product.")
   return lines.join("\n")
 }
 
@@ -660,9 +795,10 @@ export function inferSourceTypeFromSourceName(sourceName = ""): string {
   if (!name) return "unknown"
   if (/监管|批复|备案|条款|合同|费率|投保提示|健康告知|regulatory|clause|terms/.test(name)) return "regulatory_doc"
   if (/说明书|产品手册|product.*manual|manual/.test(name)) return "product_manual"
-  if (/服务手册|服务权益|家医|绿通|service/.test(name)) return "service_manual"
-  if (/宣传|海报|折页|单页|marketing|poster|brochure/.test(name)) return "official_marketing"
+  if (/案例|客户故事|服务故事|case/.test(name)) return "agent_experience"
   if (/话术|销售|培训|训练|异议|qa|q&a|问答/.test(name)) return "sales_training"
+  if (/宣传|海报|折页|单页|marketing|poster|brochure/.test(name)) return "official_marketing"
+  if (/服务手册|服务权益|家医|绿通|service/.test(name)) return "service_manual"
   if (/\.(png|jpe?g|webp|bmp|tiff?)$/i.test(name)) return "ocr_image"
   return "unknown"
 }

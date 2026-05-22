@@ -288,21 +288,33 @@ function detectSourceSignals(sourceContent: string): { kind: string; expectedIte
   const serviceItems = [
     "家庭医生服务", "在线问诊", "音视频问诊", "名医大咖", "特色体检", "21天社群训练营", "门诊预约协助", "就医陪诊",
     "重疾专案管理", "专家会诊", "国内住院安排协助", "手术安排协助", "住院照护", "上门护理", "服务激活流程",
-    "服务中止规则", "服务终止规则", "重疾服务等待期与非共享规则", "合规免责说明",
+    "服务中止规则", "服务终止规则", "重疾服务等待期与非共享规则", "合规免责说明", "检查安排协助", "手术安排协助",
+    "康复门诊协助", "康复住院协助", "海外远程书面咨询", "海外重疾住院安排协助", "出院安排协助", "上门护理", "PET-CT",
   ].filter((item) => sourceContent.includes(item))
   const tableLikeRowCount = sourceContent.split(/\r?\n/).filter((line) =>
     /(\|\s*[^|]+\s*\|)|(^\s*\d+[\.、]\s+)|(\bY\b|\bN\b|是|否|1\*?)/.test(line),
   ).length
-  const kind = serviceItems.length >= 6
+  const isQa = /(Q&A|QA|问答|常见问题|问：|答：|客户问|客户答|如何解释|怎么解释)/i.test(sourceContent)
+  const isCase = /(服务案例|客户案例|成交案例|案例背景|关键转折|客户原声|客户反馈|后续结果)/i.test(sourceContent)
+  const kind = isCase
+    ? "service_case"
+    : isQa
+      ? "service_qa"
+      : serviceItems.length >= 6
     ? "service_manual"
     : tableLikeRowCount >= 20
       ? "table_or_catalog"
       : sourceContent.length > 50000
         ? "long_document"
         : "standard_document"
+  const expectedItemCount = kind === "service_manual" || kind === "service_qa"
+    ? serviceItems.length
+    : kind === "service_case"
+      ? Math.max(1, Math.min(serviceItems.length, 4))
+      : Math.max(serviceItems.length, tableLikeRowCount >= 20 ? tableLikeRowCount : 0)
   return {
     kind,
-    expectedItemCount: Math.max(serviceItems.length, tableLikeRowCount >= 20 ? tableLikeRowCount : 0),
+    expectedItemCount,
     detectedItems: serviceItems,
     tableLikeRowCount,
   }

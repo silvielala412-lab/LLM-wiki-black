@@ -103,6 +103,9 @@ type SchemaCandidateKind =
   | "selling_scenario"
   | "pitch"
   | "objection_handling"
+  | "success_case"
+  | "customer_voice"
+  | "sales_path"
   | "asset"
   | "source_inventory"
 
@@ -118,10 +121,12 @@ interface SchemaDrivenCandidate {
   sourceLines: string[]
 }
 
-type UniversalTypeForCandidate = "entity" | "concept" | "process" | "rule" | "data" | "source"
+type UniversalTypeForCandidate = "entity" | "concept" | "process" | "rule" | "data" | "source" | "case"
 
 interface SchemaCandidateSignals {
   serviceManual: boolean
+  serviceQa: boolean
+  caseStudy: boolean
   productAccessList: boolean
   productTerms: boolean
   salesMaterial: boolean
@@ -130,6 +135,8 @@ interface SchemaCandidateSignals {
 type DocumentIntentDocType =
   | "service_manual"
   | "service_catalog"
+  | "service_qa"
+  | "service_case"
   | "product_terms"
   | "product_manual"
   | "product_access_list"
@@ -311,6 +318,32 @@ function hasAny(text: string, needles: string[]): boolean {
 
 function detectSchemaCandidateSignals(content: string): SchemaCandidateSignals {
   return {
+    serviceQa: hasAny(content, [
+      "Q&A",
+      "QA",
+      "问答",
+      "常见问题",
+      "客户问",
+      "客户答",
+      "问：",
+      "答：",
+      "Q:",
+      "A:",
+      "如何解释",
+      "怎么解释",
+    ]),
+    caseStudy: hasAny(content, [
+      "案例",
+      "服务案例",
+      "成交案例",
+      "客户案例",
+      "客户原声",
+      "客户反馈",
+      "真实案例",
+      "案例背景",
+      "关键转折",
+      "后续结果",
+    ]),
     serviceManual: hasAny(content, [
       ZH.serviceManual,
       ZH.serviceBenefit,
@@ -395,6 +428,42 @@ function recognizeDocumentIntent(sourceContent: string): DocumentIntent {
   const serviceItems = estimateServiceTableItemCount(sourceContent)
   const productRows = estimateTableLikeRowCount(sourceContent)
 
+  if (signals.caseStudy && !signals.productAccessList) {
+    return {
+      docType: "service_case",
+      primaryDomain: "cases",
+      secondaryDomains: ["product", "method", "customer", "compliance"],
+      splitStrategy: "by_section",
+      estimatedItemCount: Math.max(1, detectedServiceManualNodes(sourceContent).length),
+      targetSchemaKeys: ["insurance.cases.SuccessCase", "insurance.cases.CustomerVoice", "insurance.method.SalesPath", "insurance.product.ServiceBenefit"],
+      coverageUnit: "section",
+      boundaryHints: {
+        headingPatterns: ["^#{1,6}\\s+", "^案例", "^客户"],
+        tableHeaders: ["案例背景", "服务过程", "客户反馈", "亮点"],
+        itemColumnNames: ["案例", "客户", "服务项目", "结果"],
+        rulePatterns: ["免责", "不承诺", "不保证", "仅供参考"],
+      },
+    }
+  }
+
+  if (signals.serviceQa && (signals.serviceManual || serviceItems >= 3) && !signals.productAccessList) {
+    return {
+      docType: "service_qa",
+      primaryDomain: "method",
+      secondaryDomains: ["product", "compliance", "customer"],
+      splitStrategy: serviceItems >= 5 ? "by_table_row_group" : "by_section",
+      estimatedItemCount: Math.max(serviceItems, detectedServiceManualNodes(sourceContent).length),
+      targetSchemaKeys: ["insurance.method.Pitch", "insurance.method.ObjectionHandling", "insurance.product.ServiceBenefit", "insurance.compliance.ComplianceRule"],
+      coverageUnit: serviceItems >= 5 ? "service_item" : "section",
+      boundaryHints: {
+        headingPatterns: ["^#{1,6}\\s+", "^Q\\d+", "^问[:：]"],
+        tableHeaders: ["问题", "回答", "服务项目", "服务次数"],
+        itemColumnNames: ["问题", "服务项目", "权益项目"],
+        rulePatterns: ["免责", "不承诺", "不保证", "超出", "转机构", "不得"],
+      },
+    }
+  }
+
   if (signals.serviceManual || serviceItems >= 5) {
     return {
       docType: serviceItems >= 5 ? "service_catalog" : "service_manual",
@@ -402,7 +471,7 @@ function recognizeDocumentIntent(sourceContent: string): DocumentIntent {
       secondaryDomains: ["compliance", "method"],
       splitStrategy: serviceItems >= 5 ? "by_table_row_group" : "by_section",
       estimatedItemCount: Math.max(serviceItems, detectedServiceManualNodes(sourceContent).length),
-      targetSchemaKeys: ["insurance.product.Product", "insurance.product.SellingPoint"],
+      targetSchemaKeys: ["insurance.product.Product", "insurance.product.ServiceBenefit", "insurance.product.SellingPoint"],
       coverageUnit: serviceItems >= 5 ? "service_item" : "section",
       boundaryHints: {
         headingPatterns: ["^#{1,6}\\s+", "^第[一二三四五六七八九十0-9]+[章节部分]"],
@@ -520,8 +589,10 @@ function buildServiceTableBatches(sourceContent: string, intent: DocumentIntent)
       title: activeTitle,
       text: activeRows.join("\n"),
       sourcePages: activePage > 0 ? [activePage] : pagesInText(activeRows.join("\n")),
-      targetSchemaKeys: ["insurance.product.SellingPoint"],
-      expectedCandidateTypes: ["service_benefit", "rule", "process", "compliance_rule"],
+      targetSchemaKeys: intent.targetSchemaKeys.length > 0 ? intent.targetSchemaKeys : ["insurance.product.ServiceBenefit"],
+      expectedCandidateTypes: intent.docType === "service_qa"
+        ? ["service_benefit", "pitch", "objection_handling", "rule", "compliance_rule"]
+        : ["service_benefit", "rule", "process", "compliance_rule"],
     })
     activeRows = []
     seenHeader = false
@@ -578,7 +649,7 @@ function buildSectionBatches(sourceContent: string, intent: DocumentIntent): Sma
       text,
       sourcePages: currentPage > 0 ? [currentPage] : pagesInText(text),
       targetSchemaKeys: intent.targetSchemaKeys,
-      expectedCandidateTypes: intent.docType === "product_terms" ? ["coverage_rule", "rule", "compliance_rule"] : ["service_benefit", "process", "rule", "compliance_rule"],
+      expectedCandidateTypes: expectedCandidateTypesForIntent(intent),
     })
   }
 
@@ -611,8 +682,15 @@ function buildPageBatches(sourceContent: string, intent: DocumentIntent): SmartI
     text,
     sourcePages: pagesInText(text),
     targetSchemaKeys: intent.targetSchemaKeys,
-    expectedCandidateTypes: ["service_benefit", "process", "rule", "compliance_rule"],
+    expectedCandidateTypes: expectedCandidateTypesForIntent(intent),
   }))
+}
+
+function expectedCandidateTypesForIntent(intent: DocumentIntent): SchemaCandidateKind[] {
+  if (intent.docType === "product_terms") return ["coverage_rule", "rule", "compliance_rule"]
+  if (intent.docType === "service_qa") return ["service_benefit", "pitch", "objection_handling", "rule", "compliance_rule"]
+  if (intent.docType === "service_case" || intent.docType === "case_study") return ["success_case", "customer_voice", "sales_path", "service_benefit", "compliance_rule"]
+  return ["service_benefit", "process", "rule", "compliance_rule"]
 }
 
 function buildSmartIngestPlan(sourceContent: string): SmartIngestPlan {
@@ -758,6 +836,26 @@ function inferCandidateKind(
   signals: SchemaCandidateSignals,
 ): Pick<SchemaDrivenCandidate, "knowledgeDomain" | "entityType" | "universalType" | "required" | "reason" | "confidence"> | null {
   const context = `${sectionPath.join(" ")} ${line} ${title}`
+  if (signals.caseStudy && hasAny(context, ["案例", "服务案例", "客户案例", "服务经过", "关键转折", "后续结果", "亮点"])) {
+    return {
+      knowledgeDomain: "cases",
+      entityType: "success_case",
+      universalType: "case",
+      required: true,
+      confidence: 0.88,
+      reason: "Customer/service case narrative detected.",
+    }
+  }
+  if (signals.caseStudy && hasAny(context, ["客户原声", "客户反馈", "客户说", "表示", "评价", "感谢", "认可"])) {
+    return {
+      knowledgeDomain: "cases",
+      entityType: "customer_voice",
+      universalType: "data",
+      required: true,
+      confidence: 0.82,
+      reason: "Customer voice or feedback detected in a case source.",
+    }
+  }
   if (hasAny(context, COMPLIANCE_LIKE_KEYWORDS)) {
     return {
       knowledgeDomain: "compliance",
@@ -786,6 +884,16 @@ function inferCandidateKind(
       required: true,
       confidence: 0.82,
       reason: "Sales explanation, QA, or reusable pitch guidance detected.",
+    }
+  }
+  if (signals.serviceQa && hasAny(context, ["问题", "回答", "Q", "A", "怎么用", "如何使用", "怎么办", "能否", "是否"])) {
+    return {
+      knowledgeDomain: "method",
+      entityType: "pitch",
+      universalType: "process",
+      required: true,
+      confidence: 0.78,
+      reason: "Service QA answer can be reused as customer-facing explanation.",
     }
   }
   if (hasAny(context, PROCESS_LIKE_KEYWORDS)) {
@@ -992,6 +1100,56 @@ function extractSchemaDrivenCandidates(sourceContent: string, plan = buildSmartI
   const sectionPath: string[] = []
   const lines = sourceContent.split(/\r?\n/)
 
+  if (plan.intent.docType === "service_case" || plan.intent.docType === "case_study") {
+    candidates.set("case.service_case_review", {
+      title: "服务案例复盘",
+      aliases: ["服务案例", "客户案例"],
+      knowledgeDomain: "cases",
+      entityType: "success_case",
+      universalType: "case",
+      required: true,
+      confidence: 0.9,
+      reason: "Case-oriented source must create a Cases.SuccessCase page instead of only updating product pages.",
+      sourceLines: [],
+    })
+    candidates.set("case.customer_voice", {
+      title: "客户服务体验反馈",
+      aliases: ["客户反馈", "客户原声"],
+      knowledgeDomain: "cases",
+      entityType: "customer_voice",
+      universalType: "data",
+      required: false,
+      confidence: 0.78,
+      reason: "Case source may contain customer voice or reusable feedback evidence.",
+      sourceLines: [],
+    })
+  }
+
+  if (plan.intent.docType === "service_qa") {
+    candidates.set("method.service_qa_pitch", {
+      title: "服务问答解释话术",
+      aliases: ["服务QA", "常见问题解释"],
+      knowledgeDomain: "method",
+      entityType: "pitch",
+      universalType: "process",
+      required: true,
+      confidence: 0.86,
+      reason: "Service QA should be reusable as customer-facing explanation and sales enablement.",
+      sourceLines: [],
+    })
+    candidates.set("method.service_boundary_objection", {
+      title: "服务边界异议处理",
+      aliases: ["服务限制说明", "免责说明异议"],
+      knowledgeDomain: "method",
+      entityType: "objection_handling",
+      universalType: "process",
+      required: true,
+      confidence: 0.82,
+      reason: "Service QA often includes customer concerns about availability, limits, and responsibility boundaries.",
+      sourceLines: [],
+    })
+  }
+
   for (const batch of plan.batches) {
     if (batch.batchType === "service_table") {
       addServiceTableCandidates(candidates, batch.text.split(/\r?\n/), signals)
@@ -1079,7 +1237,7 @@ function buildSchemaCandidateManifest(candidates: SchemaDrivenCandidate[], plan?
     "The system pre-scanned the source and found reusable knowledge candidates. Treat this manifest as a coverage contract, not as optional suggestions.",
     "For every REQUIRED candidate, either generate a dedicated page or create a REVIEW missing-page item explaining why the source evidence is insufficient.",
     "Do not collapse many required service/rule/process candidates into one generic page.",
-    "Domain routing: service_benefit -> product; rule/process for service eligibility/activation/limits -> product; compliance_rule -> compliance; pitch/objection_handling/QA sales explanation -> method.",
+    "Domain routing: service_benefit -> product; rule/process for service eligibility/activation/limits -> product; compliance_rule -> compliance; pitch/objection_handling/QA sales explanation -> method; customer/service case narratives -> cases.",
     "Field values such as service frequency, time limits, and yes/no flags are attributes of their parent service/rule, not independent pages.",
     "",
     `Candidate count: ${candidates.length}. Required count: ${required.length}.`,
@@ -1196,6 +1354,8 @@ function buildInsuranceExtractionChecklist(sourceContent: string): string {
   const signals: string[] = []
   if (/(准入|清单|产品代码|主险代码|是否|1\+N|PVMargin|渠道|交期)/i.test(sourceContent)) signals.push("product_access_list")
   if (/(服务手册|服务权益|服务内容|服务流程|预约|申请|次数|有效期|适用对象|不适用|限制|免责)/i.test(sourceContent)) signals.push("service_manual")
+  if (/(Q&A|QA|问答|常见问题|问：|答：|客户问|客户答|如何解释|怎么解释)/i.test(sourceContent)) signals.push("service_qa")
+  if (/(服务案例|客户案例|成交案例|案例背景|关键转折|客户原声|客户反馈|后续结果)/i.test(sourceContent)) signals.push("case_study")
   if (/(投保年龄|等待期|保险责任|责任免除|缴费期间|保障期间|基本保险金额|理赔|核保|健康告知)/i.test(sourceContent)) signals.push("product_terms")
   if (/(宣传|海报|卖点|客户|场景|话术|异议|促成|转介绍|邀约|面访)/i.test(sourceContent)) signals.push("sales_material")
   const detected = signals.length > 0 ? signals.join(", ") : "general_insurance_source"
@@ -1223,6 +1383,15 @@ function buildInsuranceExtractionChecklist(sourceContent: string): string {
     "- Extract service name, service category, target product/customer, eligibility, service frequency, time limits, service process, required materials, provider/network, exclusions, disclaimers, customer-facing value, and compliance reminders.",
     "- Split independent services into `service_benefit`, `process`, `limitation`, and `compliance_rule` pages when they have reusable business value.",
     "- A service manual should usually generate many pages, not only one service-plan page. If it contains family doctor, online consultation, famous-doctor, medical appointment, escort, hospitalization, surgery, nursing, rehabilitation, activation, suspension, termination, waiting-period, non-sharing, or disclaimer rules, these must become dedicated nodes or explicit review gaps.",
+    "",
+    "If the source is service QA:",
+    "- Preserve the exact Q/A facts on the source page, but also create reusable Method pages: `pitch` for customer-facing explanation and `objection_handling` for concerns about limits, availability, responsibility boundaries, or service value.",
+    "- Keep service definitions and service limits linked back to Product/service_benefit and Compliance/compliance_rule pages.",
+    "",
+    "If the source is a service/customer case:",
+    "- Create at least one Cases `success_case` or `failure_case` page when the case contains a customer, service journey, result, or lesson.",
+    "- Extract customer profile, trigger event, service path, key moments, outcome, lessons learned, customer voice, and linked Product/Method/Compliance nodes.",
+    "- Do not force a case-only source into only the product page.",
     "",
     "If the source is product terms or a product brochure:",
     "- Extract positioning, product category, status, effective date, regulatory filing number if present, age range, waiting period, payment periods, coverage periods, responsibilities, exclusions, claim trigger, underwriting basics, service packages, selling points, and compliance limits.",
@@ -3042,7 +3211,7 @@ function buildCandidateBackfillPrompt(sourceFileName: string, preparedSource: Pr
     "Required behavior:",
     "- Create one page per candidate unless the evidence is clearly insufficient.",
     "- Do not merge multiple service benefits, process rules, or compliance rules into a single generic page.",
-    "- Respect candidate domain routing exactly: service benefits stay in product; customer-facing explanation/QA/pitch/objection handling goes to method; disclaimers/prohibited promises/compliance warnings go to compliance.",
+    "- Respect candidate domain routing exactly: service benefits stay in product; customer-facing explanation/QA/pitch/objection handling goes to method; customer/service case narratives and customer voice go to cases; disclaimers/prohibited promises/compliance warnings go to compliance.",
     "- Do not create standalone pages for field values such as 家庭不限次、首年每人 1 次、T+2 个工作日. Put these values under attributes on the related service/rule page.",
     "- Fill universal frontmatter plus entity-specific attributes. Put missing extension fields into attributes.knowledge_gaps and a visible knowledge-gap section.",
     "- Every page body must include visible business content, not only frontmatter.",
@@ -3054,8 +3223,8 @@ function buildCandidateBackfillPrompt(sourceFileName: string, preparedSource: Pr
     "industry: insurance",
     "knowledge_domain: product | customer | method | content | activity | cases | compliance | general",
     "domain: same as knowledge_domain",
-    "type: entity | concept | process | rule | data",
-    "entity_type: service_benefit | process | rule | compliance_rule | coverage_rule | product | persona | pitch | objection_handling",
+    "type: entity | concept | process | rule | data | case",
+    "entity_type: service_benefit | process | rule | compliance_rule | coverage_rule | product | persona | pitch | objection_handling | success_case | customer_voice | sales_path",
     "business_phase: service | conversion | signing | general",
     "dedup_key: stable key",
     "title: human-readable title",
@@ -3693,12 +3862,15 @@ export function buildGenerationPrompt(schema: string, purpose: string, index: st
     "- Service process pages should use `type: process`; service limitation/waiting-period/non-sharing pages should use `type: rule`; disclaimer pages should use `knowledge_domain: compliance` and `entity_type: compliance_rule`.",
     "- For product terms, do not collapse responsibilities/exclusions/rules into a single summary. Extract age range, waiting period, payment period, coverage period, claim trigger, responsibility amounts, exclusions, underwriting basics, service packages, and official caveats separately.",
     "- For sales/customer/method content, extract target personas, lifecycle triggers, customer signals, scenario, business phase, pitch, objection handling, content assets, and compliance-sensitive wording separately.",
+    "- For service QA sources, generate Method pages for customer-facing explanation and objection handling when the source contains reusable answers. Keep Product service benefits and Compliance rules as separate linked pages.",
+    "- For service/customer case sources, generate Cases pages (`success_case`, `customer_voice`, or `failure_case`) when the source contains customer background, service journey, key moments, outcome, or lessons. Do not only update the Product page.",
     "- Every entity page should include an `证据摘录` or `来源依据` section with 3-8 concrete source-backed facts when available. Do not rely only on frontmatter claims.",
     "- If a field is absent in the source, do not invent it. Put it under visible `待补全信息` and in `attributes.knowledge_gaps`.",
     "- Add REVIEW missing-page items when the source implies a reusable Product/Customer/Method/Compliance concept but there is not enough evidence to create a full page.",
     "- For Product pages, visible body sections should include 产品定位、基础规则、核心保障/权益、适配客户、销售方法关联、合规提醒、待补全信息 when available.",
     "- For Persona pages, visible body sections should include 画像定义、识别信号、核心痛点、适配产品/场景、典型异议、销售切入建议、待补全信息 when available.",
     "- For Method pages, visible body sections should include 使用场景、适用客户、核心逻辑、推荐话术/步骤、注意事项、关联产品/证据、待补全信息 when available.",
+    "- For Cases pages, visible body sections should include 案例背景、客户画像、触发事件、服务/销售路径、关键转折、结果、可复用经验、关联产品/方法、合规提醒、来源依据、待补全信息 when available.",
     "- Follow the analysis recommendations on what to emphasize",
     "- If the analysis found connections to existing pages, add cross-references",
     "",
