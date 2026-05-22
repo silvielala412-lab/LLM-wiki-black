@@ -1,8 +1,9 @@
-import { readFile, writeFile } from "@/commands/fs"
+import { fileExists, readFile, writeFile } from "@/commands/fs"
 import { autoIngest } from "./ingest"
 import { useWikiStore } from "@/stores/wiki-store"
 import { normalizePath, isAbsolutePath } from "@/lib/path-utils"
 import { getProjectPathById } from "@/lib/project-identity"
+import { checkIngestCache } from "@/lib/ingest-cache"
 
 // ── Types ─────────────────────────────────────────────────────────────────
 
@@ -81,6 +82,41 @@ function generateId(): string {
 
 function sourceExtension(sourcePath: string): string {
   return sourcePath.split("?")[0]?.split(".").pop()?.toLowerCase() ?? ""
+}
+
+function sourceFileName(sourcePath: string): string {
+  return sourcePath.replace(/\\/g, "/").split("/").pop() ?? sourcePath
+}
+
+async function readSourceContentForCache(sourceFullPath: string): Promise<string> {
+  const ext = sourceExtension(sourceFullPath)
+  if (["png", "jpg", "jpeg", "webp", "gif", "bmp", "tiff", "tif", "pdf"].includes(ext)) {
+    const { readFileAsBase64 } = await import("@/commands/fs")
+    return await readFileAsBase64(sourceFullPath)
+  }
+  return await readFile(sourceFullPath)
+}
+
+async function taskAlreadyCompleted(projectPath: string, task: IngestTask): Promise<boolean> {
+  const pp = normalizePath(projectPath)
+  const fullSourcePath = isAbsolutePath(task.sourcePath)
+    ? normalizePath(task.sourcePath)
+    : `${pp}/${task.sourcePath}`
+  try {
+    const sourceContent = await readSourceContentForCache(fullSourcePath)
+    const cached = await checkIngestCache(pp, sourceFileName(task.sourcePath), sourceContent)
+    if (cached !== null) return true
+  } catch {
+    // Fall through to source-summary existence check.
+  }
+
+  const summaryName = sourceFileName(task.sourcePath).replace(/\.[^.]+$/, "")
+  const summaryPath = `${pp}/wiki/sources/${summaryName}.md`
+  try {
+    return await fileExists(summaryPath)
+  } catch {
+    return false
+  }
 }
 
 function ingestPriority(sourcePath: string): number {
@@ -415,14 +451,24 @@ export async function restoreQueue(
     }
   }
 
-  queue = orderTasksForProcessing(mine)
+  const resumable: IngestTask[] = []
+  let completed = 0
+  for (const task of mine) {
+    if (await taskAlreadyCompleted(pp, task)) {
+      completed++
+      continue
+    }
+    resumable.push(task)
+  }
+
+  queue = orderTasksForProcessing(resumable)
   await saveQueue(pp)
 
   const pending = queue.filter((t) => t.status === "pending").length
   const failed = queue.filter((t) => t.status === "failed").length
 
   if (pending > 0 || restored > 0) {
-    console.log(`[Ingest Queue] Restored: ${pending} pending, ${failed} failed, ${restored} resumed from interrupted`)
+    console.log(`[Ingest Queue] Restored: ${pending} pending, ${failed} failed, ${restored} resumed from interrupted, ${completed} already completed`)
     processNext(projectId)
   }
 }
