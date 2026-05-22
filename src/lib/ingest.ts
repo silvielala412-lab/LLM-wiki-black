@@ -11,6 +11,7 @@ import { normalizeSchemaFrontmatter, shouldNormalizeKnowledgePage } from "@/lib/
 import { cleanupKnowledgeFrontmatter } from "@/lib/knowledge-frontmatter-cleanup"
 import { checkIngestCache, saveIngestCache } from "@/lib/ingest-cache"
 import { withProjectLock } from "@/lib/project-mutex"
+import { writeExtractionQualityAudit } from "@/lib/extraction-quality-audit"
 import {
   extractAndSaveSourceImages,
   buildImageMarkdownSection,
@@ -2501,9 +2502,20 @@ async function autoIngestImpl(
     }
   }
 
+  let extractionAuditReviewItems: Omit<ReviewItem, "id" | "resolved" | "createdAt">[] = []
   if (!signal?.aborted) {
     await preserveOcrDetailsInSourcePage(sourceSummaryFullPath, sourceContent, sourceOrigin)
     await preserveSchemaCandidateAuditInSourcePage(sourceSummaryFullPath, schemaCandidates, schemaBackfill.missingAfterBackfill, pp)
+    const audit = await writeExtractionQualityAudit({
+      projectPath: pp,
+      sourceFileName: fileName,
+      sourceContent,
+      writtenPaths,
+      missingCandidates: schemaBackfill.missingAfterBackfill,
+      preparedSource,
+    })
+    if (audit.auditPath && !writtenPaths.includes(audit.auditPath)) writtenPaths.push(audit.auditPath)
+    extractionAuditReviewItems = audit.reviewItems
   }
 
   // ── Step 3.5: Append extracted images to the source-summary page ─
@@ -2530,6 +2542,7 @@ async function autoIngestImpl(
     ...(await buildMissingLinkReviewItems(pp)),
     ...buildSchemaCandidateCoverageReviewItems(schemaBackfill.missingAfterBackfill, writtenPaths, sp),
     ...(await buildServiceManualCoverageReviewItems(pp, sourceContent, writtenPaths, sp)),
+    ...extractionAuditReviewItems,
   ]
   const reviewItems = [
     ...parseReviewBlocks(generation, sp),
@@ -3626,6 +3639,7 @@ export function buildGenerationPrompt(schema: string, purpose: string, index: st
     "- Relation rule: `recommended_for` only points to customer personas, life stages, or customer signals. Product-to-product pairing must use `complements` or `bundled_with`. Product/service composition must use `has_part`.",
     "- Customer pages must link back to suitable Product pages with `has_recommendation`, not `recommended_for`.",
     "- Use the Insurance Schema Registry to choose a schema_key, then fill `attributes` with the entity-specific extension fields. Put unavailable fields as null or [] and mention important missing fields in `attributes.knowledge_gaps`.",
+    "- Attribute key rule: use canonical English field names from the Insurance Schema Registry. If the source says 服务对象/适用客户, map it to the matching registry field such as eligible_customers or target_personas; do not invent parallel keys.",
     "- Keep universal governance status in `status` (candidate/active/superseded/rejected). Put business status such as 在售/已停售 in `attributes.product_status`, never in universal `status`.",
     "- Do not let LLM invent auto_derived metrics such as usage_count, conversion_rate, sales_volume_trend, feedback_score, or average_premium_per_policy. Use null unless supplied by a business system.",
     "- For uploaded documents, keep `status: candidate` by default. Do not mark generated knowledge as active unless the source explicitly says it has been human-approved.",

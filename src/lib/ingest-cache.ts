@@ -18,7 +18,7 @@ interface CacheData {
   entries: Record<string, CacheEntry> // keyed by source filename
 }
 
-const INGEST_PIPELINE_VERSION = "deterministic-field-resolution-v4"
+const INGEST_PIPELINE_VERSION = "extraction-quality-audit-v5"
 
 async function sha256(content: string): Promise<string> {
   if (!globalThis.crypto?.subtle) {

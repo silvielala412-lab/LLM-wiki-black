@@ -3,6 +3,7 @@ import {
   getInsuranceFieldMergePolicy,
   inferSourceTypeFromSourceName,
   inferStableInsuranceDedupKey,
+  normalizeInsuranceAttributes,
   sourceTypeWeight,
 } from "@/lib/insurance-schema-registry"
 import type { ReviewItem } from "@/stores/review-store"
@@ -158,7 +159,7 @@ function parseKnowledgePage(content: string): {
     title: getScalar(frontmatter, "title"),
     entityType: getScalar(frontmatter, "entity_type"),
     dedupKey: getScalar(frontmatter, "dedup_key"),
-    attributes: parseAttributes(getScalar(frontmatter, "attributes")),
+    attributes: normalizeInsuranceAttributes(getScalar(frontmatter, "entity_type"), parseAttributes(getScalar(frontmatter, "attributes"))),
   }
 }
 

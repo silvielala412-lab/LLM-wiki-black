@@ -5,6 +5,8 @@ export interface InsuranceFieldSpec {
   label: string
   note: string
   importance: FieldImportance
+  aliases?: string[]
+  semanticGroup?: string
 }
 
 export interface InsuranceEntitySchemaSpec {
@@ -59,6 +61,57 @@ const DEDUP_KEY_FIELDS: Record<string, string[]> = {
   compliance_rule: ["rule_name", "title"],
   rule: ["rule_name", "title"],
   process: ["process_name", "service_name", "title"],
+}
+
+const FIELD_ALIASES: Record<string, Record<string, string[]>> = {
+  product: {
+    product_name: ["official_product_name", "name", "产品名称", "官方完整名称"],
+    product_code: ["code", "product_id", "产品代码", "产品编号"],
+    product_status: ["status_business", "sale_status", "销售状态", "在售状态"],
+    target_age_range: ["age_range", "insured_age", "投保年龄", "投保年龄范围"],
+    waiting_period_days: ["waiting_period", "等待期", "等待期天数"],
+    payment_period_options: ["payment_period", "缴费期间", "交费期间"],
+    coverage_period_options: ["coverage_period", "保障期间"],
+    core_responsibilities: ["coverage", "responsibilities", "核心保障", "保险责任"],
+    exclusions_official: ["exclusions", "责任免除", "免责条款"],
+    selling_points_official: ["selling_points", "卖点", "官方卖点"],
+  },
+  service_benefit: {
+    service_name: ["name", "title", "服务名称", "权益名称"],
+    related_product: ["product", "适用产品", "关联产品"],
+    service_frequency: ["frequency", "次数", "服务次数", "使用次数"],
+    eligible_customers: ["target_customer", "适用对象", "服务对象", "适用客户"],
+    application_process: ["process", "流程", "申请流程", "服务流程"],
+    service_limits: ["limits", "限制", "使用限制", "服务限制"],
+    compliance_notes: ["disclaimer", "免责", "合规提示", "合规说明"],
+  },
+  persona: {
+    persona_name: ["name", "画像名称", "客户画像"],
+    age_band: ["age_range", "年龄", "年龄段"],
+    family_structure: ["family", "家庭结构"],
+    purchase_signals: ["signals", "购买信号", "客户信号"],
+    typical_pain_points: ["pain_points", "痛点", "客户痛点"],
+    typical_objections: ["objections", "异议", "典型异议"],
+    matching_products: ["recommended_products", "适配产品", "匹配产品"],
+  },
+  selling_scenario: {
+    scenario_name: ["name", "场景名称", "销售场景"],
+    business_phases: ["business_phase", "业务阶段", "业务环节"],
+    target_personas: ["personas", "目标画像", "适用客户"],
+    target_products: ["products", "目标产品", "适用产品"],
+  },
+  pitch: {
+    related_scenario: ["scenario", "关联场景"],
+    pitch_type: ["type", "话术类型"],
+    script: ["话术", "话术原文", "script_text"],
+    core_message: ["核心信息", "核心传递点"],
+  },
+  objection_handling: {
+    objection_raw: ["raw_objection", "客户原话", "异议原话"],
+    objection_category: ["category", "异议类别"],
+    response_strategy: ["strategy", "应对策略"],
+    response_script: ["script", "应对话术"],
+  },
 }
 
 const SOURCE_TYPE_WEIGHTS: Record<string, number> = {
@@ -492,6 +545,37 @@ export function getInsuranceFieldMergePolicy(entityType: string, fieldName: stri
 
 export function getInsuranceFieldImportance(entityType: string, fieldName: string): FieldImportance | undefined {
   return getInsuranceSchemaSpec(entityType)?.fields.find((item) => item.name === fieldName)?.importance
+}
+
+export function getCanonicalInsuranceFieldName(entityType: string, fieldName: string): string {
+  const normalizedEntityType = normalizeToken(entityType)
+  const normalizedField = normalizeToken(fieldName)
+  const spec = getInsuranceSchemaSpec(normalizedEntityType)
+  if (spec?.fields.some((field) => field.name === normalizedField)) return normalizedField
+
+  const aliases = FIELD_ALIASES[normalizedEntityType] ?? {}
+  for (const [canonical, values] of Object.entries(aliases)) {
+    if (values.some((alias) => normalizeToken(alias) === normalizedField)) return canonical
+  }
+  return normalizedField
+}
+
+export function normalizeInsuranceAttributes(
+  entityType: string,
+  attributes: Record<string, unknown>,
+): Record<string, unknown> {
+  const normalized: Record<string, unknown> = {}
+  for (const [field, value] of Object.entries(attributes)) {
+    const canonical = getCanonicalInsuranceFieldName(entityType, field)
+    if (normalized[canonical] === undefined) {
+      normalized[canonical] = value
+    } else if (Array.isArray(normalized[canonical])) {
+      normalized[canonical] = [...normalized[canonical] as unknown[], value]
+    } else {
+      normalized[canonical] = [normalized[canonical], value]
+    }
+  }
+  return normalized
 }
 
 export function inferStableInsuranceDedupKey(input: {
