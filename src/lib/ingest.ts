@@ -61,6 +61,19 @@ function safeCacheName(name: string): string {
   return (base || "source").slice(0, 48)
 }
 
+function sanitizeJsonValue<T>(value: T): T {
+  if (typeof value === "string") {
+    return value.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, "") as T
+  }
+  if (Array.isArray(value)) return value.map((item) => sanitizeJsonValue(item)) as T
+  if (value && typeof value === "object") {
+    const cleaned: Record<string, unknown> = {}
+    for (const [key, item] of Object.entries(value)) cleaned[key] = sanitizeJsonValue(item)
+    return cleaned as T
+  }
+  return value
+}
+
 interface PreparedIngestSource {
   content: string
   originalChars: number
@@ -266,6 +279,7 @@ const GENERIC_CANDIDATE_TITLES = new Set([
   "overview",
   "summary",
   "introduction",
+  "ocr text",
   "\u76ee\u5f55",
   "\u524d\u8a00",
   "\u6982\u8ff0",
@@ -275,6 +289,13 @@ const GENERIC_CANDIDATE_TITLES = new Set([
   "\u8bf4\u660e",
   "\u5b9a\u4e49",
   "\u5e38\u89c1\u95ee\u9898",
+  "\u670d\u52a1\u573a\u666f",
+  "\u670d\u52a1\u9636\u6bb5",
+  "\u670d\u52a1\u9879\u76ee",
+  "\u670d\u52a1\u6b21\u6570",
+  "\u670d\u52a1\u6807\u51c6",
+  "\u670d\u52a1\u5185\u5bb9",
+  "\u542f\u52a8\u6761\u4ef6",
 ])
 
 function hasAny(text: string, needles: string[]): boolean {
@@ -658,7 +679,7 @@ async function persistSmartCompileArtifacts(
         estimatedItemCount: plan.intent.estimatedItemCount,
       },
     }
-    await writeFile(`${dir}/${safeCacheName(sourceFileName)}-compile-candidates.json`, JSON.stringify(payload, null, 2))
+    await writeFile(`${dir}/${safeCacheName(sourceFileName)}-compile-candidates.json`, JSON.stringify(sanitizeJsonValue(payload), null, 2))
   } catch (err) {
     console.warn("[ingest] Failed to persist smart compile artifacts:", err)
   }
@@ -685,11 +706,42 @@ function splitCandidateTitle(raw: string): string[] {
 
 function isUsableCandidateTitle(title: string): boolean {
   if (!title || title.length < 2 || title.length > 40) return false
+  if (/^OCR text extracted from\b/i.test(title)) return false
   if (/^[\d\s.\-_/]+$/.test(title)) return false
   if (/^(第?\d+[章节页]?|page\s*\d+)$/i.test(title)) return false
   if (GENERIC_CANDIDATE_TITLES.has(title.toLowerCase())) return false
   if (/^(true|false|null|yes|no|1|0|n)$/i.test(title)) return false
+  if (isFieldValueOnlyTitle(title)) return false
   return /[\p{L}\p{N}]/u.test(title)
+}
+
+function isFieldValueOnlyTitle(title: string): boolean {
+  const t = normalizeCandidateTitle(title)
+  if (!t) return true
+  if (/^(家庭|每人|首年|年度|服务期内|非共享|不限次|按需|结合客户情况)/.test(t) && /(\d+\s*次|不限次|按需|\/\s*年|年度|服务期内)/.test(t)) return true
+  if (/^(家庭|每人)?\s*\d+\s*次\s*(\(非共享\))?\s*(\/|每)?\s*(年|年度|服务期内)?$/.test(t)) return true
+  if (/^(家庭|每人)?\s*不限次/.test(t)) return true
+  if (/^首年每人\s*\d+\s*次/.test(t)) return true
+  if (/^T\s*\+\s*\d+\s*(个)?(工作|自然)?日$/i.test(t)) return true
+  if (/^\d+\s*[*xX]\s*\d+\s*(小时|h)?/.test(t)) return true
+  if (/^(是|否|有|无|不适用|以实际安排为准)$/.test(t)) return true
+  return false
+}
+
+function tableLineLooksLikeServiceHeader(cells: string[]): boolean {
+  return findHeaderIndex(cells, [ZH.service + "\u9879\u76ee", "\u6743\u76ca\u9879\u76ee", "\u9879\u76ee"]) >= 0 &&
+    findHeaderIndex(cells, [ZH.service + "\u6b21\u6570", ZH.frequency, "\u6b21/\u5e74", "\u6b21"]) >= 0
+}
+
+function shouldScanTableCellAsCandidate(cell: string, line: string, signals: SchemaCandidateSignals): boolean {
+  if (!isUsableCandidateTitle(cell)) return false
+  if (!signals.serviceManual) return true
+  if (isFieldValueOnlyTitle(cell)) return false
+  const context = `${line} ${cell}`
+  if (hasAny(context, COMPLIANCE_LIKE_KEYWORDS)) return true
+  if (hasAny(context, PROCESS_LIKE_KEYWORDS) && cell.length <= 24) return true
+  if (hasAny(context, RULE_LIKE_KEYWORDS) && !hasAny(cell, SERVICE_LIKE_KEYWORDS) && cell.length <= 24) return true
+  return false
 }
 
 function inferCandidateKind(
@@ -707,6 +759,26 @@ function inferCandidateKind(
       required: true,
       confidence: 0.88,
       reason: "Compliance/disclaimer wording detected.",
+    }
+  }
+  if (hasAny(context, [ZH.objection, "\u62d2\u7edd", "\u592a\u8d35", "\u533b\u4fdd", "\u5df2\u7ecf\u6709", "\u7528\u4e0d\u4e0a"])) {
+    return {
+      knowledgeDomain: "method",
+      entityType: "objection_handling",
+      universalType: "process",
+      required: true,
+      confidence: 0.84,
+      reason: "Customer objection or response guidance detected.",
+    }
+  }
+  if (hasAny(context, [ZH.pitch, "\u8bdd\u672f", "\u8bf4\u6cd5", "\u600e\u4e48\u8bf4", "\u5982\u4f55\u89e3\u91ca", "\u5ba2\u6237\u95ee", "\u5ba2\u6237\u7b54", "\u95ee\uff1a", "\u7b54\uff1a", "Q:", "A:"])) {
+    return {
+      knowledgeDomain: "method",
+      entityType: "pitch",
+      universalType: "process",
+      required: true,
+      confidence: 0.82,
+      reason: "Sales explanation, QA, or reusable pitch guidance detected.",
     }
   }
   if (hasAny(context, PROCESS_LIKE_KEYWORDS)) {
@@ -945,7 +1017,9 @@ function extractSchemaDrivenCandidates(sourceContent: string, plan = buildSmartI
 
     if (line.includes("|")) {
       const cells = line.split("|").map(normalizeCandidateTitle).filter(Boolean)
+      if (tableLineLooksLikeServiceHeader(cells)) continue
       for (const cell of cells.slice(0, 8)) {
+        if (!shouldScanTableCellAsCandidate(cell, line, signals)) continue
         addSchemaCandidate(candidates, cell, line, sectionPath, signals)
       }
     }
@@ -998,6 +1072,8 @@ function buildSchemaCandidateManifest(candidates: SchemaDrivenCandidate[], plan?
     "The system pre-scanned the source and found reusable knowledge candidates. Treat this manifest as a coverage contract, not as optional suggestions.",
     "For every REQUIRED candidate, either generate a dedicated page or create a REVIEW missing-page item explaining why the source evidence is insufficient.",
     "Do not collapse many required service/rule/process candidates into one generic page.",
+    "Domain routing: service_benefit -> product; rule/process for service eligibility/activation/limits -> product; compliance_rule -> compliance; pitch/objection_handling/QA sales explanation -> method.",
+    "Field values such as service frequency, time limits, and yes/no flags are attributes of their parent service/rule, not independent pages.",
     "",
     `Candidate count: ${candidates.length}. Required count: ${required.length}.`,
     "",
@@ -2915,6 +2991,8 @@ function buildCandidateBackfillPrompt(sourceFileName: string, preparedSource: Pr
     "Required behavior:",
     "- Create one page per candidate unless the evidence is clearly insufficient.",
     "- Do not merge multiple service benefits, process rules, or compliance rules into a single generic page.",
+    "- Respect candidate domain routing exactly: service benefits stay in product; customer-facing explanation/QA/pitch/objection handling goes to method; disclaimers/prohibited promises/compliance warnings go to compliance.",
+    "- Do not create standalone pages for field values such as 家庭不限次、首年每人 1 次、T+2 个工作日. Put these values under attributes on the related service/rule page.",
     "- Fill universal frontmatter plus entity-specific attributes. Put missing extension fields into attributes.knowledge_gaps and a visible knowledge-gap section.",
     "- Every page body must include visible business content, not only frontmatter.",
     "- Every page must cite the source filename and evidence excerpt.",
