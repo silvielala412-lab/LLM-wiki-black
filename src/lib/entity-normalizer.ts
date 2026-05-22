@@ -20,7 +20,7 @@
  * Scope: only applies to wiki/entities/ and wiki/concepts/
  */
 
-import { listDirectory, readFile, writeFile } from "@/commands/fs"
+import { createDirectory, listDirectory, readFile, writeFile } from "@/commands/fs"
 
 // ── Levenshtein distance (small strings only) ────────────────────────────────
 
@@ -89,6 +89,15 @@ export interface ExistingEntity {
   entityType?: string
   /** Lightweight business signature used for schema-aware deduplication. */
   businessSignature?: string
+  /** Lightweight parent/variant family signature, e.g. rehab service family. */
+  familySignature?: string
+}
+
+export interface VariantFamilyDefinition {
+  signature: string
+  title: string
+  description: string
+  aliases: string[]
 }
 
 /**
@@ -114,6 +123,7 @@ export async function loadExistingEntities(
           name: nameFromPath(relativePath),
           entityType: extractScalar(existingContent, "entity_type"),
           businessSignature: inferBusinessSignature(existingContent, nameFromPath(relativePath)),
+          familySignature: inferVariantFamilySignature(existingContent, nameFromPath(relativePath))?.signature,
         })
       }
     } catch {
@@ -255,6 +265,175 @@ export async function normalizeEntityBlock(
   }
 }
 
+export async function materializeVariantFamilyPages(
+  projectPath: string,
+): Promise<{ writtenPaths: string[]; warnings: string[] }> {
+  const writtenPaths: string[] = []
+  const warnings: string[] = []
+  const entities = await loadExistingEntities(projectPath)
+  const familyMembers = new Map<string, { family: VariantFamilyDefinition; members: ExistingEntity[] }>()
+
+  for (const entity of entities) {
+    if (!entity.relativePath.startsWith("wiki/entities/")) continue
+    const content = await safeRead(entity.fullPath)
+    const family = inferVariantFamilySignature(content, entity.name)
+    if (!family) continue
+    if (!familyMembers.has(family.signature)) familyMembers.set(family.signature, { family, members: [] })
+    familyMembers.get(family.signature)!.members.push(entity)
+  }
+
+  for (const { family, members } of familyMembers.values()) {
+    const uniqueMembers = dedupeBy(members, (member) => member.relativePath)
+    if (uniqueMembers.length < 2) continue
+
+    const conceptPath = `wiki/concepts/${family.title}.md`
+    const conceptFullPath = `${projectPath}/${conceptPath}`
+    const memberLinks = uniqueMembers.map((member) => `[[${member.name}]]`)
+
+    await createDirectory(`${projectPath}/wiki`).catch(() => {})
+    await createDirectory(`${projectPath}/wiki/concepts`).catch(() => {})
+
+    const existingConcept = await safeRead(conceptFullPath)
+    const conceptContent = buildVariantFamilyConcept(family, memberLinks, existingConcept)
+    if (conceptContent !== existingConcept) {
+      await writeFile(conceptFullPath, conceptContent)
+      writtenPaths.push(conceptPath)
+    }
+
+    for (const member of uniqueMembers) {
+      try {
+        const existing = await readFile(member.fullPath)
+        const updated = upsertFamilyRelation(existing, family.title, memberLinks.filter((link) => link !== `[[${member.name}]]`))
+        if (updated !== existing) {
+          await writeFile(member.fullPath, updated)
+          writtenPaths.push(member.relativePath)
+        }
+      } catch (err) {
+        warnings.push(`Could not update variant relation for ${member.relativePath}: ${err instanceof Error ? err.message : String(err)}`)
+      }
+    }
+  }
+
+  return { writtenPaths: dedupeStrings(writtenPaths), warnings }
+}
+
+function buildVariantFamilyConcept(
+  family: VariantFamilyDefinition,
+  memberLinks: string[],
+  existingContent: string,
+): string {
+  const frontmatter = [
+    "---",
+    "schema_version: \"2.1\"",
+    "industry: insurance",
+    "knowledge_domain: product",
+    "domain: product",
+    "type: concept",
+    "entity_type: service_family",
+    `title: "${family.title}"`,
+    `summary: "${family.description}"`,
+    `dedup_key: "${family.signature}"`,
+    `aliases: [${family.aliases.map((alias) => `"${alias}"`).join(", ")}]`,
+    `children: [${memberLinks.map((link) => `"${link.replace(/^\[\[|\]\]$/g, "")}"`).join(", ")}]`,
+    `related: [${memberLinks.map((link) => `"${link.replace(/^\[\[|\]\]$/g, "")}"`).join(", ")}]`,
+    "status: candidate",
+    "needs_review: true",
+    "---",
+    "",
+  ].join("\n")
+
+  const body = [
+    `# ${family.title}`,
+    "",
+    family.description,
+    "",
+    "## 子服务",
+    "",
+    ...memberLinks.map((link) => `- ${link}`),
+    "",
+    "## 建模说明",
+    "",
+    "这些页面不是重复概念，而是同一上位服务族下的不同服务场景或服务步骤。系统保留子服务独立页面，同时通过本页聚合它们的共同业务语义。",
+  ].join("\n")
+
+  if (!existingContent.trim()) return `${frontmatter}${body}\n`
+  return appendSectionIfMissing(existingContent, "## 子服务", body)
+}
+
+function upsertFamilyRelation(content: string, parentTitle: string, siblingLinks: string[]): string {
+  let updated = upsertFrontmatterScalar(content, "parent", parentTitle)
+  updated = upsertFrontmatterList(updated, "related", [parentTitle, ...siblingLinks.map((link) => link.replace(/^\[\[|\]\]$/g, ""))])
+  const section = [
+    "## 概念层级",
+    "",
+    `- 上位概念：[[${parentTitle}]]`,
+    ...siblingLinks.map((link) => `- 同族服务：${link}`),
+  ].join("\n")
+  return appendSectionIfMissing(updated, "## 概念层级", section)
+}
+
+function upsertFrontmatterScalar(content: string, key: string, value: string): string {
+  const fmMatch = content.match(/^---\n([\s\S]*?)\n---/)
+  if (!fmMatch) return `---\n${key}: "${escapeYaml(value)}"\n---\n\n${content}`
+  const fm = fmMatch[1]
+  const rest = content.slice(fmMatch[0].length)
+  const line = `${key}: "${escapeYaml(value)}"`
+  if (new RegExp(`^${key}:`, "m").test(fm)) {
+    return `---\n${fm.replace(new RegExp(`^${key}:.*$`, "m"), line)}\n---${rest}`
+  }
+  return `---\n${fm}\n${line}\n---${rest}`
+}
+
+function upsertFrontmatterList(content: string, key: string, values: string[]): string {
+  const cleanValues = values.map((value) => value.trim()).filter(Boolean)
+  if (cleanValues.length === 0) return content
+  const fmMatch = content.match(/^---\n([\s\S]*?)\n---/)
+  if (!fmMatch) return `---\n${key}: [${cleanValues.map((value) => `"${escapeYaml(value)}"`).join(", ")}]\n---\n\n${content}`
+  const fm = fmMatch[1]
+  const rest = content.slice(fmMatch[0].length)
+  const existing = extractListValuesFromFrontmatter(fm, key)
+  const merged = dedupeStrings([...existing, ...cleanValues])
+  const line = `${key}: [${merged.map((value) => `"${escapeYaml(value)}"`).join(", ")}]`
+  if (new RegExp(`^${key}:`, "m").test(fm)) {
+    return `---\n${fm.replace(new RegExp(`^${key}:.*$`, "m"), line)}\n---${rest}`
+  }
+  return `---\n${fm}\n${line}\n---${rest}`
+}
+
+function extractListValuesFromFrontmatter(frontmatter: string, key: string): string[] {
+  const inline = frontmatter.match(new RegExp(`^${key}:\\s*\\[(.*)]\\s*$`, "m"))
+  if (!inline) return []
+  return inline[1]
+    .split(",")
+    .map((item) => item.trim().replace(/^["']|["']$/g, ""))
+    .filter(Boolean)
+}
+
+function appendSectionIfMissing(content: string, heading: string, section: string): string {
+  if (content.includes(heading)) return content
+  return `${content.trimEnd()}\n\n${section}\n`
+}
+
+function dedupeBy<T>(items: T[], keyFn: (item: T) => string): T[] {
+  const seen = new Set<string>()
+  const result: T[] = []
+  for (const item of items) {
+    const key = keyFn(item)
+    if (seen.has(key)) continue
+    seen.add(key)
+    result.push(item)
+  }
+  return result
+}
+
+function dedupeStrings(values: string[]): string[] {
+  return Array.from(new Set(values.filter(Boolean)))
+}
+
+function escapeYaml(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')
+}
+
 export function inferBusinessSignature(content: string, fallbackName: string): string {
   const entityType = extractScalar(content, "entity_type")
   const title = extractTitle(content) || fallbackName
@@ -273,7 +452,8 @@ export function inferBusinessSignature(content: string, fallbackName: string): s
     if (/体检异常/.test(identityText)) return "customer.persona.abnormal_physical_exam"
   }
 
-  if (entityType === "service_benefit" || /家庭医生在线咨询服务|重疾绿通服务|健康档案管理服务/.test(identityText)) {
+  if (entityType === "service_benefit" || entityType === "process" || /家庭医生在线咨询服务|重疾绿通服务|健康档案管理服务/.test(identityText)) {
+    if (/康复门诊|康复住院|康复训练/.test(identityText)) return ""
     if (/家庭医生|在线咨询/.test(identityText)) return "product.service.family_doctor_online"
     if (/重疾绿通|绿通|专家门诊/.test(identityText)) return "product.service.critical_illness_green_channel"
     if (/健康档案/.test(identityText)) return "product.service.health_record_management"
@@ -284,6 +464,57 @@ export function inferBusinessSignature(content: string, fallbackName: string): s
   }
 
   return ""
+}
+
+const SERVICE_FAMILIES: VariantFamilyDefinition[] = [
+  {
+    signature: "product.service_family.rehab",
+    title: "康复服务",
+    description: "围绕重疾或术后康复阶段提供的门诊、住院、训练和随访类服务集合。",
+    aliases: ["康复门诊协助", "康复住院协助", "康复训练管理", "康复随访"],
+  },
+  {
+    signature: "product.service_family.critical_illness_journey",
+    title: "重疾全程服务",
+    description: "围绕重疾疑似确诊、诊疗、手术、住院和康复阶段的全流程医疗协助服务集合。",
+    aliases: ["重疾专案管理", "检查安排协助", "专家会诊", "国内住院安排协助", "手术安排协助", "住院照护"],
+  },
+  {
+    signature: "product.service_family.outpatient",
+    title: "日常就医服务",
+    description: "围绕普通门诊、预约、陪诊和线下就医过程的服务集合。",
+    aliases: ["门诊预约协助", "就医陪诊"],
+  },
+  {
+    signature: "product.service_family.family_doctor",
+    title: "家庭医生服务组",
+    description: "围绕家庭医生、在线问诊、音视频首访/随访和健康报告的主动健康管理服务集合。",
+    aliases: ["家庭医生服务", "在线问诊", "音视频首访", "音视频随访", "年度健康报告"],
+  },
+]
+
+export function inferVariantFamilySignature(content: string, fallbackName: string): VariantFamilyDefinition | null {
+  const entityType = extractScalar(content, "entity_type")
+  const type = extractScalar(content, "type")
+  const title = extractTitle(content) || fallbackName
+  const identityText = `${fallbackName}\n${title}`.toLowerCase()
+  const contentText = content.toLowerCase()
+  const haystack = `${identityText}\n${contentText}`
+
+  if (["product", "persona", "compliance_rule", "source"].includes(entityType)) return null
+
+  const serviceLike = entityType === "service_benefit" ||
+    entityType === "process" ||
+    type === "process" ||
+    /服务|协助|问诊|会诊|陪诊|住院|门诊|康复|重疾|家庭医生/.test(identityText)
+  if (!serviceLike) return null
+
+  if (/康复(门诊|住院|训练|随访)|康复科|康复医院/.test(haystack)) return SERVICE_FAMILIES[0]
+  if (/重疾|疑似确诊|专家会诊|手术安排|住院安排|检查安排|住院照护|海外远程/.test(haystack)) return SERVICE_FAMILIES[1]
+  if (/门诊预约|就医陪诊|日常就医/.test(haystack)) return SERVICE_FAMILIES[2]
+  if (/家庭医生|在线问诊|音视频(首访|随访|问诊)|年度健康报告/.test(haystack)) return SERVICE_FAMILIES[3]
+
+  return null
 }
 
 function compatibleEntityTypes(existingType = "", newType = ""): boolean {

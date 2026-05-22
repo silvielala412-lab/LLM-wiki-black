@@ -18,7 +18,7 @@ import {
 import { captionMarkdownImages, loadCaptionCache } from "@/lib/image-caption-pipeline"
 import { isImagePdf, ocrImagePdf, ocrImageBytes } from "@/lib/pdf-ocr"
 import { buildVisionLlmConfig } from "@/lib/server-config"
-import { loadExistingEntities, normalizeEntityBlock } from "@/lib/entity-normalizer"
+import { loadExistingEntities, materializeVariantFamilyPages, normalizeEntityBlock } from "@/lib/entity-normalizer"
 import type { MultimodalConfig } from "@/stores/wiki-store"
 import type { ChunkingConfig } from "@/types/wiki"
 import { useAuthStore } from "@/stores/auth-store"
@@ -2964,6 +2964,18 @@ async function writeFileBlocks(
     }
   }
 
+  try {
+    const familyResult = await materializeVariantFamilyPages(projectPath)
+    for (const rel of familyResult.writtenPaths) {
+      if (!writtenPaths.includes(rel)) writtenPaths.push(rel)
+    }
+    warnings.push(...familyResult.warnings)
+  } catch (err) {
+    const msg = `Variant family materialization failed: ${err instanceof Error ? err.message : String(err)}`
+    console.warn(`[ingest] ${msg}`)
+    warnings.push(msg)
+  }
+
   return { writtenPaths, warnings, hardFailures }
 }
 
@@ -3634,6 +3646,8 @@ export function buildGenerationPrompt(schema: string, purpose: string, index: st
     "- For product access lists or service eligibility lists within a few hundred rows, the source page must include every identifiable row/item in a compact Markdown table or numbered list. If token budget prevents full table rendering, include a clear `未完全展开的清单范围` section and a REVIEW item; never silently omit rows.",
     "- For service manuals, do not collapse multiple services into one generic paragraph. Extract independent service benefits, process steps, usage limits, exclusions, materials, time limits, and compliance disclaimers as separate visible bullets or tables.",
     "- Service manual minimum node rule: if the source contains identifiable service items, generate dedicated pages for the service items and rules named in `Service Manual Node Extraction Requirements`. A service manual output with only the main service-plan page is incomplete.",
+    "- Concept resolution rule: do not create isolated near-duplicate pages. Exact duplicates should update the existing page; near variants such as 康复门诊协助 / 康复住院协助 should remain separate child service pages linked through a shared parent concept such as 康复服务.",
+    "- When generating a child service page that belongs to a service family, include `parent` and `related` frontmatter when the parent or sibling service is known. The system will also materialize missing parent concept pages after generation.",
     "- Service benefit pages should use `wiki/entities/[服务项目名].md`, `entity_type: service_benefit`, `knowledge_domain: product`, `business_phase: service`, and should link back to the main service plan.",
     "- Service process pages should use `type: process`; service limitation/waiting-period/non-sharing pages should use `type: rule`; disclaimer pages should use `knowledge_domain: compliance` and `entity_type: compliance_rule`.",
     "- For product terms, do not collapse responsibilities/exclusions/rules into a single summary. Extract age range, waiting period, payment period, coverage period, claim trigger, responsibility amounts, exclusions, underwriting basics, service packages, and official caveats separately.",
