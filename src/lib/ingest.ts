@@ -18,7 +18,8 @@ import {
 import { captionMarkdownImages, loadCaptionCache } from "@/lib/image-caption-pipeline"
 import { isImagePdf, ocrImagePdf, ocrImageBytes } from "@/lib/pdf-ocr"
 import { buildVisionLlmConfig } from "@/lib/server-config"
-import { loadExistingEntities, materializeVariantFamilyPages, normalizeEntityBlock } from "@/lib/entity-normalizer"
+import { loadExistingEntities, normalizeEntityBlock } from "@/lib/entity-normalizer"
+import { resolveIncomingKnowledgePage } from "@/lib/knowledge-resolution"
 import type { MultimodalConfig } from "@/stores/wiki-store"
 import type { ChunkingConfig } from "@/types/wiki"
 import { useAuthStore } from "@/stores/auth-store"
@@ -2874,7 +2875,7 @@ async function writeFileBlocks(
       projectPath,
     )
     const relativePath = normalised.path
-    const content = shouldNormalizeKnowledgePage(relativePath)
+    let content = shouldNormalizeKnowledgePage(relativePath)
       ? cleanupKnowledgeFrontmatter(normalizeSchemaFrontmatter(normalised.content, {
           relativePath,
           defaultStatus: "candidate",
@@ -2917,6 +2918,18 @@ async function writeFileBlocks(
     const fullPath = `${projectPath}/${relativePath}`
     try {
       const existing = await tryReadFile(fullPath)
+      const resolution = resolveIncomingKnowledgePage(relativePath, content, existing || null)
+      if (resolution.reviewItems.length > 0) {
+        useReviewStore.getState().addItems(resolution.reviewItems)
+      }
+      if (resolution.hasBlockingConflict) {
+        const msg = `Blocked "${relativePath}" because same dedup_key has conflicting critical/high-confidence fields.`
+        console.warn(`[ingest] ${msg}`)
+        warnings.push(msg)
+        continue
+      }
+      content = resolution.content
+
       const skipReason = shouldSkipUnsafeKnowledgeWrite(relativePath, content, existing)
       if (skipReason) {
         const msg = `Skipped "${relativePath}" because ${skipReason}.`
@@ -2962,18 +2975,6 @@ async function writeFileBlocks(
       warnings.push(msg)
       hardFailures.push(relativePath)
     }
-  }
-
-  try {
-    const familyResult = await materializeVariantFamilyPages(projectPath)
-    for (const rel of familyResult.writtenPaths) {
-      if (!writtenPaths.includes(rel)) writtenPaths.push(rel)
-    }
-    warnings.push(...familyResult.warnings)
-  } catch (err) {
-    const msg = `Variant family materialization failed: ${err instanceof Error ? err.message : String(err)}`
-    console.warn(`[ingest] ${msg}`)
-    warnings.push(msg)
   }
 
   return { writtenPaths, warnings, hardFailures }
@@ -3597,6 +3598,7 @@ export function buildGenerationPrompt(schema: string, purpose: string, index: st
     `source_files: ["${sourceFileName}"]  # MUST contain the original source filename`,
     "source_chunks: []",
     `sources: ["${sourceFileName}"]  # MUST contain the original source filename`,
+    "source_type: regulatory_doc | product_terms | product_manual | service_manual | official_marketing | sales_training | agent_experience | ocr_image | unknown",
     "confidence: 0.0-1.0",
     "status: candidate",
     "needs_review: true | false",
@@ -3647,7 +3649,7 @@ export function buildGenerationPrompt(schema: string, purpose: string, index: st
     "- For service manuals, do not collapse multiple services into one generic paragraph. Extract independent service benefits, process steps, usage limits, exclusions, materials, time limits, and compliance disclaimers as separate visible bullets or tables.",
     "- Service manual minimum node rule: if the source contains identifiable service items, generate dedicated pages for the service items and rules named in `Service Manual Node Extraction Requirements`. A service manual output with only the main service-plan page is incomplete.",
     "- Concept resolution rule: do not create isolated near-duplicate pages. Exact duplicates should update the existing page; near variants such as 康复门诊协助 / 康复住院协助 should remain separate child service pages linked through a shared parent concept such as 康复服务.",
-    "- When generating a child service page that belongs to a service family, include `parent` and `related` frontmatter when the parent or sibling service is known. The system will also materialize missing parent concept pages after generation.",
+    "- When generating a child service page that belongs to a service family, include `parent` and `related` frontmatter when the parent or sibling service is known. Do not assume the system will automatically merge variants; only exact `dedup_key` duplicates are auto-merged.",
     "- Service benefit pages should use `wiki/entities/[服务项目名].md`, `entity_type: service_benefit`, `knowledge_domain: product`, `business_phase: service`, and should link back to the main service plan.",
     "- Service process pages should use `type: process`; service limitation/waiting-period/non-sharing pages should use `type: rule`; disclaimer pages should use `knowledge_domain: compliance` and `entity_type: compliance_rule`.",
     "- For product terms, do not collapse responsibilities/exclusions/rules into a single summary. Extract age range, waiting period, payment period, coverage period, claim trigger, responsibility amounts, exclusions, underwriting basics, service packages, and official caveats separately.",

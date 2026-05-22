@@ -4,6 +4,10 @@ import {
   type KnowledgeEntityType,
   type UniversalEntityType,
 } from "@/lib/knowledge-schema"
+import {
+  inferSourceTypeFromSourceName,
+  inferStableInsuranceDedupKey,
+} from "@/lib/insurance-schema-registry"
 import type { KnowledgeStatus } from "@/lib/knowledge-governance"
 
 interface NormalizeOptions {
@@ -53,7 +57,7 @@ export function normalizeSchemaFrontmatter(content: string, options: NormalizeOp
     type: universalType,
     entity_type: entityType,
     business_phase: "general",
-    dedup_key: inferDedupKey(existing, title, options.relativePath),
+    dedup_key: inferDedupKey(existing, title, entityType, options.relativePath),
     title,
     summary: "",
     created_at: getField(existing, "created") || date,
@@ -69,6 +73,7 @@ export function normalizeSchemaFrontmatter(content: string, options: NormalizeOp
     source_files: options.sourceFileName ? [options.sourceFileName] : [],
     source_chunks: [],
     sources: options.sourceFileName ? [options.sourceFileName] : [],
+    source_type: getField(existing, "source_type") || inferSourceTypeFromSourceName(options.sourceFileName || firstYamlListValue(existing, "source_files") || firstYamlListValue(existing, "sources")),
     confidence: 0.7,
     status,
     needs_review: status !== "active",
@@ -173,11 +178,42 @@ function inferTaxonomyPath(frontmatter: string, knowledgeDomain: string, entityT
   return path.length > 0 ? path : ["general"]
 }
 
-function inferDedupKey(frontmatter: string, title: string, relativePath?: string): string {
+function inferDedupKey(frontmatter: string, title: string, entityType: string, relativePath?: string): string {
   const existing = getField(frontmatter, "dedup_key")
   if (existing) return existing
   const fromPath = relativePath?.replace(/\\/g, "/").split("/").pop()?.replace(/\.md$/, "")
-  return slugify(fromPath || title || "untitled")
+  const attributes = parseAttributes(frontmatter)
+  return inferStableInsuranceDedupKey({
+    entityType,
+    title,
+    attributes,
+    fallback: fromPath || title || "untitled",
+  })
+}
+
+function parseAttributes(frontmatter: string): Record<string, unknown> {
+  const raw = getField(frontmatter, "attributes")
+  if (!raw || raw === "{}") return {}
+  try {
+    const parsed = JSON.parse(raw)
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {}
+  } catch {
+    return {}
+  }
+}
+
+function firstYamlListValue(frontmatter: string, key: string): string {
+  const inline = frontmatter.match(new RegExp(`^${escapeRegExp(key)}\\s*:\\s*\\[([^\\]]*)]`, "m"))
+  if (inline) {
+    return inline[1].split(",").map((item) => stripQuotes(item.trim())).find(Boolean) ?? ""
+  }
+  const block = frontmatter.match(new RegExp(`^${escapeRegExp(key)}\\s*:\\s*\\n((?:\\s+-\\s+.+\\n?)+)`, "m"))
+  if (!block) return ""
+  for (const line of block[1].split(/\r?\n/)) {
+    const item = line.match(/^\s+-\s+(.+?)\s*$/)
+    if (item) return stripQuotes(item[1].trim())
+  }
+  return ""
 }
 
 function extractTitle(body: string, relativePath?: string): string {

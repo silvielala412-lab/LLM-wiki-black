@@ -19,12 +19,59 @@ export interface InsuranceEntitySchemaSpec {
   lintRules?: string[]
 }
 
+export type FieldMergePolicy = "append" | "conflict" | "keep_best" | "ignore_empty"
+
 const f = (name: string, label: string, note: string, importance: FieldImportance): InsuranceFieldSpec => ({
   name,
   label,
   note,
   importance,
 })
+
+const DEDUP_KEY_FIELDS: Record<string, string[]> = {
+  product: ["product_code", "product_name"],
+  product_combo: ["combo_name"],
+  selling_point: ["related_product", "point_name"],
+  regulatory_doc: ["related_product", "doc_type", "effective_version"],
+  service_benefit: ["related_product", "service_name", "title"],
+  persona: ["persona_name", "title"],
+  life_stage: ["stage_name"],
+  customer_signal: ["signal_type", "signal_description"],
+  selling_scenario: ["scenario_name"],
+  pitch: ["related_scenario", "pitch_type", "core_message"],
+  objection_handling: ["objection_category", "objection_raw"],
+  sales_path: ["path_name"],
+  sales_playbook: ["playbook_name"],
+  referral_method: ["method_name"],
+  needs_discovery: ["method_name"],
+  asset: ["title", "asset_type"],
+  asset_collection: ["name"],
+  content_template: ["name", "template_type"],
+  presentation_kit: ["kit_name"],
+  campaign: ["name", "start_date"],
+  incentive: ["name", "start_date"],
+  success_case: ["title"],
+  failure_case: ["title"],
+  customer_voice: ["voice_type", "raw_text"],
+  referral_case: ["title"],
+  agent_feedback: ["feedback_type", "content"],
+  competitive_insight: ["competitor_name", "insight_type", "capture_date"],
+  compliance_rule: ["rule_name", "title"],
+  rule: ["rule_name", "title"],
+  process: ["process_name", "service_name", "title"],
+}
+
+const SOURCE_TYPE_WEIGHTS: Record<string, number> = {
+  regulatory_doc: 100,
+  product_terms: 95,
+  product_manual: 85,
+  service_manual: 80,
+  official_marketing: 70,
+  sales_training: 55,
+  agent_experience: 40,
+  ocr_image: 35,
+  unknown: 10,
+}
 
 export const INSURANCE_SCHEMA_REGISTRY: InsuranceEntitySchemaSpec[] = [
   {
@@ -427,4 +474,79 @@ export function renderInsuranceSchemaRegistryPrompt(): string {
   lines.push("## Deferred domains")
   lines.push("Content、Activity、Cases、Compliance can use the same pattern, but the first demo should prioritize Product + Customer + Method. If these domains appear, classify them correctly and create conservative attributes rather than forcing them into product/customer/method.")
   return lines.join("\n")
+}
+
+export function getInsuranceSchemaSpec(entityType: string): InsuranceEntitySchemaSpec | undefined {
+  const normalized = normalizeToken(entityType)
+  return INSURANCE_SCHEMA_REGISTRY.find((spec) => normalizeToken(spec.entityType) === normalized)
+}
+
+export function getInsuranceFieldMergePolicy(entityType: string, fieldName: string): FieldMergePolicy {
+  const spec = getInsuranceSchemaSpec(entityType)
+  const field = spec?.fields.find((item) => item.name === fieldName)
+  if (!field) return "conflict"
+  if (field.importance === "recommended") return "append"
+  if (field.importance === "auto_derived") return "keep_best"
+  return "conflict"
+}
+
+export function getInsuranceFieldImportance(entityType: string, fieldName: string): FieldImportance | undefined {
+  return getInsuranceSchemaSpec(entityType)?.fields.find((item) => item.name === fieldName)?.importance
+}
+
+export function inferStableInsuranceDedupKey(input: {
+  entityType: string
+  title: string
+  attributes?: Record<string, unknown>
+  fallback?: string
+}): string {
+  const entityType = normalizeToken(input.entityType || "general")
+  const attrs = input.attributes ?? {}
+  const keyFields = DEDUP_KEY_FIELDS[entityType] ?? ["title"]
+  const parts: string[] = [entityType]
+
+  for (const field of keyFields) {
+    const value = field === "title" ? input.title : attrs[field]
+    const normalized = normalizeDedupPart(value)
+    if (normalized) parts.push(normalized)
+  }
+
+  if (parts.length === 1) {
+    const fallback = normalizeDedupPart(input.fallback) || normalizeDedupPart(input.title) || "untitled"
+    parts.push(fallback)
+  }
+
+  return parts.join(".")
+}
+
+export function inferSourceTypeFromSourceName(sourceName = ""): string {
+  const name = sourceName.toLowerCase()
+  if (!name) return "unknown"
+  if (/监管|批复|备案|条款|合同|费率|投保提示|健康告知|regulatory|clause|terms/.test(name)) return "regulatory_doc"
+  if (/说明书|产品手册|product.*manual|manual/.test(name)) return "product_manual"
+  if (/服务手册|服务权益|家医|绿通|service/.test(name)) return "service_manual"
+  if (/宣传|海报|折页|单页|marketing|poster|brochure/.test(name)) return "official_marketing"
+  if (/话术|销售|培训|训练|异议|qa|q&a|问答/.test(name)) return "sales_training"
+  if (/\.(png|jpe?g|webp|bmp|tiff?)$/i.test(name)) return "ocr_image"
+  return "unknown"
+}
+
+export function sourceTypeWeight(sourceType = "unknown"): number {
+  return SOURCE_TYPE_WEIGHTS[sourceType] ?? SOURCE_TYPE_WEIGHTS.unknown
+}
+
+function normalizeToken(value: string): string {
+  return value.trim().toLowerCase().replace(/[\s-]+/g, "_")
+}
+
+function normalizeDedupPart(value: unknown): string {
+  if (value == null) return ""
+  const raw = Array.isArray(value) ? value.join("_") : String(value)
+  return raw
+    .trim()
+    .toLowerCase()
+    .replace(/[\s/\\|,，、;；:：()[\]{}'"“”‘’]+/g, "_")
+    .replace(/[^\p{L}\p{N}_-]+/gu, "")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 80)
 }

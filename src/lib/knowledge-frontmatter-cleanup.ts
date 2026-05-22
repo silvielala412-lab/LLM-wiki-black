@@ -133,6 +133,7 @@ export function cleanupKnowledgeFrontmatter(content: string): string {
     "source_files",
     "source_chunks",
     "sources",
+    "source_type",
     "confidence",
     "status",
     "needs_review",

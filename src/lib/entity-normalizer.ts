@@ -21,6 +21,7 @@
  */
 
 import { createDirectory, listDirectory, readFile, writeFile } from "@/commands/fs"
+import { inferStableInsuranceDedupKey } from "@/lib/insurance-schema-registry"
 
 // ── Levenshtein distance (small strings only) ────────────────────────────────
 
@@ -87,6 +88,8 @@ export interface ExistingEntity {
   name: string
   /** Schema entity_type from frontmatter, when available. */
   entityType?: string
+  /** Stable schema-driven dedup key. First-stage merging only uses exact matches. */
+  dedupKey?: string
   /** Lightweight business signature used for schema-aware deduplication. */
   businessSignature?: string
   /** Lightweight parent/variant family signature, e.g. rehab service family. */
@@ -122,6 +125,7 @@ export async function loadExistingEntities(
           relativePath,
           name: nameFromPath(relativePath),
           entityType: extractScalar(existingContent, "entity_type"),
+          dedupKey: inferEntityDedupKey(existingContent, nameFromPath(relativePath)),
           businessSignature: inferBusinessSignature(existingContent, nameFromPath(relativePath)),
           familySignature: inferVariantFamilySignature(existingContent, nameFromPath(relativePath))?.signature,
         })
@@ -221,17 +225,18 @@ export async function normalizeEntityBlock(
   }
 
   const newName = nameFromPath(relativePath)
-  const newSignature = inferBusinessSignature(content, newName)
+  const newDedupKey = inferEntityDedupKey(content, newName)
   const newEntityType = extractScalar(content, "entity_type")
 
-  // Find the first existing entity that is "similar" but NOT the exact same path
+  // First-stage deterministic merge: only exact schema dedup_key matches redirect
+  // to an existing canonical page. Similar-name / variant decisions are deferred
+  // to human review or a later LLM-assisted stage.
   const match = existingEntities.find(
     (e) =>
       e.relativePath !== relativePath &&
-      (
-        (newSignature && e.businessSignature === newSignature && compatibleEntityTypes(e.entityType, newEntityType)) ||
-        (!newSignature && compatibleEntityTypes(e.entityType, newEntityType) && isSimilar(e.name, newName))
-      ),
+      newDedupKey &&
+      e.dedupKey === newDedupKey &&
+      compatibleEntityTypes(e.entityType, newEntityType),
   )
 
   if (!match) {
@@ -525,6 +530,30 @@ function compatibleEntityTypes(existingType = "", newType = ""): boolean {
   if (genericTypes.has(existingType) || genericTypes.has(newType)) return true
 
   return false
+}
+
+function inferEntityDedupKey(content: string, fallbackName: string): string {
+  const existing = extractScalar(content, "dedup_key")
+  if (existing) return existing
+  return inferStableInsuranceDedupKey({
+    entityType: extractScalar(content, "entity_type"),
+    title: extractTitle(content) || fallbackName,
+    attributes: extractAttributes(content),
+    fallback: fallbackName,
+  })
+}
+
+function extractAttributes(content: string): Record<string, unknown> {
+  const raw = content.match(/^attributes:\s*(\{.*\})\s*$/m)?.[1]
+  if (!raw) return {}
+  try {
+    const parsed = JSON.parse(raw)
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : {}
+  } catch {
+    return {}
+  }
 }
 
 function extractTitle(content: string): string {
