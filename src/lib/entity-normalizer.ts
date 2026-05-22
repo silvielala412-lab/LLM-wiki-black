@@ -21,7 +21,11 @@
  */
 
 import { createDirectory, listDirectory, readFile, writeFile } from "@/commands/fs"
-import { inferStableInsuranceDedupKey } from "@/lib/insurance-schema-registry"
+import {
+  inferStableInsuranceDedupKey,
+  inferStrongInsuranceIdentityKeys,
+  normalizeInsuranceAttributes,
+} from "@/lib/insurance-schema-registry"
 
 // ── Levenshtein distance (small strings only) ────────────────────────────────
 
@@ -90,6 +94,8 @@ export interface ExistingEntity {
   entityType?: string
   /** Stable schema-driven dedup key. First-stage merging only uses exact matches. */
   dedupKey?: string
+  /** Strong business identity keys: product code/name, service+product, persona name, etc. */
+  identityKeys?: string[]
   /** Lightweight business signature used for schema-aware deduplication. */
   businessSignature?: string
   /** Lightweight parent/variant family signature, e.g. rehab service family. */
@@ -126,6 +132,7 @@ export async function loadExistingEntities(
           name: nameFromPath(relativePath),
           entityType: extractScalar(existingContent, "entity_type"),
           dedupKey: inferEntityDedupKey(existingContent, nameFromPath(relativePath)),
+          identityKeys: inferEntityIdentityKeys(existingContent, nameFromPath(relativePath)),
           businessSignature: inferBusinessSignature(existingContent, nameFromPath(relativePath)),
           familySignature: inferVariantFamilySignature(existingContent, nameFromPath(relativePath))?.signature,
         })
@@ -226,17 +233,20 @@ export async function normalizeEntityBlock(
 
   const newName = nameFromPath(relativePath)
   const newDedupKey = inferEntityDedupKey(content, newName)
+  const newIdentityKeys = inferEntityIdentityKeys(content, newName)
   const newEntityType = extractScalar(content, "entity_type")
 
-  // First-stage deterministic merge: only exact schema dedup_key matches redirect
-  // to an existing canonical page. Similar-name / variant decisions are deferred
-  // to human review or a later LLM-assisted stage.
+  // Deterministic same-concept merge: exact dedup_key OR strong schema identity
+  // keys redirect to the canonical page. Loose title similarity is still
+  // deferred; this protects sibling concepts such as 康复门诊协助 / 康复住院协助.
   const match = existingEntities.find(
     (e) =>
       e.relativePath !== relativePath &&
-      newDedupKey &&
-      e.dedupKey === newDedupKey &&
-      compatibleEntityTypes(e.entityType, newEntityType),
+      compatibleEntityTypes(e.entityType, newEntityType) &&
+      (
+        (!!newDedupKey && e.dedupKey === newDedupKey) ||
+        hasSharedIdentityKey(e.identityKeys ?? [], newIdentityKeys)
+      ),
   )
 
   if (!match) {
@@ -538,9 +548,34 @@ function inferEntityDedupKey(content: string, fallbackName: string): string {
   return inferStableInsuranceDedupKey({
     entityType: extractScalar(content, "entity_type"),
     title: extractTitle(content) || fallbackName,
-    attributes: extractAttributes(content),
+    attributes: normalizeInsuranceAttributes(extractScalar(content, "entity_type"), extractAttributes(content)),
     fallback: fallbackName,
   })
+}
+
+function inferEntityIdentityKeys(content: string, fallbackName: string): string[] {
+  const entityType = extractScalar(content, "entity_type")
+  const title = extractTitle(content) || fallbackName
+  const attributes = normalizeInsuranceAttributes(entityType, extractAttributes(content))
+  const dedupKey = inferStableInsuranceDedupKey({
+    entityType,
+    title,
+    attributes,
+    fallback: fallbackName,
+  })
+  const existingDedupKey = extractScalar(content, "dedup_key")
+  return inferStrongInsuranceIdentityKeys({
+    entityType,
+    title,
+    attributes,
+    dedupKey: existingDedupKey || dedupKey,
+  })
+}
+
+function hasSharedIdentityKey(existingKeys: string[], incomingKeys: string[]): boolean {
+  if (existingKeys.length === 0 || incomingKeys.length === 0) return false
+  const existing = new Set(existingKeys)
+  return incomingKeys.some((key) => existing.has(key))
 }
 
 function extractAttributes(content: string): Record<string, unknown> {

@@ -35,8 +35,8 @@ const DEDUP_KEY_FIELDS: Record<string, string[]> = {
   product_combo: ["combo_name"],
   selling_point: ["related_product", "point_name"],
   regulatory_doc: ["related_product", "doc_type", "effective_version"],
-  service_benefit: ["related_product", "service_name", "title"],
-  persona: ["persona_name", "title"],
+  service_benefit: ["related_product", "service_name"],
+  persona: ["persona_name"],
   life_stage: ["stage_name"],
   customer_signal: ["signal_type", "signal_description"],
   selling_scenario: ["scenario_name"],
@@ -58,9 +58,9 @@ const DEDUP_KEY_FIELDS: Record<string, string[]> = {
   referral_case: ["title"],
   agent_feedback: ["feedback_type", "content"],
   competitive_insight: ["competitor_name", "insight_type", "capture_date"],
-  compliance_rule: ["rule_name", "title"],
-  rule: ["rule_name", "title"],
-  process: ["process_name", "service_name", "title"],
+  compliance_rule: ["rule_name"],
+  rule: ["rule_name"],
+  process: ["process_name", "service_name"],
 }
 
 const FIELD_ALIASES: Record<string, Record<string, string[]>> = {
@@ -603,6 +603,58 @@ export function inferStableInsuranceDedupKey(input: {
   return parts.join(".")
 }
 
+export function inferStrongInsuranceIdentityKeys(input: {
+  entityType: string
+  title: string
+  attributes?: Record<string, unknown>
+  dedupKey?: string
+}): string[] {
+  const entityType = normalizeToken(input.entityType || "general")
+  const attrs = normalizeInsuranceAttributes(entityType, input.attributes ?? {})
+  const keys = new Set<string>()
+  if (input.dedupKey) keys.add(`dedup:${normalizeDedupPart(input.dedupKey)}`)
+
+  const addFieldKey = (field: string, prefix = field) => {
+    const normalized = normalizeDedupPart(attrs[field])
+    if (normalized) keys.add(`${entityType}.${prefix}.${normalized}`)
+  }
+  const addCompositeKey = (fields: string[], prefix: string) => {
+    const parts = fields.map((field) => normalizeDedupPart(attrs[field]))
+    if (parts.every(Boolean)) keys.add(`${entityType}.${prefix}.${parts.join(".")}`)
+  }
+
+  if (entityType === "product") {
+    addFieldKey("product_code", "code")
+    addFieldKey("product_name", "name")
+    const titleKey = normalizeBusinessTitle(input.title, "product")
+    if (titleKey) keys.add(`${entityType}.title.${titleKey}`)
+  } else if (entityType === "service_benefit") {
+    addCompositeKey(["related_product", "service_name"], "product_service")
+    addFieldKey("service_name", "service")
+    const titleKey = normalizeBusinessTitle(input.title, "service_benefit")
+    if (titleKey) keys.add(`${entityType}.title.${titleKey}`)
+  } else if (entityType === "persona") {
+    addFieldKey("persona_name", "name")
+    const titleKey = normalizeBusinessTitle(input.title, "persona")
+    if (titleKey) keys.add(`${entityType}.title.${titleKey}`)
+  } else if (entityType === "selling_scenario") {
+    addFieldKey("scenario_name", "name")
+  } else if (entityType === "pitch") {
+    addCompositeKey(["related_scenario", "pitch_type", "core_message"], "scenario_type_message")
+  } else if (entityType === "objection_handling") {
+    addCompositeKey(["objection_category", "objection_raw"], "category_raw")
+  } else {
+    const stable = inferStableInsuranceDedupKey({
+      entityType,
+      title: input.title,
+      attributes: attrs,
+    })
+    if (stable && !stable.endsWith(".untitled")) keys.add(`dedup:${normalizeDedupPart(stable)}`)
+  }
+
+  return Array.from(keys).filter((key) => key.length > 0)
+}
+
 export function inferSourceTypeFromSourceName(sourceName = ""): string {
   const name = sourceName.toLowerCase()
   if (!name) return "unknown"
@@ -633,4 +685,28 @@ function normalizeDedupPart(value: unknown): string {
     .replace(/[^\p{L}\p{N}_-]+/gu, "")
     .replace(/^_+|_+$/g, "")
     .slice(0, 80)
+}
+
+function normalizeBusinessTitle(value: string, entityType: string): string {
+  let title = String(value ?? "").trim().toLowerCase()
+  if (!title) return ""
+  title = title
+    .replace(/\.(md|pdf|docx?|xlsx?|png|jpe?g)$/i, "")
+    .replace(/[\s/\\|,，、;；:：()[\]{}'"“”‘’]+/g, "")
+
+  if (entityType === "product") {
+    title = title
+      .replace(/重大疾病/g, "重疾")
+      .replace(/重疾险/g, "重疾")
+      .replace(/产品说明书|产品说明|说明书|合同条款|保险条款|条款|宣传单页|宣传材料|费率表|准入清单|清单|pdf|文档/g, "")
+      .replace(/保险产品|产品$/g, "")
+      .replace(/保险$/g, "")
+  } else if (entityType === "service_benefit") {
+    title = title
+      .replace(/服务权益|权益服务|服务项目|服务说明|流程说明|说明|规则|pdf|文档/g, "")
+  } else if (entityType === "persona") {
+    title = title.replace(/客户画像|画像|客户|人群/g, "")
+  }
+
+  return title.length >= 4 ? normalizeDedupPart(title) : ""
 }
