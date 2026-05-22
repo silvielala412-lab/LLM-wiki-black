@@ -3,6 +3,10 @@ import {
   ENTITY_TYPE_TO_UNIVERSAL_TYPE,
   type RelationType,
 } from "@/lib/knowledge-schema"
+import {
+  inferStableInsuranceDedupKey,
+  normalizeInsuranceAttributes,
+} from "@/lib/insurance-schema-registry"
 
 interface YamlBlock {
   key: string
@@ -75,6 +79,19 @@ const CANONICAL_TARGETS: Record<string, string> = {
   "体检异常后的健康风险沟通": "健康风险沟通",
 }
 
+const SERVICE_BENEFIT_TITLES = new Set([
+  "家庭医生", "家庭医生服务", "在线问诊", "音视频问诊", "音视频首访", "音视频随访", "年度健康报告",
+  "名医大咖", "名医大咖服务", "特色体检", "体检报告解读", "21天社群训练营", "用药服务", "数字化管理",
+  "门诊预约协助", "就医陪诊", "检查安排协助", "专家会诊", "海外远程书面咨询", "国内住院安排协助",
+  "手术安排协助", "海外重疾住院安排协助", "住院照护", "出院安排协助", "康复门诊协助", "康复住院协助",
+  "上门护理", "康复训练管理", "重疾专案管理", "心理咨询",
+])
+
+const RULE_LIKE_TITLES = new Set([
+  "启动条件", "疑似或确诊重疾启动条件", "服务权益达标规则", "服务中止规则", "服务终止规则",
+  "重疾服务等待期与非共享规则", "合规免责说明",
+])
+
 export function cleanupKnowledgeFrontmatter(content: string): string {
   const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/m)
   if (!match) return content
@@ -97,7 +114,7 @@ export function cleanupKnowledgeFrontmatter(content: string): string {
 
     const value = blockValue(block)
     if (block.key === "attributes") {
-      objectValues.set(block.key, normalizeAttributesValue(value))
+      objectValues.set(block.key, normalizeAttributesValue(value, scalarValues.get("entity_type") ?? ""))
       continue
     }
 
@@ -185,8 +202,13 @@ export function cleanupKnowledgeFrontmatter(content: string): string {
     let entityType = normalizeToken(scalars.get("entity_type") ?? "")
     const title = scalars.get("title") ?? ""
     const text = `${title}\n${pageBody}\n${objects.get("attributes") ?? ""}`
+    const baseTitle = title.replace(/服务流程|流程|服务说明|说明|规则/g, "").trim()
 
-    if (entityType === "selling_point" && /家庭医生|绿通|健康档案|服务权益/.test(text)) {
+    if (SERVICE_BENEFIT_TITLES.has(title) || SERVICE_BENEFIT_TITLES.has(baseTitle)) {
+      entityType = "service_benefit"
+    } else if (RULE_LIKE_TITLES.has(title) || RULE_LIKE_TITLES.has(baseTitle) || /等待期|非共享|服务中止|服务终止|免责|达标规则/.test(title)) {
+      entityType = /免责|合规/.test(title) ? "compliance_rule" : "rule"
+    } else if (entityType === "selling_point" && /家庭医生|绿通|健康档案|服务权益/.test(text)) {
       entityType = "service_benefit"
     } else if (entityType === "selling_point" && /预算|异议|话术|方案设计|回应|保费太贵/.test(text)) {
       entityType = "objection_handling"
@@ -220,6 +242,17 @@ export function cleanupKnowledgeFrontmatter(content: string): string {
     const relations = lists.get("relations") ?? []
     lists.set("related", related)
     lists.set("relations", normalizeBusinessRelations(relations, entityType, related))
+    objects.set("attributes", normalizeAttributesValue(objects.get("attributes") ?? "{}", entityType))
+    const titleForKey = scalars.get("title") ?? ""
+    const attrsForKey = parseJsonObject(objects.get("attributes") ?? "{}")
+    if (entityType && titleForKey) {
+      scalars.set("dedup_key", inferStableInsuranceDedupKey({
+        entityType,
+        title: titleForKey,
+        attributes: attrsForKey,
+        fallback: titleForKey,
+      }))
+    }
   }
 }
 
@@ -295,13 +328,57 @@ function extractListValues(block: YamlBlock): string[] {
     .filter(Boolean)
 }
 
-function normalizeAttributesValue(raw: string): string {
+function normalizeAttributesValue(raw: string, entityType = ""): string {
   const cleaned = raw.trim()
   if (!cleaned) return "{}"
   try {
-    return JSON.stringify(JSON.parse(cleaned))
+    const parsed = JSON.parse(cleaned)
+    return JSON.stringify(normalizeInsuranceAttributes(entityType, isRecord(parsed) ? parsed : { value: parsed }))
   } catch {
-    return cleaned.replace(/\s+/g, " ")
+    return JSON.stringify(normalizeInsuranceAttributes(entityType, parseLooseAttributes(cleaned)))
+  }
+}
+
+function parseLooseAttributes(raw: string): Record<string, unknown> {
+  const cleaned = raw.replace(/\r?\n/g, " ").replace(/\s+/g, " ").trim()
+  if (!cleaned) return {}
+  const matches = Array.from(cleaned.matchAll(/([A-Za-z_][\w-]*)\s*:/g))
+  if (matches.length === 0) return { raw_attributes: cleaned }
+
+  const result: Record<string, unknown> = {}
+  for (let i = 0; i < matches.length; i++) {
+    const key = matches[i][1]
+    const start = (matches[i].index ?? 0) + matches[i][0].length
+    const end = i + 1 < matches.length ? matches[i + 1].index ?? cleaned.length : cleaned.length
+    const value = cleaned.slice(start, end).trim()
+    result[key] = parseLooseValue(value)
+  }
+  return result
+}
+
+function parseLooseValue(value: string): unknown {
+  const trimmed = value.trim()
+  if (!trimmed) return null
+  if (/^(null|none|无|未提供|待补全)$/i.test(trimmed)) return null
+  if (/^(true|false)$/i.test(trimmed)) return /^true$/i.test(trimmed)
+  if (/^-?\d+(?:\.\d+)?$/.test(trimmed)) return Number(trimmed)
+  if (trimmed.includes(" - ")) {
+    const items = trimmed.split(/\s+-\s+/).map((item) => item.trim()).filter(Boolean)
+    if (items.length > 1) return items
+  }
+  return trimmed
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value)
+}
+
+function parseJsonObject(raw: string): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(raw)
+    return isRecord(parsed) ? parsed : {}
+  } catch {
+    return {}
   }
 }
 

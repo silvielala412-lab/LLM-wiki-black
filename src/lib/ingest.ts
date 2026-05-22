@@ -19,7 +19,12 @@ import {
 import { captionMarkdownImages, loadCaptionCache } from "@/lib/image-caption-pipeline"
 import { isImagePdf, ocrImagePdf, ocrImageBytes } from "@/lib/pdf-ocr"
 import { buildVisionLlmConfig } from "@/lib/server-config"
-import { loadExistingEntities, normalizeEntityBlock } from "@/lib/entity-normalizer"
+import {
+  buildExistingEntityIndexItem,
+  loadExistingEntities,
+  mergeStrongIdentityDuplicatePages,
+  normalizeEntityBlock,
+} from "@/lib/entity-normalizer"
 import { resolveIncomingKnowledgePage } from "@/lib/knowledge-resolution"
 import type { MultimodalConfig } from "@/stores/wiki-store"
 import type { ChunkingConfig } from "@/types/wiki"
@@ -2419,7 +2424,7 @@ async function autoIngestImpl(
 
   // ── Step 3: Write files ───────────────────────────────────────
   activity.updateItem(activityId, { detail: "Writing files...", step: "Analysing entity deduplication" })
-  const { writtenPaths, warnings: writeWarnings, hardFailures } = await writeFileBlocks(pp, generation)
+  const { writtenPaths, warnings: writeWarnings, hardFailures } = await writeFileBlocks(pp, generation, fileName)
 
   // Stamp all newly written wiki pages as "candidate" (knowledge governance).
   // Skip structural pages (index, log, overview) — they don't need review.
@@ -2860,6 +2865,7 @@ export function shouldSkipUnsafeKnowledgeWrite(
 async function writeFileBlocks(
   projectPath: string,
   text: string,
+  sourceFileName = "",
 ): Promise<{ writtenPaths: string[]; warnings: string[]; hardFailures: string[] }> {
   const { blocks, warnings: parseWarnings } = parseFileBlocks(text)
   const warnings = [...parseWarnings]
@@ -2891,6 +2897,7 @@ async function writeFileBlocks(
     let content = shouldNormalizeKnowledgePage(relativePath)
       ? cleanupKnowledgeFrontmatter(normalizeSchemaFrontmatter(normalised.content, {
           relativePath,
+          sourceFileName,
           defaultStatus: "candidate",
           defaultCreatedBy: _getUploaderUsername(),
         }))
@@ -2982,12 +2989,30 @@ async function writeFileBlocks(
         await writeFile(fullPath, toWrite)
       }
       writtenPaths.push(relativePath)
+      if (relativePath.startsWith("wiki/entities/") || relativePath.startsWith("wiki/concepts/")) {
+        existingEntities.push(buildExistingEntityIndexItem(projectPath, relativePath, content))
+      }
     } catch (err) {
       const msg = `Failed to write "${relativePath}": ${err instanceof Error ? err.message : String(err)}`
       console.error(`[ingest] ${msg}`)
       warnings.push(msg)
       hardFailures.push(relativePath)
     }
+  }
+
+  try {
+    const duplicateResult = await mergeStrongIdentityDuplicatePages(projectPath)
+    for (const rel of duplicateResult.mergedPaths) {
+      if (!writtenPaths.includes(rel)) writtenPaths.push(rel)
+    }
+    for (const rel of duplicateResult.deletedPaths) {
+      warnings.push(`Merged duplicate concept page and removed "${rel}".`)
+    }
+    warnings.push(...duplicateResult.warnings)
+  } catch (err) {
+    const msg = `Strong identity duplicate scan failed: ${err instanceof Error ? err.message : String(err)}`
+    console.warn(`[ingest] ${msg}`)
+    warnings.push(msg)
   }
 
   return { writtenPaths, warnings, hardFailures }
@@ -3135,7 +3160,7 @@ async function backfillMissingSchemaCandidatePages(
       continue
     }
 
-    const { writtenPaths, warnings } = await writeFileBlocks(projectPath, generation)
+    const { writtenPaths, warnings } = await writeFileBlocks(projectPath, generation, sourceFileName)
     allWritten.push(...writtenPaths)
     allWarnings.push(...warnings)
     knownTitles = await collectWikiPageTitles(projectPath)

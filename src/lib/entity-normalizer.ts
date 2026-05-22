@@ -20,7 +20,8 @@
  * Scope: only applies to wiki/entities/ and wiki/concepts/
  */
 
-import { createDirectory, listDirectory, readFile, writeFile } from "@/commands/fs"
+import { createDirectory, deleteFile, listDirectory, readFile, writeFile } from "@/commands/fs"
+import { buildMergedReviewContent } from "@/lib/knowledge-governance/review-actions"
 import {
   inferStableInsuranceDedupKey,
   inferStrongInsuranceIdentityKeys,
@@ -143,6 +144,68 @@ export async function loadExistingEntities(
   }
 
   return results
+}
+
+export function buildExistingEntityIndexItem(
+  projectPath: string,
+  relativePath: string,
+  content: string,
+): ExistingEntity {
+  return {
+    fullPath: `${projectPath}/${relativePath}`,
+    relativePath,
+    name: nameFromPath(relativePath),
+    entityType: extractScalar(content, "entity_type"),
+    dedupKey: inferEntityDedupKey(content, nameFromPath(relativePath)),
+    identityKeys: inferEntityIdentityKeys(content, nameFromPath(relativePath)),
+    businessSignature: inferBusinessSignature(content, nameFromPath(relativePath)),
+    familySignature: inferVariantFamilySignature(content, nameFromPath(relativePath))?.signature,
+  }
+}
+
+export async function mergeStrongIdentityDuplicatePages(
+  projectPath: string,
+): Promise<{ mergedPaths: string[]; deletedPaths: string[]; warnings: string[] }> {
+  const entities = await loadExistingEntities(projectPath)
+  const warnings: string[] = []
+  const mergedPaths: string[] = []
+  const deletedPaths: string[] = []
+  const seenPairs = new Set<string>()
+
+  for (const entity of entities) {
+    for (const candidate of entities) {
+      if (entity.relativePath === candidate.relativePath) continue
+      if (!compatibleEntityTypesForMerge(entity.entityType, candidate.entityType)) continue
+      if (!hasSharedIdentityKey(entity.identityKeys ?? [], candidate.identityKeys ?? [])) continue
+
+      const [canonical, duplicate] = chooseCanonicalEntity(entity, candidate)
+      const pairKey = `${canonical.relativePath}<- ${duplicate.relativePath}`
+      const reverseKey = `${duplicate.relativePath}<- ${canonical.relativePath}`
+      if (seenPairs.has(pairKey) || seenPairs.has(reverseKey) || deletedPaths.includes(duplicate.relativePath)) continue
+      seenPairs.add(pairKey)
+
+      try {
+        const [canonicalContent, duplicateContent] = await Promise.all([
+          readFile(canonical.fullPath),
+          readFile(duplicate.fullPath),
+        ])
+        const withAlias = injectAlias(canonicalContent, duplicate.name)
+        const merged = buildMergedReviewContent(withAlias, duplicateContent, duplicate.name)
+        await writeFile(canonical.fullPath, merged)
+        await deleteFile(duplicate.fullPath)
+        mergedPaths.push(canonical.relativePath)
+        deletedPaths.push(duplicate.relativePath)
+      } catch (err) {
+        warnings.push(`Could not merge duplicate "${duplicate.relativePath}" into "${canonical.relativePath}": ${err instanceof Error ? err.message : String(err)}`)
+      }
+    }
+  }
+
+  return {
+    mergedPaths: dedupeStrings(mergedPaths),
+    deletedPaths: dedupeStrings(deletedPaths),
+    warnings,
+  }
 }
 
 async function safeRead(path: string): Promise<string> {
@@ -542,6 +605,26 @@ function compatibleEntityTypes(existingType = "", newType = ""): boolean {
   return false
 }
 
+function compatibleEntityTypesForMerge(a = "", b = ""): boolean {
+  if (compatibleEntityTypes(a, b)) return true
+  const serviceTypes = new Set(["service_benefit", "process", "rule", "service_plan", "product"])
+  return serviceTypes.has(a) && serviceTypes.has(b)
+}
+
+function chooseCanonicalEntity(a: ExistingEntity, b: ExistingEntity): [ExistingEntity, ExistingEntity] {
+  const score = (entity: ExistingEntity): number => {
+    let value = 0
+    if (entity.entityType === "product" || entity.entityType === "service_benefit") value += 40
+    if (entity.entityType === "service_plan") value += 30
+    if (entity.entityType === "process") value += 20
+    if (entity.entityType === "rule") value += 10
+    value += Math.max(0, 80 - entity.name.length)
+    if (!/流程|说明|规则/.test(entity.name)) value += 10
+    return value
+  }
+  return score(a) >= score(b) ? [a, b] : [b, a]
+}
+
 function inferEntityDedupKey(content: string, fallbackName: string): string {
   const existing = extractScalar(content, "dedup_key")
   if (existing) return existing
@@ -564,12 +647,28 @@ function inferEntityIdentityKeys(content: string, fallbackName: string): string[
     fallback: fallbackName,
   })
   const existingDedupKey = extractScalar(content, "dedup_key")
-  return inferStrongInsuranceIdentityKeys({
+  const keys = inferStrongInsuranceIdentityKeys({
     entityType,
     title,
     attributes,
     dedupKey: existingDedupKey || dedupKey,
   })
+  const serviceKey = inferServiceTitleIdentityKey(title || fallbackName)
+  if (serviceKey) keys.push(serviceKey)
+  return dedupeStrings(keys)
+}
+
+function inferServiceTitleIdentityKey(title: string): string {
+  const normalized = title
+    .replace(/服务流程|流程|服务说明|说明|规则/g, "")
+    .replace(/服务$/g, "")
+    .replace(/[\s_\-·•、，,]/g, "")
+    .trim()
+  if (!normalized || normalized.length < 3) return ""
+  if (!/家庭医生|在线问诊|音视频问诊|音视频首访|音视频随访|年度健康报告|名医大咖|特色体检|体检报告解读|21天社群训练营|用药服务|数字化管理|门诊预约协助|就医陪诊|检查安排协助|专家会诊|海外远程书面咨询|国内住院安排协助|手术安排协助|海外重疾住院安排协助|住院照护|出院安排协助|康复门诊协助|康复住院协助|上门护理|康复训练管理|重疾专案管理|心理咨询|臻享家医服务计划|平安臻享家医/.test(normalized)) {
+    return ""
+  }
+  return `service_identity.title.${normalized.toLowerCase()}`
 }
 
 function hasSharedIdentityKey(existingKeys: string[], incomingKeys: string[]): boolean {

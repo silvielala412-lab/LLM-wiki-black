@@ -18,7 +18,7 @@ interface CacheData {
   entries: Record<string, CacheEntry> // keyed by source filename
 }
 
-const INGEST_PIPELINE_VERSION = "strong-concept-identity-v6"
+const INGEST_PIPELINE_VERSION = "service-router-dedupe-v7"
 
 async function sha256(content: string): Promise<string> {
   if (!globalThis.crypto?.subtle) {
