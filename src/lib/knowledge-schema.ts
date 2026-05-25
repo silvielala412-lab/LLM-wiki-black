@@ -111,7 +111,23 @@ export interface KnowledgeRelation {
   type: RelationType
   inverse_type?: string
   bidirectional: boolean
+  /**
+   * confidence: factual reliability of this relation edge.
+   * "Is this relation actually true?" — determined by evidence quality and source.
+   * Range 0.0–1.0.
+   */
   confidence: number
+  /**
+   * strength: business importance of this relation type for reasoning/retrieval.
+   * "How much should RAG/Agent weight this edge when expanding the graph?"
+   * Determined by relation type semantics, not evidence. Range 0.0–1.0.
+   */
+  strength: number
+  /**
+   * Composite retrieval score for graph expansion priority.
+   * score = confidence * strength. Pre-computed to avoid recalculation.
+   */
+  score: number
   evidence_refs: string[]
   created_at: string
   created_by: "llm" | "system" | "user"
@@ -286,6 +302,92 @@ export const RELATION_INVERSE_LABELS: Partial<Record<RelationType, string>> = {
   review_required_by: "requires_review",
   bundled_with: "bundled_with",
   complements: "complements",
+}
+
+// ─── Relation Scoring Constants ───────────────────────────────────────────────
+// These constants encode the four-layer schema's relation layer contract.
+// Used at index-build time (knowledge-relation-index.ts) and by the RAG API.
+
+/**
+ * Confidence modifier by relation creation source.
+ * Governance Layer (Layer 4): source metadata → confidence modifier
+ */
+export const RELATION_SOURCE_CONFIDENCE: Record<"system" | "llm" | "user", number> = {
+  system: 1.00, // postprocess schema-inferred (e.g. part_of from related_product)
+  user:   1.00, // human-annotated — ground truth
+  llm:    0.85, // LLM-generated — needs evidence to raise confidence
+}
+
+/**
+ * Per-relation-type base scores.
+ * confidence_base: reliability of this relation type as a fact.
+ * strength: business importance for RAG/Agent graph expansion.
+ * Relation Layer (Layer 3): type semantics → retrieval weight
+ */
+export const RELATION_TYPE_SCORES: Record<RelationType, { confidence_base: number; strength: number }> = {
+  // Structural composition
+  part_of:               { confidence_base: 0.95, strength: 0.95 },
+  has_part:              { confidence_base: 0.95, strength: 0.95 },
+  parent_of:             { confidence_base: 0.92, strength: 0.90 },
+  child_of:              { confidence_base: 0.92, strength: 0.90 },
+  // Regulatory / compliance
+  governed_by:           { confidence_base: 0.90, strength: 0.92 },
+  governs:               { confidence_base: 0.90, strength: 0.92 },
+  defines:               { confidence_base: 0.88, strength: 0.85 },
+  defined_by:            { confidence_base: 0.88, strength: 0.85 },
+  mitigates:             { confidence_base: 0.85, strength: 0.80 },
+  mitigated_by:          { confidence_base: 0.85, strength: 0.80 },
+  not_recommended_for:   { confidence_base: 0.85, strength: 0.75 },
+  // Evidence / provenance
+  has_evidence:          { confidence_base: 0.88, strength: 0.82 },
+  derived_from:          { confidence_base: 0.85, strength: 0.80 },
+  described_by:          { confidence_base: 0.82, strength: 0.75 },
+  describes:             { confidence_base: 0.82, strength: 0.75 },
+  // Business application
+  applies_to:            { confidence_base: 0.82, strength: 0.85 },
+  recommended_for:       { confidence_base: 0.80, strength: 0.82 },
+  has_recommendation:    { confidence_base: 0.80, strength: 0.82 },
+  targets_persona:       { confidence_base: 0.80, strength: 0.80 },
+  targeted_by:           { confidence_base: 0.80, strength: 0.80 },
+  // Sales / method
+  supports:              { confidence_base: 0.78, strength: 0.75 },
+  supported_by:          { confidence_base: 0.78, strength: 0.75 },
+  uses_pitch:            { confidence_base: 0.82, strength: 0.80 },
+  used_by_pitch:         { confidence_base: 0.82, strength: 0.80 },
+  uses_objection_handling:      { confidence_base: 0.82, strength: 0.80 },
+  used_by_objection_handling:   { confidence_base: 0.82, strength: 0.80 },
+  uses_asset:            { confidence_base: 0.78, strength: 0.72 },
+  fills_gap_for:         { confidence_base: 0.75, strength: 0.70 },
+  // Product / versioning
+  complements:           { confidence_base: 0.78, strength: 0.75 },
+  bundled_with:          { confidence_base: 0.80, strength: 0.78 },
+  supersedes:            { confidence_base: 0.88, strength: 0.85 },
+  updates:               { confidence_base: 0.85, strength: 0.82 },
+  refines:               { confidence_base: 0.78, strength: 0.72 },
+  maps_to:               { confidence_base: 0.75, strength: 0.68 },
+  conflicts_with:        { confidence_base: 0.82, strength: 0.78 },
+  // Governance
+  requires_review:       { confidence_base: 0.90, strength: 0.60 },
+  review_required_by:    { confidence_base: 0.90, strength: 0.60 },
+  // Soft / supplementary
+  related_to:            { confidence_base: 0.60, strength: 0.45 },
+  mentions:              { confidence_base: 0.70, strength: 0.35 },
+}
+
+/**
+ * Query-intent → high-priority relation types for RAG graph expansion.
+ * RAG/Agent uses this to route which edges to follow per query intent.
+ * Relation Layer (Layer 3): query-time routing contract.
+ */
+export const RELATION_QUERY_AFFINITY: Record<string, RelationType[]> = {
+  composition:  ["has_part", "part_of", "defined_by", "describes"],
+  compliance:   ["governed_by", "governs", "defines", "mitigated_by", "not_recommended_for"],
+  suitability:  ["recommended_for", "applies_to", "targets_persona", "not_recommended_for"],
+  sales:        ["uses_pitch", "uses_objection_handling", "supports", "targets_persona"],
+  evidence:     ["has_evidence", "derived_from", "described_by", "describes"],
+  combination:  ["bundled_with", "complements", "recommended_for"],
+  versioning:   ["supersedes", "updates", "refines"],
+  general:      ["part_of", "has_part", "governed_by", "applies_to", "recommended_for"],
 }
 
 export const UNIVERSAL_INSURANCE_SCHEMA_PROMPT = [

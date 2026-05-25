@@ -4,6 +4,8 @@ import { normalizePath } from "@/lib/path-utils"
 import {
   ENTITY_TYPE_DOMAIN,
   RELATION_INVERSE_LABELS,
+  RELATION_TYPE_SCORES,
+  RELATION_SOURCE_CONFIDENCE,
   type BusinessPhase,
   type KnowledgeDomain,
   type KnowledgeEntityType,
@@ -99,43 +101,51 @@ export async function buildKnowledgeRelationIndex(projectPath: string): Promise<
     const content = pageContent.get(page.path) ?? ""
     const parsed = parseMarkdownFrontmatter(content)
 
+    // Page-level confidence for quality weighting
+    const pageConf = parseFloat(frontmatterString(parsed.frontmatter, "confidence") ?? "0.75") || 0.75
+
     for (const related of page.related) {
       const target = resolveTarget(related, byId, byTitle)
-      pushRelation(relations, seen, page, target, related, "related_to", 0.8, "llm")
+      const scores = computeRelationScore("related_to", "llm", false, pageConf)
+      pushRelation(relations, seen, page, target, related, "related_to", scores, "llm", [])
     }
 
     const parent = frontmatterString(parsed.frontmatter, "parent")
     if (parent) {
       const target = resolveTarget(parent, byId, byTitle)
-      pushRelation(relations, seen, page, target, parent, "child_of", 0.9, "llm")
+      const scores = computeRelationScore("child_of", "llm", false, pageConf)
+      pushRelation(relations, seen, page, target, parent, "child_of", scores, "llm", [])
     }
 
     for (const child of frontmatterList(parsed.frontmatter, "children")) {
       const target = resolveTarget(child, byId, byTitle)
-      pushRelation(relations, seen, page, target, child, "parent_of", 0.9, "llm")
+      const scores = computeRelationScore("parent_of", "llm", false, pageConf)
+      pushRelation(relations, seen, page, target, child, "parent_of", scores, "llm", [])
     }
 
     for (const link of extractWikilinks(parsed.body)) {
       const target = resolveTarget(link, byId, byTitle)
-      pushRelation(relations, seen, page, target, link, "mentions", 0.7, "system")
+      const scores = computeRelationScore("mentions", "system", false, pageConf)
+      pushRelation(relations, seen, page, target, link, "mentions", scores, "system", [])
     }
 
     for (const relationLine of frontmatterList(parsed.frontmatter, "relations")) {
       const parsedRelation = parseCompactRelation(relationLine)
       if (!parsedRelation) continue
       const target = resolveTarget(parsedRelation.target, byId, byTitle)
+      // Frontmatter relations are explicitly written — treat as llm with existing evidence check
+      const hasEvidence = frontmatterList(parsed.frontmatter, "claims").length > 0
+      const scores = computeRelationScore(parsedRelation.type, "llm", hasEvidence, pageConf)
       pushRelation(
-        relations,
-        seen,
-        page,
-        target,
-        parsedRelation.target,
-        parsedRelation.type,
-        parsedRelation.confidence,
-        "llm",
+        relations, seen, page, target, parsedRelation.target,
+        parsedRelation.type, scores, "llm",
+        hasEvidence ? frontmatterList(parsed.frontmatter, "source_files") : [],
       )
     }
   }
+
+  // Sort by score descending so RAG/Agent always gets highest-priority edges first
+  relations.sort((a, b) => b.score - a.score)
 
   return { pages, relations }
 }
@@ -210,6 +220,23 @@ function extractWikilinks(content: string): string[] {
   return links
 }
 
+function computeRelationScore(
+  type: RelationType,
+  createdBy: "llm" | "system" | "user",
+  hasEvidence: boolean,
+  pageConfidence: number,
+): { confidence: number; strength: number; score: number } {
+  const typeScore = RELATION_TYPE_SCORES[type] ?? { confidence_base: 0.60, strength: 0.45 }
+  const sourceFactor = RELATION_SOURCE_CONFIDENCE[createdBy] ?? 0.85
+  const evidenceFactor = hasEvidence ? 1.08 : 1.0
+  // Page confidence (0-1) contributes a modest boost: pages with confidence>0.85
+  // get +5% on their relations, pages < 0.6 get -10%
+  const pageQualityFactor = pageConfidence >= 0.85 ? 1.05 : pageConfidence < 0.6 ? 0.90 : 1.0
+  const confidence = Math.min(1, typeScore.confidence_base * sourceFactor * evidenceFactor * pageQualityFactor)
+  const strength = typeScore.strength
+  return { confidence, strength, score: confidence * strength }
+}
+
 function pushRelation(
   relations: KnowledgeRelation[],
   seen: Set<string>,
@@ -217,8 +244,9 @@ function pushRelation(
   target: KnowledgeIndexPage | null,
   targetLabel: string,
   type: RelationType,
-  confidence: number,
+  scores: { confidence: number; strength: number; score: number },
   createdBy: "llm" | "system" | "user",
+  evidenceRefs: string[],
 ): void {
   const targetId = target?.id ?? slugId(targetLabel)
   if (!targetId || targetId === source.id) return
@@ -238,8 +266,10 @@ function pushRelation(
     type,
     inverse_type: RELATION_INVERSE_LABELS[type],
     bidirectional: true,
-    confidence,
-    evidence_refs: [],
+    confidence: scores.confidence,
+    strength: scores.strength,
+    score: scores.score,
+    evidence_refs: evidenceRefs,
     created_at: new Date().toISOString(),
     created_by: createdBy,
   })
