@@ -10,9 +10,11 @@ export interface ServiceInventoryRow {
 
 interface SourceFacts {
   rows: ServiceInventoryRow[]
+  serviceItems: string[]
   coverageByService: Map<string, string>
   serviceProvider: string
   relatedProduct: string
+  sourceFileName: string
 }
 
 interface DirEntry {
@@ -24,8 +26,8 @@ const AUTO_SECTION_MARKER = "<!-- service-benefit-enrichment -->"
 
 export async function enrichServiceBenefitPagesFromSources(projectPath: string): Promise<string[]> {
   const facts = await collectSourceFacts(projectPath)
-  if (facts.rows.length === 0) return []
-  return enrichServiceBenefitPages(projectPath, facts)
+  if (facts.rows.length === 0 && facts.serviceItems.length === 0) return []
+  return ensureAndEnrichServiceBenefitPages(projectPath, facts)
 }
 
 export async function enrichServiceBenefitPagesFromText(
@@ -38,10 +40,13 @@ export async function enrichServiceBenefitPagesFromText(
   const directCoverage = parseCoverageTable(sourceContent)
   for (const [service, coverage] of directCoverage) facts.coverageByService.set(normalizeServiceName(service), coverage)
   const directProvider = stringValue(parseAttributes(sourceContent).service_provider)
+  const directItems = parseDeclaredServiceItems(sourceContent)
   facts.rows = dedupeRows([...directRows, ...facts.rows])
+  facts.serviceItems = dedupeNames([...directItems, ...facts.serviceItems, ...directRows.map((row) => row.serviceName)])
+  facts.sourceFileName = sourceFileName
   if (directProvider) facts.serviceProvider = directProvider
   if (!facts.relatedProduct) facts.relatedProduct = scalar(sourceContent, "title") || "臻享家医健康服务计划"
-  return enrichServiceBenefitPages(projectPath, facts)
+  return ensureAndEnrichServiceBenefitPages(projectPath, facts)
 }
 
 export function parseServiceInventoryRows(content: string, sourceFile = "source"): ServiceInventoryRow[] {
@@ -53,9 +58,11 @@ export function parseServiceInventoryRows(content: string, sourceFile = "source"
 
 async function collectSourceFacts(projectPath: string): Promise<SourceFacts> {
   const rows: ServiceInventoryRow[] = []
+  const serviceItems: string[] = []
   const coverageByService = new Map<string, string>()
   let serviceProvider = ""
   let relatedProduct = ""
+  let sourceFileName = ""
 
   const sourceFiles = await safeList(`${projectPath}/wiki/sources`)
   for (const file of sourceFiles) {
@@ -65,8 +72,10 @@ async function collectSourceFacts(projectPath: string): Promise<SourceFacts> {
     const attrs = parseAttributes(content)
     if (!serviceProvider) serviceProvider = stringValue(attrs.service_provider)
     if (!relatedProduct) relatedProduct = scalar(content, "title") || file.name.replace(/\.md$/i, "")
+    if (!sourceFileName) sourceFileName = firstListValue(content, "source_files") || firstListValue(content, "sources") || file.name
     rows.push(...parseMarkdownServiceTable(content, file.name))
     rows.push(...parseSequentialOcrServiceTable(content, file.name))
+    serviceItems.push(...parseDeclaredServiceItems(content))
     for (const [service, coverage] of parseCoverageTable(content)) {
       coverageByService.set(normalizeServiceName(service), coverage)
     }
@@ -74,10 +83,18 @@ async function collectSourceFacts(projectPath: string): Promise<SourceFacts> {
 
   return {
     rows: dedupeRows(rows),
+    serviceItems: dedupeNames([...serviceItems, ...rows.map((row) => row.serviceName)]),
     coverageByService,
     serviceProvider,
     relatedProduct,
+    sourceFileName,
   }
+}
+
+async function ensureAndEnrichServiceBenefitPages(projectPath: string, facts: SourceFacts): Promise<string[]> {
+  const created = await ensureMissingServiceBenefitPages(projectPath, facts)
+  const enriched = await enrichServiceBenefitPages(projectPath, facts)
+  return [...created, ...enriched.filter((path) => !created.includes(path))]
 }
 
 async function enrichServiceBenefitPages(projectPath: string, facts: SourceFacts): Promise<string[]> {
@@ -103,6 +120,34 @@ async function enrichServiceBenefitPages(projectPath: string, facts: SourceFacts
     }
   }
   return updatedPaths
+}
+
+async function ensureMissingServiceBenefitPages(projectPath: string, facts: SourceFacts): Promise<string[]> {
+  const existingFiles = await safeList(`${projectPath}/wiki/entities`)
+  const existingNames = new Set<string>()
+  for (const file of existingFiles) {
+    if (file.is_dir || !file.name.endsWith(".md")) continue
+    const content = await readFile(`${projectPath}/wiki/entities/${file.name}`).catch(() => "")
+    const title = scalar(content, "title") || file.name.replace(/\.md$/i, "")
+    existingNames.add(normalizeServiceName(title))
+    const attrs = parseAttributes(content)
+    const serviceName = stringValue(attrs.service_name)
+    if (serviceName) existingNames.add(normalizeServiceName(serviceName))
+  }
+
+  const created: string[] = []
+  for (const serviceName of facts.serviceItems) {
+    const normalized = normalizeServiceName(serviceName)
+    if (!normalized || existingNames.has(normalized)) continue
+
+    const row = findServiceRow(facts.rows, serviceName, serviceName)
+    const path = `wiki/entities/${safeFileName(serviceName)}.md`
+    const content = buildServiceBenefitPage(serviceName, row, facts)
+    await writeFile(`${projectPath}/${path}`, content)
+    existingNames.add(normalized)
+    created.push(path)
+  }
+  return created
 }
 
 function parseMarkdownServiceTable(content: string, sourceFile: string): ServiceInventoryRow[] {
@@ -195,6 +240,19 @@ function parseCoverageTable(content: string): Map<string, string> {
   return result
 }
 
+function parseDeclaredServiceItems(content: string): string[] {
+  const attrs = parseAttributes(content)
+  const fromAttrs = Array.isArray(attrs.service_items)
+    ? attrs.service_items.map(stringValue).filter(Boolean)
+    : []
+  const fromStructuredTable: string[] = []
+  for (const match of content.matchAll(/\|\s*`?service_benefit`?\s*\|\s*([^|\r\n]+?)\s*\|/g)) {
+    const item = clean(match[1])
+    if (isServiceItem(item)) fromStructuredTable.push(item)
+  }
+  return dedupeNames([...fromAttrs, ...fromStructuredTable])
+}
+
 function enrichServicePage(content: string, row: ServiceInventoryRow, facts: SourceFacts): string {
   const attrs = parseAttributes(content)
   attrs.service_name = stringValue(attrs.service_name) || row.serviceName
@@ -219,6 +277,104 @@ function enrichServicePage(content: string, row: ServiceInventoryRow, facts: Sou
   next = replaceScalar(next, "updated", new Date().toISOString().slice(0, 10))
   next = upsertAutoSection(next, row, facts, coverage)
   return next
+}
+
+function buildServiceBenefitPage(serviceName: string, row: ServiceInventoryRow | null, facts: SourceFacts): string {
+  const date = new Date().toISOString().slice(0, 10)
+  const coverage = findCoverage(facts.coverageByService, serviceName)
+  const sourceFile = facts.sourceFileName || row?.sourceFile || "来源文档"
+  const category = row ? [row.serviceScene, row.serviceStage].filter(Boolean).join("/") : ""
+  const gaps = [
+    row?.serviceFrequency ? "" : "service_frequency",
+    category ? "" : "service_category",
+    coverage ? "" : "coverage_scope",
+    facts.serviceProvider ? "" : "service_provider",
+    "application_process",
+    "time_limits",
+    "service_limits",
+    "compliance_notes",
+  ].filter(Boolean)
+  const attrs = {
+    service_name: serviceName,
+    related_product: facts.relatedProduct || "臻享家医健康服务计划",
+    service_category: category || null,
+    core_value: null,
+    eligible_customers: null,
+    service_frequency: row?.serviceFrequency || null,
+    application_process: null,
+    time_limits: null,
+    service_provider: facts.serviceProvider || null,
+    coverage_scope: coverage || null,
+    service_limits: null,
+    compliance_notes: null,
+    knowledge_gaps: gaps,
+  }
+  const summaryText = `${serviceName}是${facts.relatedProduct || "服务手册"}中的服务权益，已由源文档清单自动生成。`
+  const relatedProduct = facts.relatedProduct || "臻享家医健康服务计划"
+  const knownRows = [
+    row?.serviceScene ? `| 服务场景 | ${escapeTable(row.serviceScene)} |` : "",
+    row?.serviceStage ? `| 服务阶段 | ${escapeTable(row.serviceStage)} |` : "",
+    `| 服务项目 | ${escapeTable(serviceName)} |`,
+    row?.serviceFrequency ? `| 服务次数 | ${escapeTable(row.serviceFrequency)} |` : "",
+    facts.serviceProvider ? `| 服务提供方 | ${escapeTable(facts.serviceProvider)} |` : "",
+    coverage ? `| 覆盖范围 | ${escapeTable(coverage)} |` : "",
+  ].filter(Boolean)
+
+  return [
+    "---",
+    'schema_version: "2.1"',
+    "industry: insurance",
+    "knowledge_domain: product",
+    "domain: product",
+    "taxonomy_path: [product, service_benefit]",
+    "type: entity",
+    "entity_type: service_benefit",
+    "business_phase: service",
+    `dedup_key: "service_benefit.${escapeYaml(serviceName)}"`,
+    `title: "${escapeYaml(serviceName)}"`,
+    `summary: "${escapeYaml(summaryText)}"`,
+    `created: ${date}`,
+    `updated: ${date}`,
+    `created_at: ${date}`,
+    `updated_at: ${date}`,
+    "created_by: system",
+    `tags: ["服务权益", "${escapeYaml(serviceName)}"]`,
+    `keywords: ["${escapeYaml(serviceName)}"]`,
+    `related: ["${escapeYaml(relatedProduct)}"]`,
+    'relations:',
+    `  - "part_of: ${escapeYaml(relatedProduct)}"`,
+    'parent: ""',
+    "children: []",
+    `source_files: ["${escapeYaml(sourceFile)}"]`,
+    `sources: ["${escapeYaml(sourceFile)}"]`,
+    'source_type: "service_manual"',
+    "confidence: 0.78",
+    "status: candidate",
+    "needs_review: true",
+    `attributes: ${JSON.stringify(attrs)}`,
+    "claims: []",
+    "---",
+    "",
+    `# ${serviceName}`,
+    "",
+    AUTO_SECTION_MARKER,
+    "## 服务手册确定信息",
+    "",
+    "| 字段 | 已抽取事实 |",
+    "|---|---|",
+    knownRows.join("\n"),
+    "",
+    `来源依据：[[${sourceFile.replace(/\.[^.]+$/i, "")}]] 服务项目清单。`,
+    "",
+    "## 服务说明",
+    "",
+    `${serviceName} 是服务手册中识别出的独立服务权益。当前页面由系统根据服务清单兜底生成，用于避免重要服务项只停留在源文档中而没有独立知识页。`,
+    "",
+    "## 待补全信息",
+    "",
+    gaps.length > 0 ? gaps.map((gap) => `- ${gap}`).join("\n") : "- 暂无",
+    "",
+  ].join("\n")
 }
 
 function upsertAutoSection(content: string, row: ServiceInventoryRow, facts: SourceFacts, coverage = ""): string {
@@ -336,6 +492,26 @@ function dedupeRows(rows: ServiceInventoryRow[]): ServiceInventoryRow[] {
   return result
 }
 
+function dedupeNames(names: string[]): string[] {
+  const seen = new Set<string>()
+  const result: string[] = []
+  for (const name of names.map(clean).filter(isServiceItem)) {
+    const key = normalizeServiceName(name)
+    if (!key || seen.has(key)) continue
+    seen.add(key)
+    result.push(name)
+  }
+  return result
+}
+
+function safeFileName(name: string): string {
+  const safe = clean(name)
+    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_")
+    .replace(/\s+/g, "")
+    .slice(0, 80)
+  return `${safe || "service_benefit"}.md`
+}
+
 function scalar(content: string, key: string): string {
   const fm = content.match(/^---\r?\n([\s\S]*?)\r?\n---/m)?.[1] ?? ""
   const match = fm.match(new RegExp(`^${escapeRegExp(key)}\\s*:\\s*(.*?)\\s*$`, "m"))
@@ -351,6 +527,13 @@ function parseAttributes(content: string): Record<string, unknown> {
   } catch {
     return {}
   }
+}
+
+function firstListValue(content: string, key: string): string {
+  const fm = content.match(/^---\r?\n([\s\S]*?)\r?\n---/m)?.[1] ?? ""
+  const inline = fm.match(new RegExp(`^${escapeRegExp(key)}\\s*:\\s*\\[([^\\]]*)]`, "m"))
+  if (!inline) return ""
+  return stripQuotes(inline[1].split(",")[0]?.trim() ?? "")
 }
 
 function replaceAttributes(content: string, attrs: Record<string, unknown>): string {
@@ -388,4 +571,8 @@ function stripQuotes(value: string): string {
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+}
+
+function escapeYaml(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')
 }

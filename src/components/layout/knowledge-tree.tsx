@@ -67,6 +67,10 @@ export function KnowledgeTree() {
       const pageInfos: WikiPageInfo[] = []
       for (const file of mdFiles) {
         if (file.name === "index.md" || file.name === "log.md") continue
+        if (!shouldReadPageMetadata(file.path)) {
+          pageInfos.push(parsePageInfo(file.path, file.name, ""))
+          continue
+        }
         try {
           const content = await readFile(file.path)
           const info = parsePageInfo(file.path, file.name, content)
@@ -348,6 +352,14 @@ function RawSourcesSection() {
       )}
     </div>
   )
+}
+
+function shouldReadPageMetadata(path: string): boolean {
+  const normalized = normalizePath(path)
+  if (normalized.includes("/wiki/sources/")) return false
+  if (normalized.includes("/wiki/audits/")) return false
+  if (normalized.includes("/wiki/media/")) return false
+  return true
 }
 
 function parsePageInfo(path: string, fileName: string, content: string): WikiPageInfo {

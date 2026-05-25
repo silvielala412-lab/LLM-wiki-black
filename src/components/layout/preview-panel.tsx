@@ -11,6 +11,8 @@ import { cascadeDeleteWikiPage } from "@/lib/wiki-page-delete"
 import { ConfirmDialog } from "@/components/ui/confirm-dialog"
 import { useAuthStore } from "@/stores/auth-store"
 
+const LARGE_PREVIEW_CHAR_LIMIT = 160000
+
 function isWikiMarkdown(filePath: string): boolean {
   const np = normalizePath(filePath)
   return np.includes("/wiki/") && !np.includes("/wiki/media/") && np.endsWith(".md")
@@ -30,16 +32,25 @@ export function PreviewPanel() {
   const [editMode, setEditMode] = useState(false)
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
   const [showCreateMenu, setShowCreateMenu] = useState(false)
+  const [previewTruncated, setPreviewTruncated] = useState(false)
 
   useEffect(() => { setEditMode(false) }, [selectedFile])
 
   useEffect(() => {
-    if (!selectedFile) { setFileContent(""); lastLoadedRef.current = ""; return }
+    if (!selectedFile) { setFileContent(""); lastLoadedRef.current = ""; setPreviewTruncated(false); return }
     const category = getFileCategory(selectedFile)
-    if (isBinary(category)) { setFileContent(""); lastLoadedRef.current = ""; return }
+    if (isBinary(category)) { setFileContent(""); lastLoadedRef.current = ""; setPreviewTruncated(false); return }
     readFile(selectedFile)
-      .then((c) => { lastLoadedRef.current = c; setFileContent(c) })
-      .catch((err) => { lastLoadedRef.current = ""; setFileContent(`Error: ${err}`) })
+      .then((c) => {
+        const truncated = c.length > LARGE_PREVIEW_CHAR_LIMIT
+        const content = c.length > LARGE_PREVIEW_CHAR_LIMIT
+          ? `${c.slice(0, LARGE_PREVIEW_CHAR_LIMIT)}\n\n> 文件内容较大，预览已截断以保持界面响应。完整内容仍保存在文件中，截断预览不会覆盖原文。`
+          : c
+        lastLoadedRef.current = content
+        setPreviewTruncated(truncated)
+        setFileContent(content)
+      })
+      .catch((err) => { lastLoadedRef.current = ""; setPreviewTruncated(false); setFileContent(`Error: ${err}`) })
   }, [selectedFile, setFileContent])
 
   const handleSave = useCallback((markdown: string) => {
@@ -155,7 +166,12 @@ export function PreviewPanel() {
 
           {/* Edit toggle */}
           {isWiki && (
-            <button onClick={() => setEditMode((m) => !m)} className="rounded px-2 py-0.5 text-xs text-muted-foreground hover:bg-accent transition-colors">
+            <button
+              onClick={() => !previewTruncated && setEditMode((m) => !m)}
+              disabled={previewTruncated}
+              className="rounded px-2 py-0.5 text-xs text-muted-foreground hover:bg-accent transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+              title={previewTruncated ? "大文件预览已截断，暂不允许直接编辑以避免覆盖完整内容" : undefined}
+            >
               {editMode ? "👁 预览" : "✏️ 编辑"}
             </button>
           )}
