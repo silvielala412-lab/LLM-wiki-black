@@ -12,6 +12,7 @@ import { cleanupKnowledgeFrontmatter } from "@/lib/knowledge-frontmatter-cleanup
 import { checkIngestCache, saveIngestCache } from "@/lib/ingest-cache"
 import { withProjectLock } from "@/lib/project-mutex"
 import { writeExtractionQualityAudit } from "@/lib/extraction-quality-audit"
+import { runKnowledgePostProcess } from "@/lib/knowledge-postprocess"
 import {
   enrichServiceBenefitPagesFromText,
   parseServiceInventoryRows,
@@ -2748,6 +2749,20 @@ async function autoIngestImpl(
     })
     if (audit.auditPath && !writtenPaths.includes(audit.auditPath)) writtenPaths.push(audit.auditPath)
     extractionAuditReviewItems = audit.reviewItems
+
+    // ── Step 3.4b: Relation reconciliation + schema materialization ──
+    // Runs after all pages are on disk so the title index is complete.
+    try {
+      const postResult = await runKnowledgePostProcess(pp)
+      if (postResult.errors.length > 0) {
+        console.warn("[ingest] Post-process errors:", postResult.errors)
+      }
+      if (postResult.reconciled > 0 || postResult.materialized > 0) {
+        console.log(`[ingest] Post-process: reconciled=${postResult.reconciled} materialized=${postResult.materialized}`)
+      }
+    } catch (err) {
+      console.warn("[ingest] Post-process failed (non-critical):", err)
+    }
   }
 
   // ── Step 3.5: Append extracted images to the source-summary page ─
@@ -3846,7 +3861,6 @@ export function buildGenerationPrompt(schema: string, purpose: string, index: st
     "schema_version: \"2.1\"",
     "industry: insurance",
     "knowledge_domain: product | customer | method | content | activity | cases | compliance | general",
-    "domain: same value as knowledge_domain",
     "taxonomy_path: []",
     "type: concept | entity | event | process | rule | data | comparison | timeline | case | source",
     "entity_type: product | regulatory_doc | product_clause | service_benefit | product_combo | selling_point | persona | life_stage | customer_signal | customer_relationship | selling_scenario | pitch | objection_handling | sales_path | sales_playbook | referral_method | needs_discovery | asset | asset_collection | content_template | presentation_kit | campaign | incentive | success_case | failure_case | customer_voice | referral_case | agent_feedback | competitive_insight | compliance_rule | source | general",
@@ -3892,6 +3906,8 @@ export function buildGenerationPrompt(schema: string, purpose: string, index: st
     "- Also emit compact relation lines such as `recommended_for: target_key`, `applies_to: target_key`, `supports: target_key`, `has_part: target_key`, `complements: target_key`, `bundled_with: target_key`, `uses_asset: target_key`, and `governed_by: target_key`.",
     "- Relation rule: `recommended_for` only points to customer personas, life stages, or customer signals. Product-to-product pairing must use `complements` or `bundled_with`. Product/service composition must use `has_part`.",
     "- Customer pages must link back to suitable Product pages with `has_recommendation`, not `recommended_for`.",
+    "- part_of direction rule: service benefit child pages MUST use `part_of: <product-or-plan page title>` — pointing to the product or service plan entity page, NOT to the source document filename. Example: `part_of: 平安臻享家医健康服务计划`, never `part_of: 平安臻享家医服务手册.md`.",
+    "- Relation target naming rule: relation target values MUST exactly match the `title` field of an existing or concurrently generated wiki page. Do NOT append suffixes (e.g. write `在线问诊`, not `在线问诊_臻享家医`). Do NOT use the source document filename as a relation target for entity-to-entity relations.",
     "- Use the Insurance Schema Registry to choose a schema_key, then fill `attributes` with the entity-specific extension fields. Put unavailable fields as null or [] and mention important missing fields in `attributes.knowledge_gaps`.",
     "- Attribute key rule: use canonical English field names from the Insurance Schema Registry. If the source says 服务对象/适用客户, map it to the matching registry field such as eligible_customers or target_personas; do not invent parallel keys.",
     "- Keep universal governance status in `status` (candidate/active/superseded/rejected). Put business status such as 在售/已停售 in `attributes.product_status`, never in universal `status`.",

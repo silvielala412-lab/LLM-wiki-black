@@ -326,7 +326,6 @@ function buildServiceBenefitPage(serviceName: string, row: ServiceInventoryRow |
     'schema_version: "2.1"',
     "industry: insurance",
     "knowledge_domain: product",
-    "domain: product",
     "taxonomy_path: [product, service_benefit]",
     "type: entity",
     "entity_type: service_benefit",
