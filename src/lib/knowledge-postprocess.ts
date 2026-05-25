@@ -118,15 +118,36 @@ export async function runKnowledgePostProcess(projectPath: string): Promise<Post
   let reconciled = 0
   let materialized = 0
   let relationsInferred = 0
+  let titlesNormalized = 0
 
   try {
-    const index = await buildPageIndex(projectPath)
-    let titlesNormalized = 0
+    // Pass 0: Fix .md.md double-extension filenames before processing
+    // This happens when the LLM generates an entity title ending in ".md"
+    // and the page creation code appends another ".md".
+    const entityDirPath = `${projectPath}/wiki/entities`
+    const rawEntityFiles = await safeList(entityDirPath)
+    for (const file of rawEntityFiles) {
+      if (file.is_dir || !file.name.endsWith(".md.md")) continue
+      try {
+        const badPath  = `${entityDirPath}/${file.name}`
+        const goodName = file.name.replace(/\.md\.md$/, ".md")
+        const goodPath = `${entityDirPath}/${goodName}`
+        const content  = await readFile(badPath)
+        await writeFile(goodPath, content)
+        // We cannot delete via writeFile, but overwriting the good path is enough.
+        // The bad file will be stale; log for developer awareness.
+        lintWarnings.push(`renamed .md.md -> ${goodName}`)
+      } catch (err) {
+        errors.push(`rename ${file.name}: ${String(err)}`)
+      }
+    }
 
-    const entityFiles = await safeList(`${projectPath}/wiki/entities`)
+    const index = await buildPageIndex(projectPath)
+
+    const entityFiles = await safeList(entityDirPath)
     for (const file of entityFiles) {
-      if (file.is_dir || !file.name.endsWith(".md")) continue
-      const filePath = `${projectPath}/wiki/entities/${file.name}`
+      if (file.is_dir || !file.name.endsWith(".md") || file.name.endsWith(".md.md")) continue
+      const filePath = `${entityDirPath}/${file.name}`
       try {
         const original = await readFile(filePath)
 
@@ -167,7 +188,7 @@ export async function runKnowledgePostProcess(projectPath: string): Promise<Post
     errors.push(`post-process init: ${String(err)}`)
   }
 
-  return { reconciled, materialized, relationsInferred, titlesNormalized: 0, lintWarnings, errors }
+  return { reconciled, materialized, relationsInferred, titlesNormalized, lintWarnings, errors }
 }
 // ─── Title Normalization ─────────────────────────────────────────────────────────────────────
 
@@ -199,20 +220,10 @@ function materializeAttributes(content: string, fileName: string): [string, bool
   // Build inverse alias map: nonStandardName → canonicalName
   const aliasMap = buildInverseAliasMap(entityType)
 
-  // Extract current attributes
-  const attrsMatch = content.match(/^attributes:\s*(\{.*\})\s*$/m)
-  if (!attrsMatch) return [content, false, warnings]
-
-  let attrs: Record<string, unknown>
-  let rawAttrsText = ""
-  try {
-    attrs = JSON.parse(attrsMatch[1])
-    if (typeof attrs !== "object" || Array.isArray(attrs) || attrs === null) attrs = {}
-  } catch {
-    // Unparseable attributes: try to salvage from raw_attributes or start fresh
-    attrs = {}
-    rawAttrsText = attrsMatch[1]
-  }
+  // Parse attributes — supports both JSON ({...}) and YAML (key: value) formats.
+  // The LLM produces YAML-format attributes in most pages; the JSON regex
+  // `^attributes:\s*(\{.*\})\s*$` silently misses them entirely.
+  const { attrs, rawAttrsText, originalFormat } = parseYamlAttributes(content)
 
   // Salvage values from raw_attributes if present
   if ("raw_attributes" in attrs && typeof attrs["raw_attributes"] === "string") {
@@ -283,9 +294,72 @@ function materializeAttributes(content: string, fileName: string): [string, bool
     .filter((f) => f.importance !== "auto_derived" && attrs[f.name] === null)
     .map((f) => f.name)
 
+  // Write back: always use JSON inline format for machine-readability.
+  // This canonicalizes pages that were previously YAML-format attributes.
   const newAttrs = JSON.stringify(attrs)
-  const newContent = content.replace(/^attributes:\s*\{.*\}\s*$/m, `attributes: ${newAttrs}`)
+  const newContent = writeBackAttributes(content, newAttrs, originalFormat)
   return [newContent, newContent !== content, warnings]
+}
+
+/**
+ * Parse attributes from a page, supporting both:
+ *   JSON inline:  attributes: {"key": "val"}
+ *   YAML block:   attributes:\n  key: val\n  key2: val2
+ */
+function parseYamlAttributes(content: string): {
+  attrs: Record<string, unknown>
+  rawAttrsText: string
+  originalFormat: "json" | "yaml" | "none"
+} {
+  // Try JSON inline first (single line)
+  const jsonMatch = content.match(/^attributes:\s*(\{[^\n]*\})\s*$/m)
+  if (jsonMatch) {
+    try {
+      const parsed = JSON.parse(jsonMatch[1])
+      if (typeof parsed === "object" && !Array.isArray(parsed) && parsed !== null) {
+        return { attrs: parsed as Record<string, unknown>, rawAttrsText: "", originalFormat: "json" }
+      }
+    } catch {
+      // Fall through to YAML parse
+    }
+    return { attrs: {}, rawAttrsText: jsonMatch[1], originalFormat: "json" }
+  }
+
+  // Try YAML block: attributes:\n  key: value\n  key2: value2
+  // The block ends at the next top-level YAML key (unindented line with ":")
+  // or the frontmatter closing "---".
+  const yamlBlockMatch = content.match(/^attributes:\s*\n((?:[ \t]+[^\n]+\n?)*)/m)
+  if (yamlBlockMatch) {
+    const block = yamlBlockMatch[1]
+    const attrs: Record<string, unknown> = {}
+    for (const line of block.split("\n")) {
+      const stripped = line.trim()
+      if (!stripped || stripped.startsWith("#")) continue
+      const colonIdx = stripped.indexOf(":")
+      if (colonIdx < 1) continue
+      const key = stripped.slice(0, colonIdx).trim()
+      let val: string = stripped.slice(colonIdx + 1).trim()
+      // Strip YAML quotes
+      val = val.replace(/^"|"$/g, "").replace(/^'|'$/g, "")
+      // Convert null/empty to null
+      attrs[key] = (val === "" || val === "null" || val === "~") ? null : val
+    }
+    return { attrs, rawAttrsText: "", originalFormat: "yaml" }
+  }
+
+  return { attrs: {}, rawAttrsText: "", originalFormat: "none" }
+}
+
+function writeBackAttributes(content: string, newAttrsJson: string, originalFormat: "json" | "yaml" | "none"): string {
+  if (originalFormat === "json") {
+    return content.replace(/^attributes:\s*\{[^\n]*\}\s*$/m, `attributes: ${newAttrsJson}`)
+  }
+  if (originalFormat === "yaml") {
+    // Replace the YAML block with JSON inline
+    return content.replace(/^attributes:\s*\n(?:[ \t]+[^\n]+\n?)*/m, `attributes: ${newAttrsJson}\n`)
+  }
+  // No existing attributes block — append before closing ---
+  return content.replace(/(\n---\s*)$/, `\nattributes: ${newAttrsJson}$1`)
 }
 
 function buildInverseAliasMap(entityType: string): Record<string, string> {
@@ -332,20 +406,10 @@ function inferMissingRelations(content: string, index: PageIndex[]): [string, bo
   const hasAppliesTo = entityType !== "service_benefit" && /\bapplies_to\b/.test(fm)
   if (hasPartOf || hasAppliesTo) return [content, false]
 
-  // Read the parent value from attributes
-  const attrsMatch = content.match(/^attributes:\s*(\{.*\})\s*$/m)
-  if (!attrsMatch) return [content, false]
-
-  let parentTitle = ""
-  try {
-    const attrs = JSON.parse(attrsMatch[1]) as Record<string, unknown>
-    const parentValue = attrs[parentAttrField]
-    if (typeof parentValue === "string" && parentValue.trim()) {
-      parentTitle = parentValue.trim()
-    }
-  } catch {
-    return [content, false]
-  }
+  // Read the parent value from attributes — supports both JSON and YAML format
+  const { attrs } = parseYamlAttributes(content)
+  const parentValue = attrs[parentAttrField]
+  const parentTitle = (typeof parentValue === "string" && parentValue.trim()) ? parentValue.trim() : ""
 
   if (!parentTitle) return [content, false]
 

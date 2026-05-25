@@ -43,6 +43,30 @@ export interface KnowledgeRelationIndex {
   relations: KnowledgeRelation[]
 }
 
+export type RelationQueryIntent = keyof typeof RELATION_QUERY_AFFINITY
+
+export interface GraphExpansionOptions {
+  /** Minimum composite score. Edges below this are dropped. Default: 0.25. */
+  minScore?: number
+  /** Include outbound edges (entity → target). Default: true. */
+  includeOutbound?: boolean
+  /** Include inbound edges (other → entity). Default: false. */
+  includeInbound?: boolean
+  /** Fall back to 'general' intent when no intent-specific edges found. Default: true. */
+  fallbackToGeneral?: boolean
+  /** Restrict expansion to these entity types. Empty = no restriction. */
+  allowedEntityTypes?: string[]
+}
+
+export interface GraphExpansionResult {
+  /** Resolved peer page (null if target not in index). */
+  targetPage: KnowledgeIndexPage | null
+  /** The scored relation edge. */
+  relation: KnowledgeRelation
+  /** Direction from the seed entity's perspective. */
+  direction: "outbound" | "inbound"
+}
+
 const WIKILINK_REGEX = /\[\[([^\]|]+?)(?:\|[^\]]+?)?\]\]/g
 
 export async function buildKnowledgeRelationIndex(projectPath: string): Promise<KnowledgeRelationIndex> {
@@ -185,70 +209,25 @@ export function relationsForPage(
     }
   }
 
-  // P0: Sort by score descending (strongest relations first).
-  // Secondary sort by title for stable ordering when scores are equal.
+  // P0: Sort by score desc, then confidence, then title for stable ordering.
   return dedupeRelationViews(views).sort((a, b) =>
-    b.score !== a.score
-      ? b.score - a.score
-      : a.display_title.localeCompare(b.display_title, "zh-CN"),
+    (b.score - a.score) ||
+    (b.confidence - a.confidence) ||
+    a.display_title.localeCompare(b.display_title, "zh-CN"),
   )
-}
-
-// ─── Graph Expansion API (P1) ─────────────────────────────────────────────────
-
-export interface GraphExpansionOptions {
-  /**
-   * Minimum composite score (confidence * strength) for a relation to be
-   * included in the result. Weak edges (mentions, related_to) are typically
-   * below 0.3. Default: 0.25.
-   */
-  minScore?: number
-  /** Include outbound edges (this entity → target). Default: true. */
-  includeOutbound?: boolean
-  /** Include inbound edges (other entity → this entity). Default: false.
-   * Enable when you need to find "who references this entity" (e.g. which
-   * products govern a compliance rule). */
-  includeInbound?: boolean
-  /**
-   * When the queryIntent has no matching high-priority relations, fall back
-   * to the "general" intent set instead of returning nothing. Default: true.
-   */
-  fallbackToGeneral?: boolean
-  /**
-   * Restrict expansion to relations whose resolved target has one of these
-   * entity types. Useful when Agent only wants to expand to, e.g., personas
-   * or compliance rules. Empty array = no restriction.
-   */
-  allowedEntityTypes?: string[]
-}
-
-export interface GraphExpansionResult {
-  /** Resolved target page, null if the target wasn't found in the index. */
-  targetPage: KnowledgeIndexPage | null
-  /** The scored relation edge. */
-  relation: KnowledgeRelation
-  /** Direction from the seed entity's perspective. */
-  direction: "outbound" | "inbound"
 }
 
 /**
  * Core RAG/Agent graph expansion API.
  *
- * Given a seed entity and a query intent, returns the top-K most relevant
- * relation edges, filtered by intent-appropriate relation types and scored
- * by confidence × strength.
+ * Returns the top-K most relevant relation edges for a seed entity,
+ * filtered by query intent and scored by confidence × strength.
  *
- * Usage example:
- * ```ts
- * const edges = expandGraphFromEntity(index, "entities/家庭医生", "compliance", 5)
- * // → [governed_by: 服务权益合规边界 (score=0.828), ...]
- * ```
- *
- * @param index       Pre-built relation index from buildKnowledgeRelationIndex().
+ * @param index       Pre-built index from buildKnowledgeRelationIndex().
  * @param entityId    Page ID as returned by index.pages[n].id.
- * @param queryIntent One of the intent keys in RELATION_QUERY_AFFINITY.
- * @param topK        Maximum number of edges to return.
- * @param options     Fine-grained expansion constraints (see GraphExpansionOptions).
+ * @param queryIntent Intent key from RELATION_QUERY_AFFINITY.
+ * @param topK        Maximum edges to return.
+ * @param options     Expansion constraints.
  */
 export function expandGraphFromEntity(
   index: KnowledgeRelationIndex,
@@ -265,72 +244,66 @@ export function expandGraphFromEntity(
     allowedEntityTypes = [],
   } = options
 
-  // Determine which relation types are high-priority for this intent.
-  // Fall back to "general" if the intent key is unknown or yields no results.
-  let priorityTypes: RelationType[] =
-    RELATION_QUERY_AFFINITY[queryIntent] ??
-    RELATION_QUERY_AFFINITY["general"]
-
   const byId = new Map(index.pages.map((p) => [p.id, p]))
+  if (!byId.has(entityId) || topK <= 0) return []
 
-  const page = byId.get(entityId)
-  if (!page) return []
+  const preferredTypes = new Set(RELATION_QUERY_AFFINITY[queryIntent] ?? [])
+  const generalTypes   = new Set(RELATION_QUERY_AFFINITY["general"] ?? [])
 
-  // Collect candidate edges from the full index
-  const candidates: GraphExpansionResult[] = []
+  // Collect candidates — try preferred types first, fall back to general if empty
+  let rawCandidates = collectExpansionCandidates(
+    index, entityId, preferredTypes, includeInbound, includeOutbound, minScore,
+  )
+  if (rawCandidates.length === 0 && fallbackToGeneral) {
+    rawCandidates = collectExpansionCandidates(
+      index, entityId, generalTypes, includeInbound, includeOutbound, minScore,
+    )
+  }
 
-  for (const relation of index.relations) {
-    const isOutbound = relation.source_id === entityId
-    const isInbound  = relation.target_id === entityId
-
-    if (!isOutbound && !isInbound) continue
-    if (isOutbound && !includeOutbound) continue
-    if (isInbound  && !includeInbound)  continue
-
-    // Score cutoff — drop weak/noise edges early
-    if (relation.score < minScore) continue
-
-    // Entity type filter
-    if (allowedEntityTypes.length > 0) {
+  // Build GraphExpansionResult[] with resolved peer page and direction
+  const results: GraphExpansionResult[] = rawCandidates
+    .filter((relation) => {
+      if (allowedEntityTypes.length === 0) return true
+      const isOutbound = relation.source_id === entityId
       const peerId = isOutbound ? relation.target_id : relation.source_id
       const peer = byId.get(peerId)
-      if (peer && !allowedEntityTypes.includes(peer.entityType)) continue
-    }
-
-    const targetPage = isOutbound ? (byId.get(relation.target_id) ?? null) : (byId.get(relation.source_id) ?? null)
-
-    candidates.push({
-      targetPage,
-      relation,
-      direction: isOutbound ? "outbound" : "inbound",
+      return !peer || allowedEntityTypes.includes(peer.entityType)
     })
-  }
-
-  // Priority sort: intent-matching types first, then by score within each tier.
-  const prioritySet = new Set(priorityTypes)
-
-  candidates.sort((a, b) => {
-    const aInPriority = prioritySet.has(a.relation.type) ? 1 : 0
-    const bInPriority = prioritySet.has(b.relation.type) ? 1 : 0
-    if (bInPriority !== aInPriority) return bInPriority - aInPriority
-    return b.relation.score - a.relation.score
-  })
-
-  // If no intent-matching edges, optionally fall back to general top-K
-  if (fallbackToGeneral && candidates.every((c) => !prioritySet.has(c.relation.type))) {
-    const generalTypes = new Set(RELATION_QUERY_AFFINITY["general"] ?? [])
-    candidates.sort((a, b) => {
-      const aGen = generalTypes.has(a.relation.type) ? 1 : 0
-      const bGen = generalTypes.has(b.relation.type) ? 1 : 0
-      if (bGen !== aGen) return bGen - aGen
-      return b.relation.score - a.relation.score
+    .map((relation) => {
+      const isOutbound = relation.source_id === entityId
+      const peerId = isOutbound ? relation.target_id : relation.source_id
+      return {
+        targetPage: byId.get(peerId) ?? null,
+        relation,
+        direction: (isOutbound ? "outbound" : "inbound") as "outbound" | "inbound",
+      }
     })
-    priorityTypes = RELATION_QUERY_AFFINITY["general"] ?? priorityTypes
-  }
 
-  return candidates.slice(0, topK)
+  return results
+    .sort((a, b) =>
+      (b.relation.score - a.relation.score) ||
+      (b.relation.confidence - a.relation.confidence) ||
+      (a.targetPage?.title ?? "").localeCompare(b.targetPage?.title ?? "", "zh-CN"),
+    )
+    .slice(0, topK)
 }
 
+function collectExpansionCandidates(
+  index: KnowledgeRelationIndex,
+  pageId: string,
+  allowedTypes: Set<RelationType>,
+  includeInbound: boolean,
+  includeOutbound: boolean,
+  minScore: number,
+): KnowledgeRelation[] {
+  return index.relations.filter((relation) => {
+    if (relation.score < minScore) return false
+    if (allowedTypes.size > 0 && !allowedTypes.has(relation.type)) return false
+    const outbound = relation.source_id === pageId
+    const inbound  = relation.target_id === pageId
+    return (includeOutbound && outbound) || (includeInbound && inbound)
+  })
+}
 
 function flattenMdFiles(nodes: FileNode[]): FileNode[] {
   const files: FileNode[] = []
@@ -502,4 +475,14 @@ function dedupeRelationViews(items: KnowledgeRelationView[]): KnowledgeRelationV
     result.push(item)
   }
   return result
+}
+
+function resolvePageForExpansion(index: KnowledgeRelationIndex, entityId: string): KnowledgeIndexPage | null {
+  const normalizedId = normalizeLookup(entityId)
+  return index.pages.find((page) =>
+    page.id === entityId ||
+    page.path === normalizePath(entityId) ||
+    normalizeLookup(page.id) === normalizedId ||
+    normalizeLookup(page.title) === normalizedId
+  ) ?? null
 }
