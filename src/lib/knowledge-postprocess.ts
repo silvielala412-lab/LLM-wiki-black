@@ -20,6 +20,7 @@
 
 import { listDirectory, readFile, writeFile } from "@/commands/fs"
 import { INSURANCE_SCHEMA_REGISTRY } from "@/lib/insurance-schema-registry"
+import { cleanupKnowledgeFrontmatter } from "@/lib/knowledge-frontmatter-cleanup"
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -54,8 +55,10 @@ export async function runKnowledgePostProcess(projectPath: string): Promise<{
       const filePath = `${projectPath}/wiki/entities/${file.name}`
       try {
         const original = await readFile(filePath)
-        let updated = reconcileRelations(original, index)
+        let updated = cleanupKnowledgeFrontmatter(original)
+        updated = reconcileRelations(updated, index)
         updated = materializeAttributes(updated)
+        updated = cleanupKnowledgeFrontmatter(updated)
         if (updated !== original) {
           await writeFile(filePath, updated)
           if (updated.includes("reconciled_relations") || relationsDiffer(original, updated)) reconciled++
@@ -203,12 +206,12 @@ function materializeAttributes(content: string): string {
 
   // Remove raw_attributes fallback key if present alongside real fields
   const hasRealFields = spec.fields.some((f) => f.name in attrs)
-  if ("raw_attributes" in attrs && hasRealFields) {
-    delete attrs["raw_attributes"]
-  }
-
   // Add null for every schema field not yet present
   let changed = false
+  if ("raw_attributes" in attrs && hasRealFields) {
+    delete attrs["raw_attributes"]
+    changed = true
+  }
   for (const field of spec.fields) {
     if (field.importance === "auto_derived") continue // never fill auto_derived
     if (!(field.name in attrs)) {
