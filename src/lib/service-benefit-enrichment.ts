@@ -71,7 +71,7 @@ async function collectSourceFacts(projectPath: string): Promise<SourceFacts> {
     if (!content) continue
     const attrs = parseAttributes(content)
     if (!serviceProvider) serviceProvider = stringValue(attrs.service_provider)
-    if (!relatedProduct) relatedProduct = scalar(content, "title") || file.name.replace(/\.md$/i, "")
+    if (!relatedProduct) relatedProduct = stringValue(attrs.product_name) || scalar(content, "title") || file.name.replace(/\.md$/i, "")
     if (!sourceFileName) sourceFileName = firstListValue(content, "source_files") || firstListValue(content, "sources") || file.name
     rows.push(...parseMarkdownServiceTable(content, file.name))
     rows.push(...parseSequentialOcrServiceTable(content, file.name))

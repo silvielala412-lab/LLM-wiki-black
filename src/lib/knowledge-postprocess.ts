@@ -7,8 +7,9 @@
  * Three hard guarantees after this pass:
  *
  * 1. SCHEMA MATERIALIZATION (hard constraint)
- *    Every entity page's `attributes` contains EXACTLY the fields defined in the
- *    Insurance Schema Registry for its entity_type:
+ *    Every entity page's `attributes` contains the fields defined in the
+ *    Insurance Schema Registry for its entity_type, plus a reserved
+ *    `extra_attributes` object for non-standard fields:
  *    - Non-standard fields are remapped via FIELD_ALIASES or quarantined into
  *      `extra_attributes` (never silently dropped).
  *    - Missing standard fields are added as null.
@@ -34,6 +35,7 @@ import { cleanupKnowledgeFrontmatter } from "@/lib/knowledge-frontmatter-cleanup
 interface PageIndex {
   title: string
   relativePath: string
+  entityType: string
   normalizedForms: string[]
 }
 
@@ -226,13 +228,14 @@ function materializeAttributes(content: string, fileName: string): [string, bool
     }
   }
 
+  const previousExtra = attrs["extra_attributes"]
+  attrs["extra_attributes"] = extraAttrs
   if (Object.keys(extraAttrs).length > 0) {
-    attrs["extra_attributes"] = extraAttrs
     warnings.push(`${fileName}: quarantined non-standard fields: ${Object.keys(extraAttrs).join(", ")}`)
   }
 
   // Add null for every missing standard field (skip auto_derived)
-  let changed = Object.keys(extraAttrs).length > 0 || rawAttrsText.length > 0
+  let changed = previousExtra === undefined || Object.keys(extraAttrs).length > 0 || rawAttrsText.length > 0 || JSON.stringify(previousExtra ?? {}) !== JSON.stringify(extraAttrs)
   for (const field of spec.fields) {
     if (field.importance === "auto_derived") continue
     if (!(field.name in attrs)) {
@@ -324,8 +327,9 @@ function inferMissingRelations(content: string, index: PageIndex[]): [string, bo
   if (!parentTitle) return [content, false]
 
   // Verify the parent page exists in the index
-  const resolved = resolveTarget(parentTitle, index)
-  const canonicalParent = resolved ?? parentTitle
+  const canonicalParent = entityType === "service_benefit"
+    ? resolveServiceBenefitParent(parentTitle, index)
+    : (resolveTarget(parentTitle, index) ?? parentTitle)
 
   const relationType = entityType === "service_benefit" ? "part_of" :
     entityType === "selling_point" ? "part_of" :
@@ -407,7 +411,12 @@ async function buildPageIndex(projectPath: string): Promise<PageIndex[]> {
         const title = extractScalar(content, "title")
         if (!title) continue
         const relativePath = dir.replace(projectPath + "/", "") + "/" + file.name
-        index.push({ title, relativePath, normalizedForms: buildNormalizedForms(title) })
+        index.push({
+          title,
+          relativePath,
+          entityType: extractScalar(content, "entity_type"),
+          normalizedForms: buildNormalizedForms(title),
+        })
       } catch {
         // ignore unreadable files
       }
@@ -430,17 +439,37 @@ function normalizeTitle(s: string): string {
   return s.trim().toLowerCase().replace(/[\s_\-·•]+/g, "").replace(/[（()）]/g, "")
 }
 
+function resolveServiceBenefitParent(rawTarget: string, index: PageIndex[]): string {
+  const resolved = resolveTargetPage(rawTarget, index)
+  if (resolved?.entityType === "product") return resolved.title
+
+  const productPages = index.filter((page) => page.entityType === "product")
+  if (productPages.length === 1 && /服务手册|手册|source|\.pdf$/i.test(rawTarget)) {
+    return productPages[0].title
+  }
+
+  const normalized = normalizeTitle(rawTarget)
+  const productMatch = productPages.find((page) =>
+    page.normalizedForms.some((form) => normalized.startsWith(form) || form.startsWith(normalized))
+  )
+  return productMatch?.title ?? resolved?.title ?? rawTarget
+}
+
 function resolveTarget(rawTarget: string, index: PageIndex[]): string | null {
+  return resolveTargetPage(rawTarget, index)?.title ?? null
+}
+
+function resolveTargetPage(rawTarget: string, index: PageIndex[]): PageIndex | null {
   const exact = index.find((p) => p.title === rawTarget)
-  if (exact) return exact.title
+  if (exact) return exact
   const normalized = normalizeTitle(rawTarget)
   if (!normalized) return null
   const fuzzy = index.find((p) => p.normalizedForms.includes(normalized))
-  if (fuzzy) return fuzzy.title
+  if (fuzzy) return fuzzy
   const prefix = index.find((p) =>
     p.normalizedForms.some((form) => normalized.startsWith(form) || form.startsWith(normalized))
   )
-  if (prefix) return prefix.title
+  if (prefix) return prefix
   return null
 }
 
