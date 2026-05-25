@@ -13,6 +13,10 @@ import { checkIngestCache, saveIngestCache } from "@/lib/ingest-cache"
 import { withProjectLock } from "@/lib/project-mutex"
 import { writeExtractionQualityAudit } from "@/lib/extraction-quality-audit"
 import {
+  enrichServiceBenefitPagesFromText,
+  parseServiceInventoryRows,
+} from "@/lib/service-benefit-enrichment"
+import {
   extractAndSaveSourceImages,
   buildImageMarkdownSection,
 } from "@/lib/extract-source-images"
@@ -393,6 +397,9 @@ function detectSchemaCandidateSignals(content: string): SchemaCandidateSignals {
 }
 
 function estimateServiceTableItemCount(content: string): number {
+  const structuredRows = parseServiceInventoryRows(content)
+  if (structuredRows.length > 0) return structuredRows.length
+
   const lines = content.split(/\r?\n/)
   let inServiceTable = false
   let itemIndex = -1
@@ -1094,11 +1101,50 @@ function addServiceTableCandidates(
   }
 }
 
+function addStructuredServiceInventoryCandidates(
+  map: Map<string, SchemaDrivenCandidate>,
+  sourceContent: string,
+): void {
+  const rows = parseServiceInventoryRows(sourceContent)
+  for (const row of rows) {
+    const key = normalizeCoverageTitle(row.serviceName)
+    const sourceLine = [
+      row.serviceScene ? `服务场景：${row.serviceScene}` : "",
+      row.serviceStage ? `服务阶段：${row.serviceStage}` : "",
+      `服务项目：${row.serviceName}`,
+      row.serviceFrequency ? `服务次数：${row.serviceFrequency}` : "",
+    ].filter(Boolean).join("；")
+    const existing = map.get(key)
+    if (existing) {
+      if (sourceLine && !existing.sourceLines.includes(sourceLine)) existing.sourceLines.push(sourceLine)
+      existing.entityType = "service_benefit"
+      existing.universalType = "entity"
+      existing.knowledgeDomain = "product"
+      existing.required = true
+      existing.confidence = Math.max(existing.confidence, 0.96)
+      continue
+    }
+    map.set(key, {
+      title: row.serviceName,
+      aliases: [],
+      knowledgeDomain: "product",
+      entityType: "service_benefit",
+      universalType: "entity",
+      required: true,
+      confidence: 0.96,
+      reason: "Service benefit row deterministically parsed from service inventory table/OCR text.",
+      sourceLines: sourceLine ? [sourceLine] : [],
+    })
+  }
+}
+
 function extractSchemaDrivenCandidates(sourceContent: string, plan = buildSmartIngestPlan(sourceContent)): SchemaDrivenCandidate[] {
   const signals = detectSchemaCandidateSignals(sourceContent)
   const candidates = new Map<string, SchemaDrivenCandidate>()
   const sectionPath: string[] = []
   const lines = sourceContent.split(/\r?\n/)
+
+  addStructuredServiceInventoryCandidates(candidates, sourceContent)
 
   if (plan.intent.docType === "service_case" || plan.intent.docType === "case_study") {
     candidates.set("case.service_case_review", {
@@ -1245,8 +1291,9 @@ function buildSchemaCandidateManifest(candidates: SchemaDrivenCandidate[], plan?
   ].filter(Boolean)
 
   for (const candidate of candidates.slice(0, 60)) {
+    const evidence = candidate.sourceLines[0] ? ` | evidence=${candidate.sourceLines[0].slice(0, 180)}` : ""
     lines.push(
-      `- ${candidate.required ? "REQUIRED" : "OPTIONAL"} | ${candidate.title} | domain=${candidate.knowledgeDomain} | entity_type=${candidate.entityType} | type=${candidate.universalType} | confidence=${candidate.confidence.toFixed(2)} | ${candidate.reason}`,
+      `- ${candidate.required ? "REQUIRED" : "OPTIONAL"} | ${candidate.title} | domain=${candidate.knowledgeDomain} | entity_type=${candidate.entityType} | type=${candidate.universalType} | confidence=${candidate.confidence.toFixed(2)} | ${candidate.reason}${evidence}`,
     )
   }
   if (candidates.length > 60) lines.push(`- ... ${candidates.length - 60} additional candidates omitted from prompt display.`)
@@ -1381,6 +1428,7 @@ function buildInsuranceExtractionChecklist(sourceContent: string): string {
     "",
     "If the source is a service manual:",
     "- Extract service name, service category, target product/customer, eligibility, service frequency, time limits, service process, required materials, provider/network, exclusions, disclaimers, customer-facing value, and compliance reminders.",
+    "- When a service table/OCR block contains 服务场景、服务阶段、服务项目、服务次数, treat those four columns as deterministic facts. They must be copied into the corresponding service_benefit attributes and visible body.",
     "- Split independent services into `service_benefit`, `process`, `limitation`, and `compliance_rule` pages when they have reusable business value.",
     "- A service manual should usually generate many pages, not only one service-plan page. If it contains family doctor, online consultation, famous-doctor, medical appointment, escort, hospitalization, surgery, nursing, rehabilitation, activation, suspension, termination, waiting-period, non-sharing, or disclaimer rules, these must become dedicated nodes or explicit review gaps.",
     "",
@@ -2636,6 +2684,16 @@ async function autoIngestImpl(
     console.warn("[ingest] Schema backfill warnings:", schemaBackfill.warnings)
   }
 
+  const enrichedServiceBenefitPaths = !signal?.aborted
+    ? await enrichServiceBenefitPagesFromText(pp, sourceContent, fileName).catch((err) => {
+        console.warn("[ingest] Service benefit enrichment failed:", err)
+        return [] as string[]
+      })
+    : []
+  for (const relPath of enrichedServiceBenefitPaths) {
+    if (!writtenPaths.includes(relPath)) writtenPaths.push(relPath)
+  }
+
   // Ensure source summary page exists (LLM may not have generated it correctly)
   const hasSourceSummary = writtenPaths.some((p) => p.startsWith("wiki/sources/"))
 
@@ -3213,6 +3271,7 @@ function buildCandidateBackfillPrompt(sourceFileName: string, preparedSource: Pr
     "- Do not merge multiple service benefits, process rules, or compliance rules into a single generic page.",
     "- Respect candidate domain routing exactly: service benefits stay in product; customer-facing explanation/QA/pitch/objection handling goes to method; customer/service case narratives and customer voice go to cases; disclaimers/prohibited promises/compliance warnings go to compliance.",
     "- Do not create standalone pages for field values such as 家庭不限次、首年每人 1 次、T+2 个工作日. Put these values under attributes on the related service/rule page.",
+    "- If `deterministic_source_facts` or manifest evidence includes service scene/stage/name/frequency, those fields are already known facts. Put them into `attributes` and visible body sections; do not list them as knowledge gaps.",
     "- Fill universal frontmatter plus entity-specific attributes. Put missing extension fields into attributes.knowledge_gaps and a visible knowledge-gap section.",
     "- Every page body must include visible business content, not only frontmatter.",
     "- Every page must cite the source filename and evidence excerpt.",
@@ -3264,6 +3323,7 @@ function buildCandidateBackfillUserContent(
     `confidence: ${candidate.confidence.toFixed(2)}`,
     `reason: ${candidate.reason}`,
     candidate.aliases.length > 0 ? `aliases: ${candidate.aliases.join(", ")}` : "",
+    candidate.sourceLines.length > 0 ? `deterministic_source_facts:\n${candidate.sourceLines.map((line) => `- ${line}`).join("\n")}` : "",
     "",
     "Evidence excerpt:",
     "```",
@@ -3855,6 +3915,7 @@ export function buildGenerationPrompt(schema: string, purpose: string, index: st
     "- For table/list documents, put row-count and column semantics into `attributes`, preserve all product names/codes and yes/no/1/1*/N flags on the source page body, and create only selected entity pages for meaningful products/services/rules instead of fabricating hundreds of shallow pages.",
     "- For product access lists or service eligibility lists within a few hundred rows, the source page must include every identifiable row/item in a compact Markdown table or numbered list. If token budget prevents full table rendering, include a clear `未完全展开的清单范围` section and a REVIEW item; never silently omit rows.",
     "- For service manuals, do not collapse multiple services into one generic paragraph. Extract independent service benefits, process steps, usage limits, exclusions, materials, time limits, and compliance disclaimers as separate visible bullets or tables.",
+    "- If the manifest evidence includes `服务场景` / `服务阶段` / `服务项目` / `服务次数`, these are deterministic source facts. Fill `service_category`, `service_name`, and `service_frequency` from them and show them visibly; never put these known values under `待补全信息`.",
     "- Service manual minimum node rule: if the source contains identifiable service items, generate dedicated pages for the service items and rules named in `Service Manual Node Extraction Requirements`. A service manual output with only the main service-plan page is incomplete.",
     "- Concept resolution rule: do not create isolated near-duplicate pages. Exact duplicates should update the existing page; near variants such as 康复门诊协助 / 康复住院协助 should remain separate child service pages linked through a shared parent concept such as 康复服务.",
     "- When generating a child service page that belongs to a service family, include `parent` and `related` frontmatter when the parent or sibling service is known. Do not assume the system will automatically merge variants; only exact `dedup_key` duplicates are auto-merged.",

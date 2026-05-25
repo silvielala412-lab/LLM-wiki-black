@@ -532,7 +532,14 @@ function formatJsonLike(value: string): string {
 
 // ── Rich Markdown renderer ────────────────────────────────────────────────────
 
+const LARGE_SECTION_CHAR_LIMIT = 18000
+
 function BodyMarkdown({ content, projectPath }: { content: string; projectPath: string | null }) {
+  const [expanded, setExpanded] = useState(false)
+  const isLarge = content.length > LARGE_SECTION_CHAR_LIMIT
+  const visibleContent = isLarge && !expanded
+    ? `${content.slice(0, LARGE_SECTION_CHAR_LIMIT)}\n\n> 该章节内容较长，已折叠后续内容以保持页面流畅。`
+    : content
   return (
     <div className="wiki-body-md prose prose-sm max-w-none dark:prose-invert">
       <ReactMarkdown
@@ -550,8 +557,17 @@ function BodyMarkdown({ content, projectPath }: { content: string; projectPath: 
           ),
         }}
       >
-        {content}
+        {visibleContent}
       </ReactMarkdown>
+      {isLarge && (
+        <button
+          type="button"
+          onClick={() => setExpanded((value) => !value)}
+          className="mt-3 rounded-md border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+        >
+          {expanded ? "收起长内容" : "展开完整内容"}
+        </button>
+      )}
     </div>
   )
 }
