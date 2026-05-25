@@ -4,6 +4,7 @@ import { normalizePath } from "@/lib/path-utils"
 import {
   ENTITY_TYPE_DOMAIN,
   RELATION_INVERSE_LABELS,
+  RELATION_QUERY_AFFINITY,
   RELATION_TYPE_SCORES,
   RELATION_SOURCE_CONFIDENCE,
   type BusinessPhase,
@@ -40,6 +41,15 @@ export interface KnowledgeRelationView extends KnowledgeRelation {
 export interface KnowledgeRelationIndex {
   pages: KnowledgeIndexPage[]
   relations: KnowledgeRelation[]
+}
+
+export type RelationQueryIntent = keyof typeof RELATION_QUERY_AFFINITY
+
+export interface GraphExpansionOptions {
+  includeInbound?: boolean
+  includeOutbound?: boolean
+  minScore?: number
+  fallbackToGeneral?: boolean
 }
 
 const WIKILINK_REGEX = /\[\[([^\]|]+?)(?:\|[^\]]+?)?\]\]/g
@@ -185,8 +195,57 @@ export function relationsForPage(
   }
 
   return dedupeRelationViews(views).sort((a, b) =>
+    (b.score - a.score) ||
+    (b.confidence - a.confidence) ||
     a.display_title.localeCompare(b.display_title, "zh-CN"),
   )
+}
+
+export function expandGraphFromEntity(
+  index: KnowledgeRelationIndex,
+  entityId: string,
+  queryIntent: RelationQueryIntent,
+  topK: number,
+  options: GraphExpansionOptions = {},
+): KnowledgeRelation[] {
+  const page = resolvePageForExpansion(index, entityId)
+  if (!page || topK <= 0) return []
+
+  const includeInbound = options.includeInbound ?? true
+  const includeOutbound = options.includeOutbound ?? true
+  const minScore = options.minScore ?? 0
+  const fallbackToGeneral = options.fallbackToGeneral ?? true
+
+  const preferredTypes = RELATION_QUERY_AFFINITY[queryIntent] ?? []
+  let candidates = collectExpansionCandidates(index, page.id, new Set(preferredTypes), includeInbound, includeOutbound, minScore)
+  if (candidates.length === 0 && fallbackToGeneral) {
+    candidates = collectExpansionCandidates(index, page.id, new Set(RELATION_QUERY_AFFINITY.general), includeInbound, includeOutbound, minScore)
+  }
+
+  return candidates
+    .sort((a, b) =>
+      (b.score - a.score) ||
+      (b.confidence - a.confidence) ||
+      a.target_title.localeCompare(b.target_title, "zh-CN"),
+    )
+    .slice(0, topK)
+}
+
+function collectExpansionCandidates(
+  index: KnowledgeRelationIndex,
+  pageId: string,
+  allowedTypes: Set<RelationType>,
+  includeInbound: boolean,
+  includeOutbound: boolean,
+  minScore: number,
+): KnowledgeRelation[] {
+  return index.relations.filter((relation) => {
+    if (relation.score < minScore) return false
+    if (allowedTypes.size > 0 && !allowedTypes.has(relation.type)) return false
+    const outbound = relation.source_id === pageId
+    const inbound = relation.target_id === pageId
+    return (includeOutbound && outbound) || (includeInbound && inbound)
+  })
 }
 
 function flattenMdFiles(nodes: FileNode[]): FileNode[] {
@@ -359,4 +418,14 @@ function dedupeRelationViews(items: KnowledgeRelationView[]): KnowledgeRelationV
     result.push(item)
   }
   return result
+}
+
+function resolvePageForExpansion(index: KnowledgeRelationIndex, entityId: string): KnowledgeIndexPage | null {
+  const normalizedId = normalizeLookup(entityId)
+  return index.pages.find((page) =>
+    page.id === entityId ||
+    page.path === normalizePath(entityId) ||
+    normalizeLookup(page.id) === normalizedId ||
+    normalizeLookup(page.title) === normalizedId
+  ) ?? null
 }
