@@ -2739,6 +2739,29 @@ async function autoIngestImpl(
   if (!signal?.aborted) {
     await preserveOcrDetailsInSourcePage(sourceSummaryFullPath, sourceContent, sourceOrigin)
     await preserveSchemaCandidateAuditInSourcePage(sourceSummaryFullPath, schemaCandidates, schemaBackfill.missingAfterBackfill, pp)
+    // ── Step 3.4b: Hard-constraint schema materializer + relation inference ──
+    // MUST run BEFORE audit so the audit score reflects the final on-disk state,
+    // not the raw LLM output. This ensures audit metrics are meaningful.
+    try {
+      const postResult = await runKnowledgePostProcess(pp)
+      if (postResult.errors.length > 0) {
+        console.warn("[ingest] Post-process errors:", postResult.errors)
+      }
+      if (postResult.lintWarnings.length > 0) {
+        console.log("[ingest] Post-process lint:", postResult.lintWarnings.slice(0, 10))
+      }
+      const changed = postResult.reconciled + postResult.materialized + postResult.relationsInferred + postResult.titlesNormalized
+      if (changed > 0) {
+        console.log(`[ingest] Post-process: reconciled=${postResult.reconciled} materialized=${postResult.materialized} relationsInferred=${postResult.relationsInferred} titlesNormalized=${postResult.titlesNormalized}`)
+      }
+    } catch (err) {
+      console.warn("[ingest] Post-process failed (non-critical):", err)
+    }
+
+    // ── Step 3.4a: Extraction quality audit ──────────────────────────────────
+    // Runs AFTER postprocess so it reads the final, materialized page state.
+    // Audit scores now reflect: schema compliance, relation coverage, field
+    // completeness — all after the hard-constraint normalizer has run.
     const audit = await writeExtractionQualityAudit({
       projectPath: pp,
       sourceFileName: fileName,
@@ -2749,25 +2772,6 @@ async function autoIngestImpl(
     })
     if (audit.auditPath && !writtenPaths.includes(audit.auditPath)) writtenPaths.push(audit.auditPath)
     extractionAuditReviewItems = audit.reviewItems
-
-    // ── Step 3.4b: Hard-constraint schema materializer + relation inference ──
-    // Runs after all pages are on disk so the title index is complete.
-    // Guarantees: non-standard attrs remapped, raw_attributes salvaged,
-    // missing relations inferred from attributes.related_product etc.
-    try {
-      const postResult = await runKnowledgePostProcess(pp)
-      if (postResult.errors.length > 0) {
-        console.warn("[ingest] Post-process errors:", postResult.errors)
-      }
-      if (postResult.lintWarnings.length > 0) {
-        console.log("[ingest] Post-process lint:", postResult.lintWarnings.slice(0, 10))
-      }
-      if (postResult.reconciled > 0 || postResult.materialized > 0 || postResult.relationsInferred > 0) {
-        console.log(`[ingest] Post-process: reconciled=${postResult.reconciled} materialized=${postResult.materialized} relationsInferred=${postResult.relationsInferred}`)
-      }
-    } catch (err) {
-      console.warn("[ingest] Post-process failed (non-critical):", err)
-    }
   }
 
   // ── Step 3.5: Append extracted images to the source-summary page ─

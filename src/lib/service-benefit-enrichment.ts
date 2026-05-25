@@ -45,7 +45,12 @@ export async function enrichServiceBenefitPagesFromText(
   facts.serviceItems = dedupeNames([...directItems, ...facts.serviceItems, ...directRows.map((row) => row.serviceName)])
   facts.sourceFileName = sourceFileName
   if (directProvider) facts.serviceProvider = directProvider
-  if (!facts.relatedProduct) facts.relatedProduct = scalar(sourceContent, "title") || "臻享家医健康服务计划"
+  if (!facts.relatedProduct) {
+    facts.relatedProduct =
+      extractPlanNameFromBody(sourceContent) ||
+      sanitizeSourceTitle(scalar(sourceContent, "title") || "") ||
+      "臻享家医健康服务计划"
+  }
   return ensureAndEnrichServiceBenefitPages(projectPath, facts)
 }
 
@@ -71,7 +76,21 @@ async function collectSourceFacts(projectPath: string): Promise<SourceFacts> {
     if (!content) continue
     const attrs = parseAttributes(content)
     if (!serviceProvider) serviceProvider = stringValue(attrs.service_provider)
-    if (!relatedProduct) relatedProduct = stringValue(attrs.product_name) || scalar(content, "title") || file.name.replace(/\.md$/i, "")
+    // Extract canonical product name. Priority:
+    //   1. Structured attribute fields (product_name, service_plan_name, plan_name)
+    //   2. Body text pattern matching for known plan-name keywords
+    //   3. Sanitized source-page title (strip version suffix, never use raw filename)
+    // We intentionally do NOT fall back to the raw source-page title (file.name)
+    // because that would make all service_benefit pages point to the source doc
+    // instead of the product entity.
+    if (!relatedProduct) {
+      relatedProduct =
+        stringValue(attrs.product_name) ||
+        stringValue(attrs.service_plan_name) ||
+        stringValue(attrs.plan_name) ||
+        extractPlanNameFromBody(content) ||
+        sanitizeSourceTitle(scalar(content, "title") || "")
+    }
     if (!sourceFileName) sourceFileName = firstListValue(content, "source_files") || firstListValue(content, "sources") || file.name
     rows.push(...parseMarkdownServiceTable(content, file.name))
     rows.push(...parseSequentialOcrServiceTable(content, file.name))
@@ -459,8 +478,67 @@ function clean(value: string): string {
     .trim()
 }
 
+/**
+ * Normalize an entity title for use as a relation target or page title.
+ * Removes HTML artifacts, OCR noise, and known naming inconsistencies that
+ * cause relation reconciliation to fail.
+ */
+export function normalizeEntityTitle(value: string): string {
+  return value
+    // Strip HTML tags (OCR/table remnants)
+    .replace(/<[^>]+>/g, "")
+    // Remove known entity-specific suffixes that cause mismatch
+    .replace(/_?臻享家医$/, "")
+    .replace(/_?家医健康$/, "")
+    // Remove source-document version markers
+    .replace(/[（(]\d{4}年\d+月版[)）]/g, "")
+    .replace(/服务手册$/, "")
+    // Common OCR substitution fixes
+    .replace(/普视频/g, "图音视频")
+    .replace(/体验专项/g, "体检专项")
+    // Clean whitespace
+    .replace(/\s+/g, " ")
+    .trim()
+}
+
+/**
+ * Extracts a canonical product/service-plan name from body text.
+ * Looks for patterns like "XX健康服务计划" or "XX服务计划" in headings.
+ */
+function extractPlanNameFromBody(content: string): string {
+  // Match headings containing common plan-name patterns
+  const patterns = [
+    /#{1,3}\s*([^\n]*?(?:健康服务计划|服务计划|健康计划)[^\n]*)/,
+    /(?:产品名称|计划名称|服务计划名称)\s*[:：]\s*([^\n]{4,40})/,
+    /([\u4e00-\u9fff]{4,20}(?:健康服务计划|服务计划))/,
+  ]
+  for (const pattern of patterns) {
+    const m = content.match(pattern)
+    if (m) {
+      const candidate = normalizeEntityTitle(m[1].trim())
+      // Must be a plausible plan name (4-30 chars, contains Chinese)
+      if (candidate.length >= 4 && candidate.length <= 30 && /[\u4e00-\u9fff]/.test(candidate)) {
+        return candidate
+      }
+    }
+  }
+  return ""
+}
+
+/**
+ * Sanitize a source-document title for use as a product name fallback.
+ * Strips version suffixes, "服务手册" etc. that indicate a source doc, not a product.
+ */
+function sanitizeSourceTitle(title: string): string {
+  const cleaned = normalizeEntityTitle(title)
+  // If the cleaned title still looks like a source document, return empty
+  // so the caller can try the next fallback
+  if (/手册|规范|说明书|条款|（\d{4}|\(\d{4}/.test(cleaned)) return ""
+  return cleaned
+}
+
 function canonicalServiceName(value: string): string {
-  return clean(value)
+  return normalizeEntityTitle(clean(value))
     .replace(/^(服务权益名称|服务名称|权益名称|服务项目名称)\s*[:：]\s*/g, "")
     .replace(/(?:\.md)+$/i, "")
     .trim()

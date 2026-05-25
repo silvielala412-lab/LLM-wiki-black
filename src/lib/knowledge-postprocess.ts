@@ -29,6 +29,7 @@
 import { listDirectory, readFile, writeFile } from "@/commands/fs"
 import { INSURANCE_SCHEMA_REGISTRY } from "@/lib/insurance-schema-registry"
 import { cleanupKnowledgeFrontmatter } from "@/lib/knowledge-frontmatter-cleanup"
+import { normalizeEntityTitle } from "@/lib/service-benefit-enrichment"
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -43,6 +44,7 @@ export interface PostProcessResult {
   reconciled: number
   materialized: number
   relationsInferred: number
+  titlesNormalized: number
   lintWarnings: string[]
   errors: string[]
 }
@@ -119,6 +121,7 @@ export async function runKnowledgePostProcess(projectPath: string): Promise<Post
 
   try {
     const index = await buildPageIndex(projectPath)
+    let titlesNormalized = 0
 
     const entityFiles = await safeList(`${projectPath}/wiki/entities`)
     for (const file of entityFiles) {
@@ -127,8 +130,12 @@ export async function runKnowledgePostProcess(projectPath: string): Promise<Post
       try {
         const original = await readFile(filePath)
 
+        // Step 0: Normalize the page title (strip HTML, OCR errors, suffix noise)
+        let updated = normalizeFrontmatterTitle(original, file.name)
+        if (updated !== original) titlesNormalized++
+
         // First pass: normalize domain/format
-        let updated = cleanupKnowledgeFrontmatter(original)
+        updated = cleanupKnowledgeFrontmatter(updated)
 
         // Schema materialization (hard constraint)
         const [materialized_content, matChanged, matWarnings] = materializeAttributes(updated, file.name)
@@ -160,7 +167,23 @@ export async function runKnowledgePostProcess(projectPath: string): Promise<Post
     errors.push(`post-process init: ${String(err)}`)
   }
 
-  return { reconciled, materialized, relationsInferred, lintWarnings, errors }
+  return { reconciled, materialized, relationsInferred, titlesNormalized: 0, lintWarnings, errors }
+}
+// ─── Title Normalization ─────────────────────────────────────────────────────────────────────
+
+function normalizeFrontmatterTitle(content: string, fileName: string): string {
+  const titleMatch = content.match(/^(title:\s*)([^\n]+)(\n)/m)
+  if (!titleMatch) return content
+  const rawTitle = titleMatch[2].replace(/^"|"$/g, "").trim()
+  const normalized = normalizeEntityTitle(rawTitle)
+  if (normalized === rawTitle) return content
+  // Preserve quoting style: use quotes if normalized value contains special chars
+  const needsQuotes = /[:#|]/.test(normalized)
+  const replacement = needsQuotes ? `"${normalized}"` : normalized
+  return content.replace(
+    /^(title:\s*)([^\n]+)(\n)/m,
+    `${titleMatch[1]}${replacement}${titleMatch[3]}`,
+  )
 }
 
 // ─── Schema Materialization ───────────────────────────────────────────────────
