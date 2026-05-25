@@ -140,9 +140,10 @@ async function ensureMissingServiceBenefitPages(projectPath: string, facts: Sour
     const normalized = normalizeServiceName(serviceName)
     if (!normalized || existingNames.has(normalized)) continue
 
-    const row = findServiceRow(facts.rows, serviceName, serviceName)
-    const path = `wiki/entities/${safeFileName(serviceName)}.md`
-    const content = buildServiceBenefitPage(serviceName, row, facts)
+    const displayName = canonicalServiceName(serviceName)
+    const row = findServiceRow(facts.rows, displayName, displayName)
+    const path = `wiki/entities/${safeFileName(displayName)}.md`
+    const content = buildServiceBenefitPage(displayName, row, facts)
     await writeFile(`${projectPath}/${path}`, content)
     existingNames.add(normalized)
     created.push(path)
@@ -247,7 +248,7 @@ function parseDeclaredServiceItems(content: string): string[] {
     : []
   const fromStructuredTable: string[] = []
   for (const match of content.matchAll(/\|\s*`?service_benefit`?\s*\|\s*([^|\r\n]+?)\s*\|/g)) {
-    const item = clean(match[1])
+    const item = canonicalServiceName(match[1])
     if (isServiceItem(item)) fromStructuredTable.push(item)
   }
   return dedupeNames([...fromAttrs, ...fromStructuredTable])
@@ -459,6 +460,13 @@ function clean(value: string): string {
     .trim()
 }
 
+function canonicalServiceName(value: string): string {
+  return clean(value)
+    .replace(/^(服务权益名称|服务名称|权益名称|服务项目名称)\s*[:：]\s*/g, "")
+    .replace(/(?:\.md)+$/i, "")
+    .trim()
+}
+
 function isServiceItem(value: string): boolean {
   if (!value || value.length < 2 || value.length > 40) return false
   if (/^(服务项目|权益项目|项目|服务次数|服务阶段|服务场景)$/.test(value)) return false
@@ -471,7 +479,7 @@ function looksLikeFrequency(value: string): boolean {
 }
 
 function normalizeServiceName(value: string): string {
-  return clean(value)
+  return canonicalServiceName(value)
     .replace(/（.*?）|\(.*?\)/g, "")
     .replace(/、趋势对比/g, "")
     .replace(/服务流程$/g, "")
@@ -495,7 +503,7 @@ function dedupeRows(rows: ServiceInventoryRow[]): ServiceInventoryRow[] {
 function dedupeNames(names: string[]): string[] {
   const seen = new Set<string>()
   const result: string[] = []
-  for (const name of names.map(clean).filter(isServiceItem)) {
+  for (const name of names.map(canonicalServiceName).filter(isServiceItem)) {
     const key = normalizeServiceName(name)
     if (!key || seen.has(key)) continue
     seen.add(key)
@@ -505,11 +513,12 @@ function dedupeNames(names: string[]): string[] {
 }
 
 function safeFileName(name: string): string {
-  const safe = clean(name)
+  const safe = canonicalServiceName(name)
     .replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_")
     .replace(/\s+/g, "")
+    .replace(/(?:\.md)+$/i, "")
     .slice(0, 80)
-  return `${safe || "service_benefit"}.md`
+  return safe || "service_benefit"
 }
 
 function scalar(content: string, key: string): string {

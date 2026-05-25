@@ -63,7 +63,47 @@ function normalizeName(name: string): string {
 function nameFromPath(relativePath: string): string {
   const parts = relativePath.split("/")
   const filename = parts[parts.length - 1]
-  return filename.replace(/\.md$/i, "")
+  return filename.replace(/(?:\.md)+$/i, "")
+}
+
+function canonicalServiceTitle(value: string): string {
+  return String(value ?? "")
+    .replace(/<br\s*\/?>/gi, " ")
+    .replace(/\*\*/g, "")
+    .replace(/^(服务权益名称|服务名称|权益名称|服务项目名称)\s*[:：]\s*/g, "")
+    .replace(/(?:\.md)+$/i, "")
+    .replace(/\s+/g, " ")
+    .trim()
+}
+
+function normalizeKnowledgeRelativePath(relativePath: string, content: string): string {
+  const match = relativePath.match(/^(wiki\/(?:entities|concepts)\/)(.+)$/)
+  if (!match) return relativePath
+  const prefix = match[1]
+  let name = match[2].replace(/(?:\.md)+$/i, "")
+  if (extractScalar(content, "entity_type") === "service_benefit") {
+    name = canonicalServiceTitle(name)
+  }
+  name = name.replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_").replace(/\s+/g, "")
+  return `${prefix}${name || "untitled"}.md`
+}
+
+function normalizeServiceBenefitFrontmatter(content: string, fallbackName: string): string {
+  if (extractScalar(content, "entity_type") !== "service_benefit") return content
+  const title = canonicalServiceTitle(extractTitle(content) || fallbackName)
+  if (!title) return content
+
+  let updated = upsertFrontmatterScalar(content, "title", title)
+  updated = upsertFrontmatterScalar(updated, "dedup_key", `service_benefit.${title}`)
+
+  const attrs = extractAttributes(updated)
+  const rawServiceName = typeof attrs.service_name === "string" ? attrs.service_name : ""
+  const serviceName = canonicalServiceTitle(rawServiceName || title)
+  if (serviceName) {
+    attrs.service_name = serviceName
+    updated = replaceFrontmatterJsonScalar(updated, "attributes", attrs)
+  }
+  return updated
 }
 
 /** Return true if the two names are "similar enough" to be considered duplicates. */
@@ -286,18 +326,20 @@ export async function normalizeEntityBlock(
   existingEntities: ExistingEntity[],
   projectPath: string,
 ): Promise<NormalizedBlock> {
+  const normalizedPath = normalizeKnowledgeRelativePath(relativePath, content)
   const isEntityOrConcept =
-    relativePath.startsWith("wiki/entities/") ||
-    relativePath.startsWith("wiki/concepts/")
+    normalizedPath.startsWith("wiki/entities/") ||
+    normalizedPath.startsWith("wiki/concepts/")
 
   if (!isEntityOrConcept) {
     return { path: relativePath, content, merged: false, originalPath: relativePath }
   }
 
-  const newName = nameFromPath(relativePath)
-  const newDedupKey = inferEntityDedupKey(content, newName)
-  const newIdentityKeys = inferEntityIdentityKeys(content, newName)
-  const newEntityType = extractScalar(content, "entity_type")
+  const newName = nameFromPath(normalizedPath)
+  const normalizedContent = normalizeServiceBenefitFrontmatter(content, newName)
+  const newDedupKey = inferEntityDedupKey(normalizedContent, newName)
+  const newIdentityKeys = inferEntityIdentityKeys(normalizedContent, newName)
+  const newEntityType = extractScalar(normalizedContent, "entity_type")
 
   // Deterministic same-concept merge: exact dedup_key OR strong schema identity
   // keys redirect to the canonical page. Loose title similarity is still
@@ -314,7 +356,7 @@ export async function normalizeEntityBlock(
 
   if (!match) {
     // No duplicate — write normally
-    return { path: relativePath, content, merged: false, originalPath: relativePath }
+    return { path: normalizedPath, content: normalizedContent, merged: false, originalPath: relativePath }
   }
 
   console.log(
@@ -336,7 +378,7 @@ export async function normalizeEntityBlock(
   // can merge the `sources:` field from the new content into the existing page.
   return {
     path: match.relativePath,
-    content,
+    content: normalizedContent,
     merged: true,
     originalPath: relativePath,
     canonicalName: match.name,
@@ -472,6 +514,18 @@ function upsertFrontmatterList(content: string, key: string, values: string[]): 
   const existing = extractListValuesFromFrontmatter(fm, key)
   const merged = dedupeStrings([...existing, ...cleanValues])
   const line = `${key}: [${merged.map((value) => `"${escapeYaml(value)}"`).join(", ")}]`
+  if (new RegExp(`^${key}:`, "m").test(fm)) {
+    return `---\n${fm.replace(new RegExp(`^${key}:.*$`, "m"), line)}\n---${rest}`
+  }
+  return `---\n${fm}\n${line}\n---${rest}`
+}
+
+function replaceFrontmatterJsonScalar(content: string, key: string, value: Record<string, unknown>): string {
+  const fmMatch = content.match(/^---\n([\s\S]*?)\n---/)
+  if (!fmMatch) return content
+  const fm = fmMatch[1]
+  const rest = content.slice(fmMatch[0].length)
+  const line = `${key}: ${JSON.stringify(value)}`
   if (new RegExp(`^${key}:`, "m").test(fm)) {
     return `---\n${fm.replace(new RegExp(`^${key}:.*$`, "m"), line)}\n---${rest}`
   }
@@ -627,11 +681,22 @@ function chooseCanonicalEntity(a: ExistingEntity, b: ExistingEntity): [ExistingE
 
 function inferEntityDedupKey(content: string, fallbackName: string): string {
   const existing = extractScalar(content, "dedup_key")
-  if (existing) return existing
+  const entityType = extractScalar(content, "entity_type")
+  if (existing) {
+    if (entityType === "service_benefit") {
+      const serviceName = canonicalServiceTitle(
+        String(extractAttributes(content).service_name ?? "") ||
+        extractTitle(content) ||
+        fallbackName,
+      )
+      if (serviceName) return `service_benefit.${serviceName}`
+    }
+    return existing
+  }
   return inferStableInsuranceDedupKey({
-    entityType: extractScalar(content, "entity_type"),
-    title: extractTitle(content) || fallbackName,
-    attributes: normalizeInsuranceAttributes(extractScalar(content, "entity_type"), extractAttributes(content)),
+    entityType,
+    title: entityType === "service_benefit" ? canonicalServiceTitle(extractTitle(content) || fallbackName) : extractTitle(content) || fallbackName,
+    attributes: normalizeInsuranceAttributes(entityType, extractAttributes(content)),
     fallback: fallbackName,
   })
 }
@@ -659,7 +724,7 @@ function inferEntityIdentityKeys(content: string, fallbackName: string): string[
 }
 
 function inferServiceTitleIdentityKey(title: string): string {
-  const normalized = title
+  const normalized = canonicalServiceTitle(title)
     .replace(/服务流程|流程|服务说明|说明|规则/g, "")
     .replace(/服务$/g, "")
     .replace(/[\s_\-·•、，,]/g, "")

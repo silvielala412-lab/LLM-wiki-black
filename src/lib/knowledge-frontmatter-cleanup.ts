@@ -128,7 +128,6 @@ export function cleanupKnowledgeFrontmatter(content: string): string {
     "schema_version",
     "industry",
     "knowledge_domain",
-    "domain",
     "taxonomy_path",
     "type",
     "entity_type",
@@ -221,9 +220,9 @@ export function cleanupKnowledgeFrontmatter(content: string): string {
     }
 
     if (entityType) scalars.set("entity_type", entityType)
-    const domain = ENTITY_TYPE_DOMAIN[entityType] ?? normalizeToken(scalars.get("knowledge_domain") ?? "") ?? "general"
+    const domain = ENTITY_TYPE_DOMAIN[entityType] ?? normalizeToken(scalars.get("knowledge_domain") ?? scalars.get("domain") ?? "") ?? "general"
     scalars.set("knowledge_domain", domain)
-    scalars.set("domain", domain)
+    scalars.delete("domain")
     scalars.set("type", ENTITY_TYPE_TO_UNIVERSAL_TYPE[entityType] ?? normalizeToken(scalars.get("type") ?? "") ?? "concept")
 
     const ingestedBy = scalars.get("ingested_by")
