@@ -2750,15 +2750,20 @@ async function autoIngestImpl(
     if (audit.auditPath && !writtenPaths.includes(audit.auditPath)) writtenPaths.push(audit.auditPath)
     extractionAuditReviewItems = audit.reviewItems
 
-    // ── Step 3.4b: Relation reconciliation + schema materialization ──
+    // ── Step 3.4b: Hard-constraint schema materializer + relation inference ──
     // Runs after all pages are on disk so the title index is complete.
+    // Guarantees: non-standard attrs remapped, raw_attributes salvaged,
+    // missing relations inferred from attributes.related_product etc.
     try {
       const postResult = await runKnowledgePostProcess(pp)
       if (postResult.errors.length > 0) {
         console.warn("[ingest] Post-process errors:", postResult.errors)
       }
-      if (postResult.reconciled > 0 || postResult.materialized > 0) {
-        console.log(`[ingest] Post-process: reconciled=${postResult.reconciled} materialized=${postResult.materialized}`)
+      if (postResult.lintWarnings.length > 0) {
+        console.log("[ingest] Post-process lint:", postResult.lintWarnings.slice(0, 10))
+      }
+      if (postResult.reconciled > 0 || postResult.materialized > 0 || postResult.relationsInferred > 0) {
+        console.log(`[ingest] Post-process: reconciled=${postResult.reconciled} materialized=${postResult.materialized} relationsInferred=${postResult.relationsInferred}`)
       }
     } catch (err) {
       console.warn("[ingest] Post-process failed (non-critical):", err)
