@@ -494,7 +494,7 @@ export function normalizeEntityTitle(value: string): string {
     .replace(/[（(]\d{4}年\d+月版[)）]/g, "")
     .replace(/服务手册$/, "")
     // Common OCR substitution fixes
-    .replace(/普视频/g, "图音视频")
+    .replace(/普视频/g, "音视频")
     .replace(/体验专项/g, "体检专项")
     // Clean whitespace
     .replace(/\s+/g, " ")

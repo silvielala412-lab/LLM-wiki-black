@@ -226,8 +226,8 @@ function materializeAttributes(content: string, fileName: string): [string, bool
   const spec = INSURANCE_SCHEMA_REGISTRY.find((s) => s.entityType === entityType)
   if (!spec) return [content, false, warnings]
 
-  // Build inverse alias map: nonStandardName → canonicalName
-  const aliasMap = buildInverseAliasMap(entityType)
+  // Build alias map — pass content so skill detection can refine it
+  const aliasMap = buildInverseAliasMap(entityType, content)
 
   // Parse attributes — supports both JSON ({...}) and YAML (key: value) formats.
   // The LLM produces YAML-format attributes in most pages; the JSON regex
@@ -350,8 +350,8 @@ function parseYamlAttributes(content: string): {
       if (colonIdx < 1) continue
       const key = stripped.slice(0, colonIdx).trim()
       let val: string = stripped.slice(colonIdx + 1).trim()
-      // Strip YAML quotes
-      val = val.replace(/^"|"$/g, "").replace(/^'|'$/g, "")
+      // Common OCR substitution fixes
+      val = val.replace(/普视频/g, "音视频").replace(/^"|"$/g, "").replace(/^'|'$/g, "")
       // Convert null/empty to null
       attrs[key] = (val === "" || val === "null" || val === "~") ? null : val
     }
@@ -373,10 +373,30 @@ function writeBackAttributes(content: string, newAttrsJson: string, originalForm
   return content.replace(/(\n---\s*)$/, `\nattributes: ${newAttrsJson}$1`)
 }
 
-function buildInverseAliasMap(entityType: string): Record<string, string> {
-  const aliases = FIELD_ALIASES[entityType] ?? {}
+/**
+ * Build an inverse alias map (alias → canonical field name) for a given
+ * entity type. Merges aliases from:
+ *   1. Local FIELD_ALIASES in this file (baseline)
+ *   2. The registered DomainSkill's fieldAliases (skill-specific overrides)
+ * Skill aliases take precedence over local ones for the same alias key.
+ */
+function buildInverseAliasMap(entityType: string, content?: string): Record<string, string> {
+  // Start with local baseline aliases
+  const localAliases = FIELD_ALIASES[entityType] ?? {}
+
+  // Merge skill-specific aliases if a skill is registered for this entity type
+  const skill = content
+    ? (DomainSkillRegistry.detect(content) ?? DomainSkillRegistry.forEntityType(entityType))
+    : DomainSkillRegistry.forEntityType(entityType)
+  const skillAliases = skill?.fieldAliases[entityType] ?? {}
+
+  const merged: Record<string, string[]> = { ...localAliases }
+  for (const [canonical, aliasList] of Object.entries(skillAliases)) {
+    merged[canonical] = [...(merged[canonical] ?? []), ...aliasList]
+  }
+
   const inverse: Record<string, string> = {}
-  for (const [canonical, aliasList] of Object.entries(aliases)) {
+  for (const [canonical, aliasList] of Object.entries(merged)) {
     for (const alias of aliasList) {
       inverse[alias.toLowerCase()] = canonical
       inverse[alias] = canonical
@@ -412,9 +432,21 @@ function inferMissingRelations(content: string, index: PageIndex[]): [string, bo
 
   const { attrs } = parseYamlAttributes(content)
 
-  // ── Skill-based dispatch (preferred path) ──────────────────────────────────
-  // If a DomainSkill owns this entity type, delegate relation inference to it.
-  const skill = DomainSkillRegistry.forEntityType(entityType)
+  // ── Skill-based dispatch ───────────────────────────────────────────────────
+  // Prefer content-based domain detection (detectDomain) when confident;
+  // fall back to entity-type-only lookup for ambiguous cases.
+  // This correctly routes process/rule entities that belong to a specific
+  // domain without incorrectly dispatching them to the wrong skill.
+  const skillByContent = DomainSkillRegistry.detect(content)
+  const skillByType    = DomainSkillRegistry.forEntityType(entityType)
+
+  // Use content-detected skill if it's confident (≥0.5) AND it owns this entity type
+  const skill = (
+    skillByContent && skillByContent.detectDomain(content) >= 0.5
+      ? skillByContent
+      : skillByType
+  )
+
   if (skill) {
     const title = extractScalar(content, "title")
     const pageContent = { raw: content, fileName: "", entityType, title, attributes: attrs }
