@@ -29,7 +29,10 @@
 import { deleteFile, listDirectory, readFile, writeFile } from "@/commands/fs"
 import { INSURANCE_SCHEMA_REGISTRY } from "@/lib/insurance-schema-registry"
 import { cleanupKnowledgeFrontmatter } from "@/lib/knowledge-frontmatter-cleanup"
+import { DomainSkillRegistry } from "@/lib/knowledge-domain-skill"
 import { normalizeEntityTitle } from "@/lib/service-benefit-enrichment"
+// Register skills on import
+import "@/lib/health-service-skill"
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -56,11 +59,14 @@ const FIELD_ALIASES: Record<string, Record<string, string[]>> = {
   service_benefit: {
     service_name: ["name", "title", "服务名称", "权益名称", "服务项目名称"],
     related_product: ["product", "适用产品", "关联产品"],
-    service_category: ["category", "scene", "服务场景", "service_scene", "service_stage", "服务阶段", "service_team"],
-    service_frequency: ["frequency", "次数", "服务次数", "使用次数", "times"],
-    eligible_customers: ["target_customer", "target_users", "适用对象", "服务对象", "适用客户", "适用人群"],
-    application_process: ["process", "流程", "申请流程", "服务流程", "service_process"],
-    service_provider: ["provider", "提供方", "服务提供方", "服务方", "service_team"],
+    service_category: [
+      "category", "scene", "服务场景", "service_scene", "service_stage", "服务阶段",
+      // NOTE: service_team maps to service_provider (not service_category)
+    ],
+    service_provider: [
+      "provider", "提供方", "服务提供方", "服务方",
+      "service_team", "团队", "服务团队",  // ← fixed: service_team → provider
+    ],
     coverage_scope: ["coverage", "覆盖范围", "服务范围"],
     service_limits: ["limits", "限制", "使用限制", "服务限制", "service_content", "service_limits"],
     time_limits: ["time_limit", "时效", "时限", "response_timeliness", "response_time", "完成时效", "响应时效"],
@@ -393,17 +399,10 @@ function salvageFromRawText(raw: string, standardFields: string[], aliasMap: Rec
   return result
 }
 
-// ─── Relation Inference ───────────────────────────────────────────────────────
-
 function inferMissingRelations(content: string, index: PageIndex[]): [string, boolean] {
   const entityType = extractScalar(content, "entity_type")
   if (!entityType) return [content, false]
 
-  // Only infer for entity types that have a known parent field
-  const parentAttrField = PARENT_ATTR_FIELD[entityType]
-  if (!parentAttrField) return [content, false]
-
-  // Check if this page already has a part_of or applies_to relation
   const fm = extractFrontmatter(content)
   if (!fm) return [content, false]
 
@@ -411,39 +410,53 @@ function inferMissingRelations(content: string, index: PageIndex[]): [string, bo
   const hasAppliesTo = entityType !== "service_benefit" && /\bapplies_to\b/.test(fm)
   if (hasPartOf || hasAppliesTo) return [content, false]
 
-  // Read the parent value from attributes — supports both JSON and YAML format
   const { attrs } = parseYamlAttributes(content)
+
+  // ── Skill-based dispatch (preferred path) ──────────────────────────────────
+  // If a DomainSkill owns this entity type, delegate relation inference to it.
+  const skill = DomainSkillRegistry.forEntityType(entityType)
+  if (skill) {
+    const title = extractScalar(content, "title")
+    const pageContent = { raw: content, fileName: "", entityType, title, attributes: attrs }
+    const specs = skill.inferRelations(pageContent, index)
+    if (specs.length === 0) return [content, false]
+    return injectRelations(content, specs)
+  }
+
+  // ── Generic fallback for entity types without a registered skill ────────────
+  const parentAttrField = PARENT_ATTR_FIELD[entityType]
+  if (!parentAttrField) return [content, false]
+
   const parentValue = attrs[parentAttrField]
   const parentTitle = (typeof parentValue === "string" && parentValue.trim()) ? parentValue.trim() : ""
-
   if (!parentTitle) return [content, false]
 
-  // Verify the parent page exists in the index
-  const canonicalParent = entityType === "service_benefit"
-    ? resolveServiceBenefitParent(parentTitle, index)
-    : (resolveTarget(parentTitle, index) ?? parentTitle)
-
-  const relationType = entityType === "service_benefit" ? "part_of" :
-    entityType === "selling_point" ? "part_of" :
-    entityType === "product_clause" ? "part_of" :
-    entityType === "regulatory_doc" ? "governed_by" :
+  const canonicalParent = resolveTarget(parentTitle, index) ?? parentTitle
+  const relationType =
+    entityType === "selling_point"    ? "part_of"    :
+    entityType === "product_clause"   ? "part_of"    :
+    entityType === "regulatory_doc"   ? "governed_by" :
     "applies_to"
 
-  // Inject the inferred relation
-  const newRelLine = `  - "${relationType}: ${canonicalParent}"`
+  return injectRelations(content, [{ type: relationType, targetTitle: canonicalParent }])
+}
+
+/**
+ * Inject one or more relation specs into the page's relations block.
+ * Handles both `relations: []` (empty) and `relations:\n  - ...` (list) formats.
+ */
+function injectRelations(content: string, specs: Array<{ type: string; targetTitle: string }>): [string, boolean] {
+  const newRelLines = specs.map((s) => `  - "${s.type}: ${s.targetTitle}"`).join("\n")
   const relationsEmptyMatch = content.match(/^relations:\s*\[\]\s*$/m)
-  const relationsListMatch = content.match(/^(relations:\s*\n)((?:\s+-\s+.*\n?)*)/m)
+  const relationsListMatch  = content.match(/^(relations:\s*\n)((?:\s+-\s+.*\n?)*)/m)
 
   let newContent = content
   if (relationsEmptyMatch) {
-    newContent = content.replace(
-      /^relations:\s*\[\]\s*$/m,
-      `relations:\n${newRelLine}`
-    )
+    newContent = content.replace(/^relations:\s*\[\]\s*$/m, `relations:\n${newRelLines}`)
   } else if (relationsListMatch) {
     newContent = content.replace(
       relationsListMatch[0],
-      `${relationsListMatch[1]}${newRelLine}\n${relationsListMatch[2]}`
+      `${relationsListMatch[1]}${newRelLines}\n${relationsListMatch[2]}`
     )
   } else {
     return [content, false]
