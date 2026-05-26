@@ -166,12 +166,16 @@ export async function runKnowledgePostProcess(projectPath: string): Promise<Post
         const [inferred_content, inferChanged] = inferMissingRelations(updated, index)
         updated = inferred_content
 
-        // Relation reconciliation: fix broken target names
-        const [reconciled_content, recoChanged] = reconcileRelations(updated, index)
+        // Relation reconciliation: fix broken target names, drop unresolvable
+        const [reconciled_content, recoChanged, recoWarnings] = reconcileRelations(updated, index)
         updated = reconciled_content
+        lintWarnings.push(...recoWarnings)
 
         // Second cleanup to normalize format after all mutations
         updated = cleanupKnowledgeFrontmatter(updated)
+
+        // Normalize body-text wikilinks to match canonical page titles
+        updated = normalizeBodyWikilinks(updated, index)
 
         if (updated !== original) {
           await writeFile(filePath, updated)
@@ -450,39 +454,98 @@ function inferMissingRelations(content: string, index: PageIndex[]): [string, bo
 
 // ─── Relation Reconciliation ──────────────────────────────────────────────────
 
-function reconcileRelations(content: string, index: PageIndex[]): [string, boolean] {
+/**
+ * Relation types that reference narrative / computed values rather than page
+ * titles — exempt from the "drop if unresolvable" rule.
+ */
+const NARRATIVE_RELATION_TYPES = new Set([
+  "describes", "mentioned_in", "sourced_from", "sourced_via",
+])
+
+function reconcileRelations(content: string, index: PageIndex[]): [string, boolean, string[]] {
+  const warnings: string[] = []
   const fm = extractFrontmatter(content)
-  if (!fm) return [content, false]
+  if (!fm) return [content, false, warnings]
 
   const relationsMatch = fm.match(/^relations:\s*\n((?:\s+-\s+.*\n?)*)/m)
-  if (!relationsMatch) return [content, false]
+  if (!relationsMatch) return [content, false, warnings]
 
   const originalBlock = relationsMatch[0]
   const lines = relationsMatch[1].split("\n").filter(Boolean)
 
-  const reconciledLines = lines.map((line) => {
+  const reconciledLines: string[] = []
+  for (const line of lines) {
     const item = line.match(/^(\s+-\s+)"?([a-z_]+)\s*:\s*([^"]+)"?\s*$/i)
-    if (!item) return line
+    if (!item) {
+      reconciledLines.push(line)
+      continue
+    }
     const indent = item[1]
     const relType = item[2]
-    const rawTarget = item[3].trim().replace(/^["']|["']$/g, "")
+    const rawTarget = item[3].trim().replace(/^"|"$/g, "")
 
-    // Don't touch file references
-    if (rawTarget.endsWith(".md") || rawTarget.endsWith(".pdf")) return line
+    // Don't touch file references or narrative relation types
+    if (rawTarget.endsWith(".md") || rawTarget.endsWith(".pdf")) {
+      reconciledLines.push(line)
+      continue
+    }
+    if (NARRATIVE_RELATION_TYPES.has(relType)) {
+      reconciledLines.push(line)
+      continue
+    }
 
     const resolved = resolveTarget(rawTarget, index)
-    if (resolved && resolved !== rawTarget) {
-      return `${indent}"${relType}: ${resolved}"`
+    if (!resolved) {
+      // Unresolvable target: drop the relation and log it
+      warnings.push(`dropped unresolvable relation: ${relType}: ${rawTarget}`)
+      continue
     }
-    return line
-  })
+    if (resolved !== rawTarget) {
+      reconciledLines.push(`${indent}"${relType}: ${resolved}"`)
+    } else {
+      reconciledLines.push(line)
+    }
+  }
 
-  const newBlock = `relations:\n${reconciledLines.join("\n")}\n`
-  if (newBlock === originalBlock) return [content, false]
-  return [content.replace(originalBlock, newBlock), true]
+  const newBlock = `relations:\n${reconciledLines.join("\n")}${reconciledLines.length > 0 ? "\n" : ""}`
+  if (newBlock === originalBlock) return [content, false, warnings]
+  return [content.replace(originalBlock, newBlock), true, warnings]
 }
 
-// ─── Page Index ───────────────────────────────────────────────────────────────
+// ─── Body Wikilink Normalization ──────────────────────────────────────────────
+
+const WIKILINK_RE = /\[\[([^\]|]+?)(?:\|(.*?))?\]\]/g
+
+/**
+ * Scan the body text (below frontmatter) for [[...]] wikilinks and rewrite
+ * them to use the canonical page title from the index.
+ *
+ * This fixes patterns like:
+ *   [[家庭医生_臻享家医]]  →  [[家庭医生]]
+ *   [[在线问诊_臻享家医]]  →  [[在线问诊]]
+ *
+ * If the wikilink has a display alias ([[target|display]]), the alias is
+ * preserved unchanged. Only the target part is normalized.
+ */
+function normalizeBodyWikilinks(content: string, index: PageIndex[]): string {
+  const fmMatch = content.match(/^---[\s\S]*?---\n?/)
+  if (!fmMatch) return content
+  const fmBlock = fmMatch[0]
+  const bodyStart = fmBlock.length
+  const body = content.slice(bodyStart)
+
+  const normalizedBody = body.replace(WIKILINK_RE, (_match, rawTarget: string, alias?: string) => {
+    const cleanTarget = rawTarget.trim()
+    const resolved = resolveTarget(cleanTarget, index)
+    if (!resolved || resolved === cleanTarget) return _match
+    // Keep alias if one was specified; otherwise drop it (target IS the display)
+    return alias ? `[[${resolved}|${alias}]]` : `[[${resolved}]]`
+  })
+
+  if (normalizedBody === body) return content
+  return fmBlock + normalizedBody
+}
+
 
 async function buildPageIndex(projectPath: string): Promise<PageIndex[]> {
   const index: PageIndex[] = []
