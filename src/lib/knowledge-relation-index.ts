@@ -310,7 +310,12 @@ function flattenMdFiles(nodes: FileNode[]): FileNode[] {
   for (const node of nodes) {
     if (node.is_dir && node.children) {
       files.push(...flattenMdFiles(node.children))
-    } else if (!node.is_dir && node.name.endsWith(".md") && !normalizePath(node.path).includes("/wiki/media/")) {
+    } else if (
+      !node.is_dir &&
+      node.name.endsWith(".md") &&
+      !node.name.endsWith(".md.md") &&
+      !normalizePath(node.path).includes("/wiki/media/")
+    ) {
       files.push(node)
     }
   }

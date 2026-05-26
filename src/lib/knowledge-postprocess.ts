@@ -26,7 +26,7 @@
  *    their canonical title using normalized fuzzy matching.
  */
 
-import { listDirectory, readFile, writeFile } from "@/commands/fs"
+import { deleteFile, listDirectory, readFile, writeFile } from "@/commands/fs"
 import { INSURANCE_SCHEMA_REGISTRY } from "@/lib/insurance-schema-registry"
 import { cleanupKnowledgeFrontmatter } from "@/lib/knowledge-frontmatter-cleanup"
 import { normalizeEntityTitle } from "@/lib/service-benefit-enrichment"
@@ -134,8 +134,7 @@ export async function runKnowledgePostProcess(projectPath: string): Promise<Post
         const goodPath = `${entityDirPath}/${goodName}`
         const content  = await readFile(badPath)
         await writeFile(goodPath, content)
-        // We cannot delete via writeFile, but overwriting the good path is enough.
-        // The bad file will be stale; log for developer awareness.
+        await deleteFile(badPath)
         lintWarnings.push(`renamed .md.md -> ${goodName}`)
       } catch (err) {
         errors.push(`rename ${file.name}: ${String(err)}`)
@@ -223,7 +222,9 @@ function materializeAttributes(content: string, fileName: string): [string, bool
   // Parse attributes — supports both JSON ({...}) and YAML (key: value) formats.
   // The LLM produces YAML-format attributes in most pages; the JSON regex
   // `^attributes:\s*(\{.*\})\s*$` silently misses them entirely.
-  const { attrs, rawAttrsText, originalFormat } = parseYamlAttributes(content)
+  const parsedAttrs = parseYamlAttributes(content)
+  const { attrs, originalFormat } = parsedAttrs
+  let rawAttrsText = parsedAttrs.rawAttrsText
 
   // Salvage values from raw_attributes if present
   if ("raw_attributes" in attrs && typeof attrs["raw_attributes"] === "string") {
@@ -492,7 +493,7 @@ async function buildPageIndex(projectPath: string): Promise<PageIndex[]> {
   for (const dir of dirs) {
     const files = await safeList(dir)
     for (const file of files) {
-      if (file.is_dir || !file.name.endsWith(".md")) continue
+      if (file.is_dir || !file.name.endsWith(".md") || file.name.endsWith(".md.md")) continue
       try {
         const content = await readFile(`${dir}/${file.name}`)
         const title = extractScalar(content, "title")
