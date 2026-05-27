@@ -11,6 +11,7 @@ import {
   type KnowledgeDomain,
   type KnowledgeEntityType,
   type KnowledgeRelation,
+  type RelationProvenance,
   type RelationType,
 } from "@/lib/knowledge-schema"
 import {
@@ -166,6 +167,76 @@ export async function buildKnowledgeRelationIndex(projectPath: string): Promise<
         parsedRelation.type, scores, "llm",
         hasEvidence ? frontmatterList(parsed.frontmatter, "source_files") : [],
       )
+    }
+  }
+
+  // ── FIELD_DERIVED inference pass ───────────────────────────────────────────────────────
+  // Infer lateral relations from structural fields (service_category, service_scene,
+  // business_phase). Avoids full-clique noise by applying topK per source node.
+  // Only connects pages of the same domain + entity_type to prevent cross-domain leakage.
+  const FIELD_DERIVED_TOP_K = 5 // max lateral edges per source node per field
+
+  interface FieldGroupConfig {
+    field: string
+    relationType: RelationType
+    topK: number
+  }
+  const fieldGroups: FieldGroupConfig[] = [
+    { field: "service_category",  relationType: "same_category",        topK: FIELD_DERIVED_TOP_K },
+    { field: "service_scene",     relationType: "same_scene",           topK: FIELD_DERIVED_TOP_K },
+    { field: "business_phase",    relationType: "adjacent_in_process",  topK: 3 },
+  ]
+
+  for (const { field, relationType, topK } of fieldGroups) {
+    // Build groups: fieldValue → pages that have this value
+    const groups = new Map<string, KnowledgeIndexPage[]>()
+    for (const page of pages) {
+      const content = pageContent.get(page.path) ?? ""
+      const parsed = parseMarkdownFrontmatter(content)
+      // Read from attributes JSON blob first, then frontmatter scalar
+      let fieldVal = ""
+      const attrsRaw = frontmatterString(parsed.frontmatter, "attributes")
+      if (attrsRaw) {
+        try {
+          const attrs = JSON.parse(attrsRaw) as Record<string, unknown>
+          fieldVal = (attrs[field] as string | undefined) ?? ""
+        } catch { /* ignore */ }
+      }
+      if (!fieldVal) fieldVal = frontmatterString(parsed.frontmatter, field)
+      if (!fieldVal || fieldVal === "null") continue
+      const groupKey = `${page.domain}:::${page.entityType}:::${fieldVal.trim()}`
+      if (!groups.has(groupKey)) groups.set(groupKey, [])
+      groups.get(groupKey)!.push(page)
+    }
+
+    // For each group, emit topK lateral edges per source node
+    for (const group of groups.values()) {
+      if (group.length < 2) continue // singleton groups produce no edges
+      for (const source of group) {
+        const sourcePageConf = parseFloat(
+          frontmatterString(
+            parseMarkdownFrontmatter(pageContent.get(source.path) ?? "").frontmatter,
+            "confidence",
+          ) ?? "0.6"
+        ) || 0.6
+        const candidates = group
+          .filter(p => p.id !== source.id)
+          // Sort candidates: prefer higher-confidence pages as neighbors
+          .sort((a, b) => {
+            const confA = parseFloat(frontmatterString(parseMarkdownFrontmatter(pageContent.get(a.path) ?? "").frontmatter, "confidence") ?? "0.6") || 0.6
+            const confB = parseFloat(frontmatterString(parseMarkdownFrontmatter(pageContent.get(b.path) ?? "").frontmatter, "confidence") ?? "0.6") || 0.6
+            return confB - confA
+          })
+          .slice(0, topK)
+
+        for (const target of candidates) {
+          const scores = computeRelationScoreByProvenance(relationType, "field_derived", false, sourcePageConf)
+          pushRelationWithProvenance(
+            relations, seen, source, target, target.title,
+            relationType, scores, "system", [], "field_derived",
+          )
+        }
+      }
     }
   }
 
@@ -347,11 +418,21 @@ function computeRelationScore(
   hasEvidence: boolean,
   pageConfidence: number,
 ): { confidence: number; strength: number; score: number } {
+  return computeRelationScoreByProvenance(type,
+    createdBy === "system" ? "explicit" : createdBy === "user" ? "user_confirmed" : "explicit",
+    hasEvidence, pageConfidence
+  )
+}
+
+function computeRelationScoreByProvenance(
+  type: RelationType,
+  provenance: RelationProvenance,
+  hasEvidence: boolean,
+  pageConfidence: number,
+): { confidence: number; strength: number; score: number } {
   const typeScore = RELATION_TYPE_SCORES[type] ?? { confidence_base: 0.60, strength: 0.45 }
-  const sourceFactor = RELATION_SOURCE_CONFIDENCE[createdBy] ?? 0.85
+  const sourceFactor = RELATION_SOURCE_CONFIDENCE[provenance] ?? RELATION_SOURCE_CONFIDENCE["explicit"]
   const evidenceFactor = hasEvidence ? 1.08 : 1.0
-  // Page confidence (0-1) contributes a modest boost: pages with confidence>0.85
-  // get +5% on their relations, pages < 0.6 get -10%
   const pageQualityFactor = pageConfidence >= 0.85 ? 1.05 : pageConfidence < 0.6 ? 0.90 : 1.0
   const confidence = Math.min(1, typeScore.confidence_base * sourceFactor * evidenceFactor * pageQualityFactor)
   const strength = typeScore.strength
@@ -368,6 +449,27 @@ function pushRelation(
   scores: { confidence: number; strength: number; score: number },
   createdBy: "llm" | "system" | "user",
   evidenceRefs: string[],
+): void {
+  pushRelationWithProvenance(relations, seen, source, target, targetLabel, type, scores, createdBy, evidenceRefs,
+    createdBy === "system" ? "explicit" : createdBy === "user" ? "user_confirmed" : "explicit"
+  )
+}
+
+/**
+ * Extended push with explicit provenance tagging.
+ * All new code should call this; the untyped pushRelation is kept for backward compat.
+ */
+function pushRelationWithProvenance(
+  relations: KnowledgeRelation[],
+  seen: Set<string>,
+  source: KnowledgeIndexPage,
+  target: KnowledgeIndexPage | null,
+  targetLabel: string,
+  type: RelationType,
+  scores: { confidence: number; strength: number; score: number },
+  createdBy: "llm" | "system" | "user",
+  evidenceRefs: string[],
+  provenance: RelationProvenance,
 ): void {
   const targetId = target?.id ?? slugId(targetLabel)
   if (!targetId || targetId === source.id) return
@@ -393,6 +495,7 @@ function pushRelation(
     evidence_refs: evidenceRefs,
     created_at: new Date().toISOString(),
     created_by: createdBy,
+    provenance,
   })
 }
 

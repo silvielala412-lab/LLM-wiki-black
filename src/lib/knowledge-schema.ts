@@ -99,6 +99,31 @@ export type RelationType =
   | "review_required_by"
   | "bundled_with"
   | "complements"
+  // ── Field-derived lateral relations (FIELD_DERIVED provenance) ──────────────
+  // These are inferred from structural fields, not from LLM output.
+  // Lower score than explicit relations; used for candidate expansion only.
+  | "same_category"          // same service_category value
+  | "same_scene"             // same service_scene value
+  | "adjacent_in_process"    // same business_phase / sequential in process
+
+
+/**
+ * Provenance of a relation edge: how was it created?
+ * This drives confidence weighting and lets agents filter by trust level.
+ *
+ * Layer mapping (Codex design):
+ *   explicit        → Layer 1 (frontmatter relations: / human review)
+ *   field_derived   → Layer 2 (structural field matching: service_category, service_scene, etc.)
+ *   wikilink        → Layer 2.5 (body [[wikilink]] co-mention)
+ *   llm_inferred    → Layer 4 (postprocess LLM semantic pass on candidate pairs)
+ *   user_confirmed  → Layer 1 (human override — highest trust)
+ */
+export type RelationProvenance =
+  | "explicit"        // frontmatter relations: list or schema-inferred structural fact
+  | "field_derived"   // computed from matching field values (same_category, same_scene, etc.)
+  | "wikilink"        // body [[wikilink]] co-mention
+  | "llm_inferred"    // postprocess LLM semantic pass (must carry confidence + reason)
+  | "user_confirmed"  // human-annotated or human-approved
 
 export interface KnowledgeRelation {
   id: string
@@ -130,7 +155,19 @@ export interface KnowledgeRelation {
   score: number
   evidence_refs: string[]
   created_at: string
+  /** @deprecated use provenance instead; kept for backward compatibility */
   created_by: "llm" | "system" | "user"
+  /**
+   * Provenance: which layer produced this edge.
+   * Agents can filter by provenance to control trust level.
+   * e.g. minProvenance: ["explicit", "user_confirmed"] for high-trust path only.
+   */
+  provenance?: RelationProvenance
+  /**
+   * For llm_inferred edges only: reason string from the LLM that produced this edge.
+   * Enables transparency and debugging of inferred relations.
+   */
+  inferred_reason?: string
 }
 
 export interface KnowledgeClassification {
@@ -309,13 +346,21 @@ export const RELATION_INVERSE_LABELS: Partial<Record<RelationType, string>> = {
 // Used at index-build time (knowledge-relation-index.ts) and by the RAG API.
 
 /**
- * Confidence modifier by relation creation source.
- * Governance Layer (Layer 4): source metadata → confidence modifier
+ * Confidence modifier by relation provenance layer.
+ * Governance Layer (Layer 4): source metadata → confidence modifier.
+ * Ordered from highest to lowest trust.
  */
-export const RELATION_SOURCE_CONFIDENCE: Record<"system" | "llm" | "user", number> = {
-  system: 1.00, // postprocess schema-inferred (e.g. part_of from related_product)
-  user:   1.00, // human-annotated — ground truth
-  llm:    0.85, // LLM-generated — needs evidence to raise confidence
+export const RELATION_SOURCE_CONFIDENCE: Record<"system" | "llm" | "user" | RelationProvenance, number> = {
+  // Legacy created_by values (backward compat)
+  system: 1.00,
+  user:   1.00,
+  llm:    0.85,
+  // New provenance levels
+  user_confirmed: 1.00, // human ground truth
+  explicit:       0.92, // frontmatter schema-declared or postprocess-inferred structural fact
+  field_derived:  0.55, // structural field match — plausible but not confirmed
+  wikilink:       0.45, // body co-mention — weak signal
+  llm_inferred:   0.70, // LLM semantic judgment on candidate pair
 }
 
 /**
@@ -372,6 +417,10 @@ export const RELATION_TYPE_SCORES: Record<RelationType, { confidence_base: numbe
   // Soft / supplementary
   related_to:            { confidence_base: 0.60, strength: 0.45 },
   mentions:              { confidence_base: 0.70, strength: 0.35 },
+  // Field-derived lateral (FIELD_DERIVED layer) — lower scores keep them below explicit edges
+  same_category:         { confidence_base: 0.50, strength: 0.40 },
+  same_scene:            { confidence_base: 0.48, strength: 0.38 },
+  adjacent_in_process:   { confidence_base: 0.55, strength: 0.50 },
 }
 
 /**
@@ -380,14 +429,17 @@ export const RELATION_TYPE_SCORES: Record<RelationType, { confidence_base: numbe
  * Relation Layer (Layer 3): query-time routing contract.
  */
 export const RELATION_QUERY_AFFINITY: Record<string, RelationType[]> = {
-  composition:  ["has_part", "part_of", "defined_by", "describes"],
-  compliance:   ["governed_by", "governs", "defines", "mitigated_by", "not_recommended_for"],
-  suitability:  ["recommended_for", "applies_to", "targets_persona", "not_recommended_for"],
-  sales:        ["uses_pitch", "uses_objection_handling", "supports", "targets_persona"],
-  evidence:     ["has_evidence", "derived_from", "described_by", "describes"],
-  combination:  ["bundled_with", "complements", "recommended_for"],
-  versioning:   ["supersedes", "updates", "refines"],
-  general:      ["part_of", "has_part", "governed_by", "applies_to", "recommended_for"],
+  composition:   ["has_part", "part_of", "defined_by", "describes"],
+  compliance:    ["governed_by", "governs", "defines", "mitigated_by", "not_recommended_for"],
+  suitability:   ["recommended_for", "applies_to", "targets_persona", "not_recommended_for"],
+  sales:         ["uses_pitch", "uses_objection_handling", "supports", "targets_persona"],
+  evidence:      ["has_evidence", "derived_from", "described_by", "describes"],
+  combination:   ["bundled_with", "complements", "recommended_for"],
+  versioning:    ["supersedes", "updates", "refines"],
+  // service_nav: lateral navigation between sibling services
+  // Agent uses this when user asks "what other services are related to X?"
+  service_nav:   ["same_category", "same_scene", "adjacent_in_process", "complements", "bundled_with"],
+  general:       ["part_of", "has_part", "governed_by", "applies_to", "recommended_for"],
 }
 
 export const UNIVERSAL_INSURANCE_SCHEMA_PROMPT = [
