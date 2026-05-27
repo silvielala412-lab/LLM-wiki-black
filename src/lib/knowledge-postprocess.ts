@@ -386,8 +386,15 @@ function appendToFrontmatterList(content: string, key: string, items: string[]):
   if (inlineEmptyRe.test(content)) {
     return content.replace(inlineEmptyRe, `${key}:\n${itemLines}`)
   }
-  // Append before closing ---
-  return content.replace(/(\n---\s*$)/, `\n${key}:\n${itemLines}$1`)
+  // Fallback: insert key block into frontmatter using scoped extraction.
+  // Avoids matching body-level --- lines that (\n---\s*$) with multiline flag would hit.
+  const fmMatch = content.match(/^(---\r?\n)([\s\S]*?)(\r?\n---)/m)
+  if (fmMatch) {
+    const [fullFmBlock, open, fm, close] = fmMatch
+    const newFm = fm.trimEnd() + `\n${key}:\n${itemLines}`
+    return content.replace(fullFmBlock, open + newFm + close)
+  }
+  return content
 }
 
 function removeRelationCandidatesFromAttrs(content: string, attrs: Record<string, unknown>): string {
