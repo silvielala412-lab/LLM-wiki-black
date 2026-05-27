@@ -99,6 +99,8 @@ export type RelationType =
   | "review_required_by"
   | "bundled_with"
   | "complements"
+  | "next_step"
+  | "same_stage"
   // ── Field-derived lateral relations (FIELD_DERIVED provenance) ──────────────
   // These are inferred from structural fields, not from LLM output.
   // Lower score than explicit relations; used for candidate expansion only.
@@ -341,6 +343,8 @@ export const RELATION_INVERSE_LABELS: Partial<Record<RelationType, string>> = {
   review_required_by: "requires_review",
   bundled_with: "bundled_with",
   complements: "complements",
+  next_step: "previous_step",
+  same_stage: "same_stage",
 }
 
 // ─── Relation Scoring Constants ───────────────────────────────────────────────
@@ -409,6 +413,8 @@ export const RELATION_TYPE_SCORES: Record<RelationType, { confidence_base: numbe
   fills_gap_for:         { confidence_base: 0.75, strength: 0.70 },
   // Product / versioning
   complements:           { confidence_base: 0.78, strength: 0.75 },
+  next_step:             { confidence_base: 0.82, strength: 0.82 },
+  same_stage:            { confidence_base: 0.76, strength: 0.72 },
   bundled_with:          { confidence_base: 0.80, strength: 0.78 },
   supersedes:            { confidence_base: 0.88, strength: 0.85 },
   updates:               { confidence_base: 0.85, strength: 0.82 },
@@ -442,7 +448,7 @@ export const RELATION_QUERY_AFFINITY: Record<string, RelationType[]> = {
   versioning:    ["supersedes", "updates", "refines"],
   // service_nav: lateral navigation between sibling services
   // Agent uses this when user asks "what other services are related to X?"
-  service_nav:   ["same_category", "same_scene", "adjacent_in_process", "complements", "bundled_with"],
+  service_nav:   ["next_step", "same_stage", "same_category", "same_scene", "adjacent_in_process", "complements", "bundled_with"],
   general:       ["part_of", "has_part", "governed_by", "applies_to", "recommended_for"],
 }
 
@@ -509,7 +515,7 @@ export const UNIVERSAL_INSURANCE_SCHEMA_PROMPT = [
   "  - governed_by: service_benefit_compliance_review",
   "```",
   "",
-  "Allowed relation types include: related_to, mentions, applies_to, recommended_for, not_recommended_for, supports, supported_by, conflicts_with, updates, supersedes, governed_by, governs, derived_from, uses_asset, has_evidence, parent_of, child_of, refines, maps_to, fills_gap_for, describes, described_by, part_of, has_part, mitigated_by, mitigates, defines, defined_by, bundled_with, complements.",
+  "Allowed relation types include: related_to, mentions, applies_to, recommended_for, not_recommended_for, supports, supported_by, conflicts_with, updates, supersedes, governed_by, governs, derived_from, uses_asset, has_evidence, parent_of, child_of, refines, maps_to, fills_gap_for, describes, described_by, part_of, has_part, mitigated_by, mitigates, defines, defined_by, bundled_with, complements, next_step, same_stage.",
   "",
   "Do not use `entity_type: source` for pages under wiki/entities/ or wiki/concepts/. Source documents belong under wiki/sources/ with `type: source` and `entity_type: source`.",
   "",

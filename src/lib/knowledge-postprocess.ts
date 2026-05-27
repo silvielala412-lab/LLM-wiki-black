@@ -376,25 +376,28 @@ function extractFrontmatterRelationLines(content: string): string[] {
 
 function appendToFrontmatterList(content: string, key: string, items: string[]): string {
   const itemLines = items.map((item) => `  - "${item}"`).join("\n")
-  // Try to append to existing block list
-  const blockRe = new RegExp(`^(${key}:\s*\\n(?:\\s+-\\s+.+\\n?)*)`, "m")
-  if (blockRe.test(content)) {
-    return content.replace(blockRe, (match) => match.trimEnd() + "\n" + itemLines + "\n")
-  }
-  // Try to expand inline empty list
-  const inlineEmptyRe = new RegExp(`^(${key}:\s*\\[\\])`, "m")
-  if (inlineEmptyRe.test(content)) {
-    return content.replace(inlineEmptyRe, `${key}:\n${itemLines}`)
-  }
-  // Fallback: insert key block into frontmatter using scoped extraction.
-  // Avoids matching body-level --- lines that (\n---\s*$) with multiline flag would hit.
   const fmMatch = content.match(/^(---\r?\n)([\s\S]*?)(\r?\n---)/m)
-  if (fmMatch) {
-    const [fullFmBlock, open, fm, close] = fmMatch
-    const newFm = fm.trimEnd() + `\n${key}:\n${itemLines}`
+  if (!fmMatch) {
+    return `---\n${key}:\n${itemLines}\n---\n\n${content}`
+  }
+
+  const [fullFmBlock, open, fm, close] = fmMatch
+
+  // Try to append to existing block list
+  const blockRe = new RegExp(`^(${key}:\\s*\\n(?:\\s+-\\s+.+\\n?)*)`, "m")
+  if (blockRe.test(fm)) {
+    const newFm = fm.replace(blockRe, (match) => match.trimEnd() + "\n" + itemLines + "\n")
     return content.replace(fullFmBlock, open + newFm + close)
   }
-  return content
+  // Try to expand inline empty list
+  const inlineEmptyRe = new RegExp(`^(${key}:\\s*\\[\\])`, "m")
+  if (inlineEmptyRe.test(fm)) {
+    const newFm = fm.replace(inlineEmptyRe, `${key}:\n${itemLines}`)
+    return content.replace(fullFmBlock, open + newFm + close)
+  }
+  // Append to the existing frontmatter block.
+  const newFm = fm.trimEnd() + `\n${key}:\n${itemLines}`
+  return content.replace(fullFmBlock, open + newFm + close)
 }
 
 function removeRelationCandidatesFromAttrs(content: string, attrs: Record<string, unknown>): string {

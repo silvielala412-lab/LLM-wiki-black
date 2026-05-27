@@ -41,6 +41,7 @@ const TYPE_META: Record<string, { icon: string; color: string; bg: string }> = {
 // ── Frontmatter parser ───────────────────────────────────────────────────────
 
 interface Frontmatter {
+  [key: string]: unknown
   title: string
   type: string
   tags: string[]
@@ -73,6 +74,7 @@ interface Frontmatter {
   attributes: string
   claims: string[]
   relations: string[]
+  relation_edges: FrontmatterRelationEdge[]
   ingest_processing_mode: string
   ingest_source_chars: string
   ingest_context_chars: string
@@ -80,6 +82,14 @@ interface Frontmatter {
   ingest_quality_confidence: string
 }
 
+interface FrontmatterRelationEdge {
+  target: string
+  type: string
+  provenance: string
+  confidence: string
+  evidence: string
+  source_files: string[]
+}
 
 function parseFrontmatter(content: string): { fm: Frontmatter; body: string } {
   const fm: Frontmatter = {
@@ -88,7 +98,7 @@ function parseFrontmatter(content: string): { fm: Frontmatter; body: string } {
     schema_version: "", industry: "", domain: "", knowledge_domain: "", taxonomy_path: [],
     entity_type: "", business_phase: "", dedup_key: "", summary: "",
     keywords: [], source_files: [], confidence: "", needs_review: "", created_at: "", updated_at: "",
-    created_by: "", attributes: "", claims: [], relations: [],
+    created_by: "", attributes: "", claims: [], relations: [], relation_edges: [],
     ingest_processing_mode: "", ingest_source_chars: "", ingest_context_chars: "",
     ingest_chunk_count: "", ingest_quality_confidence: "",
   }
@@ -152,6 +162,14 @@ function parseFrontmatter(content: string): { fm: Frontmatter; body: string } {
   fm.attributes = rawYamlValue(yamlStr, "attributes") || fm.attributes
   if (fm.claims.length === 0) fm.claims = rawYamlBlockList(yamlStr, "claims")
   if (fm.relations.length === 0) fm.relations = rawYamlBlockList(yamlStr, "relations")
+  fm.relation_edges = rawYamlObjectList(yamlStr, "relation_edges").map((item) => ({
+    target: item.target ?? "",
+    type: item.type ?? "related_to",
+    provenance: item.provenance ?? "",
+    confidence: item.confidence ?? "",
+    evidence: item.evidence ?? "",
+    source_files: asList(item.source_files ?? ""),
+  })).filter((edge) => edge.target)
 
   return { fm, body }
 }
@@ -182,7 +200,53 @@ function rawYamlBlockList(yaml: string, key: string): string[] {
     .filter(Boolean)
 }
 
+function rawYamlObjectList(yaml: string, key: string): Array<Record<string, string>> {
+  const lines = yaml.split(/\r?\n/)
+  const start = lines.findIndex(line => new RegExp(`^${key}:\\s*$`).test(line))
+  if (start < 0) return []
+
+  const items: Array<Record<string, string>> = []
+  let current: Record<string, string> | null = null
+
+  const setField = (raw: string) => {
+    if (!current) current = {}
+    const match = raw.match(/^(\w+):\s*(.*)$/)
+    if (!match) return
+    current[match[1]] = match[2].trim().replace(/^["']|["']$/g, "")
+  }
+
+  for (let i = start + 1; i < lines.length; i++) {
+    const line = lines[i]
+    if (/^\w+:\s*/.test(line)) break
+    if (!line.trim()) continue
+
+    const itemStart = line.match(/^\s*-\s*(.*)$/)
+    if (itemStart) {
+      if (current && Object.keys(current).length > 0) items.push(current)
+      current = {}
+      if (itemStart[1].trim()) setField(itemStart[1].trim())
+      continue
+    }
+
+    const field = line.match(/^\s+(\w+:\s*.*)$/)
+    if (field) setField(field[1])
+  }
+
+  if (current && Object.keys(current).length > 0) items.push(current)
+  return items
+}
+
 // ── Section splitter ─────────────────────────────────────────────────────────
+
+function formatRelationEdge(edge: FrontmatterRelationEdge): string {
+  const meta = [
+    edge.type,
+    edge.provenance,
+    edge.confidence ? `confidence=${edge.confidence}` : "",
+  ].filter(Boolean).join(" / ")
+  const evidence = edge.evidence ? ` - ${edge.evidence}` : ""
+  return `${edge.target}${meta ? ` (${meta})` : ""}${evidence}`
+}
 
 interface Section {
   heading: string   // "" for content before first heading
@@ -430,6 +494,7 @@ function SchemaInfoPanel({ fm }: { fm: Frontmatter }) {
       rows: [
         ["Related", fm.related.join(", ")],
         ["Relations", fm.relations.join(" | ")],
+        ["Relation Edges", fm.relation_edges.map(formatRelationEdge).join("\n")],
         ["Parent", fm.parent],
         ["Children", fm.children.join(", ")],
       ],
@@ -658,6 +723,13 @@ export function WikiPageViewer({ filePath, content, onEditRequest, onDeleteCompl
       path: findWikiPage(name, allPaths),
     }))
   }, [fm.related, allPaths])
+
+  const relationEdgeResolved = useMemo(() => {
+    return fm.relation_edges.map(edge => ({
+      edge,
+      path: findWikiPage(edge.target, allPaths),
+    }))
+  }, [fm.relation_edges, allPaths])
 
   useEffect(() => {
     let cancelled = false
@@ -1059,6 +1131,32 @@ export function WikiPageViewer({ filePath, content, onEditRequest, onDeleteCompl
                   detail={relationLabel(relation)}
                   exists={Boolean(relation.display_path)}
                   onClick={() => relation.display_path && openRelated(relation.display_path)}
+                />
+              ))}
+            </div>
+          </div>
+        ) : relationEdgeResolved.length > 0 ? (
+          <div style={{ marginBottom: 28 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+              <div style={{ width: 4, height: 16, borderRadius: 2, background: "#0891B2" }} />
+              <h2 style={{ fontSize: 14, fontWeight: 700, color: "#15181E", margin: 0, borderLeft: "none", paddingLeft: 0 }}>
+                缁撴瀯鍖栧叧鑱?
+              </h2>
+            </div>
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))",
+                gap: 8,
+              }}
+            >
+              {relationEdgeResolved.map(({ edge, path }) => (
+                <WikiLinkCard
+                  key={`${edge.type}-${edge.target}`}
+                  name={edge.target}
+                  detail={[edge.type, edge.provenance, edge.confidence ? `confidence ${edge.confidence}` : ""].filter(Boolean).join(" / ")}
+                  exists={path !== null}
+                  onClick={() => path && openRelated(path)}
                 />
               ))}
             </div>

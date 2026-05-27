@@ -151,8 +151,8 @@ export async function buildKnowledgeRelationIndex(projectPath: string): Promise<
 
     for (const link of extractWikilinks(parsed.body)) {
       const target = resolveTarget(link, byId, byTitle)
-      const scores = computeRelationScore("mentions", "system", false, pageConf)
-      pushRelation(relations, seen, page, target, link, "mentions", scores, "system", [])
+      const scores = computeRelationScoreByProvenance("mentions", "wikilink", false, pageConf)
+      pushRelationWithProvenance(relations, seen, page, target, link, "mentions", scores, "system", [], "wikilink")
     }
 
     // relation_edges: MUST be processed BEFORE compact relations: so that high-quality
@@ -595,6 +595,7 @@ function normalizeRelationType(value: string): RelationType {
     "defines", "defined_by", "supported_by", "has_recommendation", "uses_pitch", "used_by_pitch",
     "uses_objection_handling", "used_by_objection_handling", "targets_persona", "targeted_by",
     "requires_review", "review_required_by", "bundled_with", "complements",
+    "next_step", "same_stage", "same_category", "same_scene", "adjacent_in_process",
   ]
   return known.includes(normalized as RelationType) ? normalized as RelationType : "related_to"
 }
