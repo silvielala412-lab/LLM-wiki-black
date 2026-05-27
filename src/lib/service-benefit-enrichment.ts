@@ -22,7 +22,16 @@ interface DirEntry {
   is_dir?: boolean
 }
 
+interface PersistedRelationEdge {
+  target: string
+  type: "part_of" | "same_stage" | "same_category" | "next_step"
+  confidence: number
+  evidence: string
+  sourceFiles: string[]
+}
+
 const AUTO_SECTION_MARKER = "<!-- service-benefit-enrichment -->"
+const MAX_STRUCTURED_SERVICE_EDGES = 6
 
 export async function enrichServiceBenefitPagesFromSources(projectPath: string): Promise<string[]> {
   const facts = await collectSourceFacts(projectPath)
@@ -295,6 +304,7 @@ function enrichServicePage(content: string, row: ServiceInventoryRow, facts: Sou
   let next = replaceAttributes(content, attrs)
   next = replaceScalar(next, "needs_review", Array.isArray(attrs.knowledge_gaps) && attrs.knowledge_gaps.length === 0 ? "false" : "true")
   next = replaceScalar(next, "updated", new Date().toISOString().slice(0, 10))
+  next = upsertServiceRelations(next, buildServiceRelationEdges(row.serviceName, row, facts))
   next = upsertAutoSection(next, row, facts, coverage)
   return next
 }
@@ -331,6 +341,13 @@ function buildServiceBenefitPage(serviceName: string, row: ServiceInventoryRow |
   }
   const summaryText = `${serviceName}是${facts.relatedProduct || "服务手册"}中的服务权益，已由源文档清单自动生成。`
   const relatedProduct = facts.relatedProduct || "臻享家医健康服务计划"
+  const relationEdges = buildServiceRelationEdges(serviceName, row, facts)
+  const relationLines = dedupeStrings([
+    `part_of: ${relatedProduct}`,
+    ...relationEdges
+      .filter((edge) => edge.type !== "part_of")
+      .map((edge) => `${edge.type}: ${edge.target}`),
+  ])
   const knownRows = [
     row?.serviceScene ? `| 服务场景 | ${escapeTable(row.serviceScene)} |` : "",
     row?.serviceStage ? `| 服务阶段 | ${escapeTable(row.serviceStage)} |` : "",
@@ -361,7 +378,9 @@ function buildServiceBenefitPage(serviceName: string, row: ServiceInventoryRow |
     `keywords: ["${escapeYaml(serviceName)}"]`,
     `related: ["${escapeYaml(relatedProduct)}"]`,
     'relations:',
-    `  - "part_of: ${escapeYaml(relatedProduct)}"`,
+    relationLines.map((line) => `  - "${escapeYaml(line)}"`).join("\n"),
+    relationEdges.length > 0 ? "relation_edges:" : "",
+    relationEdges.length > 0 ? formatRelationEdgesBlock(relationEdges) : "",
     'parent: ""',
     "children: []",
     `source_files: ["${escapeYaml(sourceFile)}"]`,
@@ -416,10 +435,10 @@ function upsertAutoSection(content: string, row: ServiceInventoryRow, facts: Sou
 
   const existing = content.indexOf(AUTO_SECTION_MARKER)
   if (existing >= 0) {
-    const before = content.slice(0, existing).trimEnd()
-    const afterStart = content.indexOf("\n## ", existing + AUTO_SECTION_MARKER.length)
-    const after = afterStart >= 0 ? content.slice(afterStart).trimStart() : ""
-    return `${before}\n\n${section}${after ? `\n${after}` : ""}`
+    const autoSectionRe = new RegExp(
+      `${escapeRegExp(AUTO_SECTION_MARKER)}[\\s\\S]*?(?=\\n## (?!服务手册确定信息)|\\n# |$)`,
+    )
+    return content.replace(autoSectionRe, section)
   }
 
   const h1 = content.match(/^# .+$/m)
@@ -443,6 +462,201 @@ function findCoverage(coverageByService: Map<string, string>, serviceName: strin
     if (service === normalized || service.includes(normalized) || normalized.includes(service)) return coverage
   }
   return ""
+}
+
+function buildServiceRelationEdges(
+  serviceName: string,
+  row: ServiceInventoryRow | null,
+  facts: SourceFacts,
+): PersistedRelationEdge[] {
+  const edges: PersistedRelationEdge[] = []
+  const sourceFiles = [facts.sourceFileName || row?.sourceFile || ""].filter(Boolean)
+  const relatedProduct = facts.relatedProduct || "臻享家医健康服务计划"
+  if (relatedProduct) {
+    edges.push({
+      target: relatedProduct,
+      type: "part_of",
+      confidence: 0.92,
+      evidence: `${serviceName} 来自 ${relatedProduct} 的服务项目清单。`,
+      sourceFiles,
+    })
+  }
+
+  if (!row) return edges
+
+  const currentKey = normalizeServiceName(row.serviceName || serviceName)
+  const orderedRows = facts.rows.filter((item) => normalizeServiceName(item.serviceName) !== currentKey)
+  const sameStage = orderedRows.filter((item) =>
+    row.serviceScene &&
+    row.serviceStage &&
+    item.serviceScene === row.serviceScene &&
+    item.serviceStage === row.serviceStage
+  )
+  for (const peer of nearestServiceRows(facts.rows, row, sameStage, 3)) {
+    edges.push({
+      target: peer.serviceName,
+      type: "same_stage",
+      confidence: 0.72,
+      evidence: `${row.serviceName} 与 ${peer.serviceName} 同属「${row.serviceScene}/${row.serviceStage}」服务阶段。`,
+      sourceFiles,
+    })
+  }
+
+  const sameCategory = orderedRows.filter((item) =>
+    row.serviceScene &&
+    item.serviceScene === row.serviceScene &&
+    item.serviceStage !== row.serviceStage
+  )
+  for (const peer of nearestServiceRows(facts.rows, row, sameCategory, 2)) {
+    edges.push({
+      target: peer.serviceName,
+      type: "same_category",
+      confidence: 0.64,
+      evidence: `${row.serviceName} 与 ${peer.serviceName} 同属「${row.serviceScene}」服务场景。`,
+      sourceFiles,
+    })
+  }
+
+  const next = nextServiceRow(facts.rows, row)
+  if (next) {
+    edges.push({
+      target: next.serviceName,
+      type: "next_step",
+      confidence: 0.66,
+      evidence: `${row.serviceName} 与 ${next.serviceName} 在源服务清单中相邻，属于同一服务场景的连续候选。`,
+      sourceFiles,
+    })
+  }
+
+  return dedupeRelationEdges(edges).slice(0, MAX_STRUCTURED_SERVICE_EDGES)
+}
+
+function nearestServiceRows(
+  allRows: ServiceInventoryRow[],
+  row: ServiceInventoryRow,
+  candidates: ServiceInventoryRow[],
+  limit: number,
+): ServiceInventoryRow[] {
+  const currentIndex = allRows.findIndex((item) => normalizeServiceName(item.serviceName) === normalizeServiceName(row.serviceName))
+  return candidates
+    .slice()
+    .sort((a, b) => {
+      const ai = allRows.findIndex((item) => normalizeServiceName(item.serviceName) === normalizeServiceName(a.serviceName))
+      const bi = allRows.findIndex((item) => normalizeServiceName(item.serviceName) === normalizeServiceName(b.serviceName))
+      return Math.abs(ai - currentIndex) - Math.abs(bi - currentIndex)
+    })
+    .slice(0, limit)
+}
+
+function nextServiceRow(rows: ServiceInventoryRow[], row: ServiceInventoryRow): ServiceInventoryRow | null {
+  const currentIndex = rows.findIndex((item) => normalizeServiceName(item.serviceName) === normalizeServiceName(row.serviceName))
+  if (currentIndex < 0) return null
+  const next = rows[currentIndex + 1]
+  if (!next || next.serviceScene !== row.serviceScene) return null
+  return next
+}
+
+function dedupeRelationEdges(edges: PersistedRelationEdge[]): PersistedRelationEdge[] {
+  const seen = new Set<string>()
+  const result: PersistedRelationEdge[] = []
+  for (const edge of edges) {
+    const key = `${edge.type}::${normalizeServiceName(edge.target)}`
+    if (!edge.target || seen.has(key)) continue
+    seen.add(key)
+    result.push(edge)
+  }
+  return result
+}
+
+function upsertServiceRelations(content: string, edges: PersistedRelationEdge[]): string {
+  if (edges.length === 0) return content
+  let next = upsertFrontmatterList(
+    content,
+    "relations",
+    edges.map((edge) => `${edge.type}: ${edge.target}`),
+  )
+  next = upsertRelationEdges(next, edges)
+  return next
+}
+
+function upsertFrontmatterList(content: string, key: string, items: string[]): string {
+  const existing = new Set(extractFrontmatterList(content, key).map((item) => item.toLowerCase()))
+  const toAdd = items.filter((item) => item && !existing.has(item.toLowerCase()))
+  if (toAdd.length === 0) return content
+  const itemLines = toAdd.map((item) => `  - "${escapeYaml(item)}"`).join("\n")
+  const fmMatch = content.match(/^(---\r?\n)([\s\S]*?)(\r?\n---)/m)
+  if (!fmMatch) return `---\n${key}:\n${itemLines}\n---\n\n${content}`
+
+  const [fullFmBlock, open, fm, close] = fmMatch
+  const blockRe = new RegExp(`^(${escapeRegExp(key)}:\\s*\\n(?:\\s+-\\s+.+\\n?)*)`, "m")
+  if (blockRe.test(fm)) {
+    const newFm = fm.replace(blockRe, (match) => `${match.trimEnd()}\n${itemLines}\n`)
+    return content.replace(fullFmBlock, open + newFm + close)
+  }
+  const inlineEmptyRe = new RegExp(`^${escapeRegExp(key)}:\\s*\\[\\]`, "m")
+  if (inlineEmptyRe.test(fm)) {
+    const newFm = fm.replace(inlineEmptyRe, `${key}:\n${itemLines}`)
+    return content.replace(fullFmBlock, open + newFm + close)
+  }
+  const newFm = `${fm.trimEnd()}\n${key}:\n${itemLines}`
+  return content.replace(fullFmBlock, open + newFm + close)
+}
+
+function upsertRelationEdges(content: string, edges: PersistedRelationEdge[]): string {
+  const existing = readExistingRelationEdgeKeys(content)
+  const toAdd = edges.filter((edge) => !existing.has(`${edge.type}::${normalizeServiceName(edge.target)}`))
+  if (toAdd.length === 0) return content
+  const edgeBlock = formatRelationEdgesBlock(toAdd)
+  const fmMatch = content.match(/^(---\r?\n)([\s\S]*?)(\r?\n---)/m)
+  if (!fmMatch) return `---\nrelation_edges:\n${edgeBlock}\n---\n\n${content}`
+
+  const [fullFmBlock, open, fm, close] = fmMatch
+  const blockRe = /^relation_edges:[ \t]*\n(?:[ \t]+.*(?:\r?\n|$))*/m
+  if (blockRe.test(fm)) {
+    const newFm = fm.replace(blockRe, (match) => `${match.trimEnd()}\n${edgeBlock}\n`)
+    return content.replace(fullFmBlock, open + newFm + close)
+  }
+  const newFm = `${fm.trimEnd()}\nrelation_edges:\n${edgeBlock}`
+  return content.replace(fullFmBlock, open + newFm + close)
+}
+
+function formatRelationEdgesBlock(edges: PersistedRelationEdge[]): string {
+  return edges.map((edge) => [
+    `  - target: "${escapeYaml(edge.target)}"`,
+    `    type: ${edge.type}`,
+    "    provenance: postprocess_inferred",
+    `    confidence: ${edge.confidence.toFixed(2)}`,
+    `    evidence: "${escapeYaml(edge.evidence)}"`,
+    edge.sourceFiles.length > 0
+      ? `    source_files: [${edge.sourceFiles.map((file) => `"${escapeYaml(file)}"`).join(", ")}]`
+      : "    source_files: []",
+  ].join("\n")).join("\n")
+}
+
+function readExistingRelationEdgeKeys(content: string): Set<string> {
+  const fm = content.match(/^---\r?\n([\s\S]*?)\r?\n---/m)?.[1] ?? ""
+  const block = fm.match(/^relation_edges:\s*\n((?:\s+-[\s\S]*?(?=\n\S|$))+)/m)?.[1] ?? ""
+  const entries = block.split(/\n(?=\s+-)/)
+  const keys = new Set<string>()
+  for (const entry of entries) {
+    const target = entry.match(/target:\s*["']?([^"'\n]+)["']?/)?.[1]?.trim()
+    const type = entry.match(/type:\s*["']?([^"'\n]+)["']?/)?.[1]?.trim()
+    if (target && type) keys.add(`${type}::${normalizeServiceName(target)}`)
+  }
+  return keys
+}
+
+function extractFrontmatterList(content: string, key: string): string[] {
+  const fm = content.match(/^---\r?\n([\s\S]*?)\r?\n---/m)?.[1] ?? ""
+  const inline = fm.match(new RegExp(`^${escapeRegExp(key)}\\s*:\\s*\\[([^\\]]*)]`, "m"))
+  if (inline) return inline[1].split(",").map((item) => stripQuotes(item.trim())).filter(Boolean)
+  const block = fm.match(new RegExp(`^${escapeRegExp(key)}\\s*:\\s*\\n((?:\\s+-\\s+.+\\n?)+)`, "m"))
+  if (!block) return []
+  return block[1]
+    .split(/\r?\n/)
+    .map((line) => line.match(/^\s+-\s+(.+)$/)?.[1]?.trim() ?? "")
+    .map(stripQuotes)
+    .filter(Boolean)
 }
 
 async function safeList(path: string): Promise<DirEntry[]> {
@@ -585,6 +799,18 @@ function dedupeNames(names: string[]): string[] {
     if (!key || seen.has(key)) continue
     seen.add(key)
     result.push(name)
+  }
+  return result
+}
+
+function dedupeStrings(values: string[]): string[] {
+  const seen = new Set<string>()
+  const result: string[] = []
+  for (const value of values.map((item) => item.trim()).filter(Boolean)) {
+    const key = value.toLowerCase()
+    if (seen.has(key)) continue
+    seen.add(key)
+    result.push(value)
   }
   return result
 }

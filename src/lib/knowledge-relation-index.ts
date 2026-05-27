@@ -118,6 +118,7 @@ export async function buildKnowledgeRelationIndex(projectPath: string): Promise<
   for (const page of pages) {
     byTitle.set(normalizeLookup(page.title), page)
     byTitle.set(normalizeLookup(page.id), page)
+    byTitle.set(normalizeLookup(fileBaseName(page.path)), page)
   }
 
   const relations: KnowledgeRelation[] = []
@@ -559,6 +560,11 @@ function resolveTarget(
 
 function pageIdFromPath(path: string): string {
   return normalizePath(path).split("/wiki/").pop()?.replace(/\.md$/, "") ?? slugId(path)
+}
+
+function fileBaseName(path: string): string {
+  const normalized = normalizePath(path)
+  return normalized.split("/").pop()?.replace(/\.md$/i, "") ?? normalized
 }
 
 function slugId(value: string): string {
