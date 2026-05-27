@@ -24,14 +24,14 @@ interface DirEntry {
 
 interface PersistedRelationEdge {
   target: string
-  type: "part_of" | "same_stage" | "same_category" | "next_step"
+  type: "part_of" | "same_stage" | "same_scene" | "same_category" | "complements" | "next_step"
   confidence: number
   evidence: string
   sourceFiles: string[]
 }
 
 const AUTO_SECTION_MARKER = "<!-- service-benefit-enrichment -->"
-const MAX_STRUCTURED_SERVICE_EDGES = 6
+const MAX_STRUCTURED_SERVICE_EDGES = 10
 
 export async function enrichServiceBenefitPagesFromSources(projectPath: string): Promise<string[]> {
   const facts = await collectSourceFacts(projectPath)
@@ -286,7 +286,10 @@ function enrichServicePage(content: string, row: ServiceInventoryRow, facts: Sou
   const attrs = parseAttributes(content)
   attrs.service_name = stringValue(attrs.service_name) || row.serviceName
   attrs.related_product = stringValue(attrs.related_product) || facts.relatedProduct || "臻享家医健康服务计划"
-  attrs.service_category = stringValue(attrs.service_category) || [row.serviceScene, row.serviceStage].filter(Boolean).join("/")
+  if (row.serviceScene) attrs.service_scene = row.serviceScene
+  if (row.serviceStage) attrs.service_stage = row.serviceStage
+  attrs.service_category = [row.serviceScene, row.serviceStage].filter(Boolean).join("/") ||
+    stringValue(attrs.service_category)
   attrs.service_frequency = row.serviceFrequency
   if (facts.serviceProvider && !stringValue(attrs.service_provider)) attrs.service_provider = facts.serviceProvider
   const coverage = findCoverage(facts.coverageByService, row.serviceName)
@@ -507,12 +510,27 @@ function buildServiceRelationEdges(
     item.serviceScene === row.serviceScene &&
     item.serviceStage !== row.serviceStage
   )
-  for (const peer of nearestServiceRows(facts.rows, row, sameCategory, 2)) {
+  for (const peer of nearestServiceRows(facts.rows, row, sameCategory, 4)) {
     edges.push({
       target: peer.serviceName,
-      type: "same_category",
-      confidence: 0.64,
+      type: "same_scene",
+      confidence: 0.68,
       evidence: `${row.serviceName} 与 ${peer.serviceName} 同属「${row.serviceScene}」服务场景。`,
+      sourceFiles,
+    })
+  }
+
+  const modalityPeers = orderedRows.filter((item) =>
+    row.serviceScene &&
+    item.serviceScene === row.serviceScene &&
+    hasServiceNameAffinity(row.serviceName, item.serviceName)
+  )
+  for (const peer of nearestServiceRows(facts.rows, row, modalityPeers, 3)) {
+    edges.push({
+      target: peer.serviceName,
+      type: "complements",
+      confidence: 0.74,
+      evidence: `${row.serviceName} 与 ${peer.serviceName} 共享服务名称语义簇，且同属「${row.serviceScene}」服务场景。`,
       sourceFiles,
     })
   }
@@ -566,6 +584,47 @@ function dedupeRelationEdges(edges: PersistedRelationEdge[]): PersistedRelationE
     result.push(edge)
   }
   return result
+}
+
+function hasServiceNameAffinity(left: string, right: string): boolean {
+  const leftKey = normalizeServiceName(left)
+  const rightKey = normalizeServiceName(right)
+  if (!leftKey || !rightKey || leftKey === rightKey) return false
+  const leftTokens = serviceNameTokens(leftKey)
+  const rightTokens = serviceNameTokens(rightKey)
+  return leftTokens.some((token) => rightTokens.includes(token))
+}
+
+function serviceNameTokens(value: string): string[] {
+  const tokens = new Set<string>()
+  const knownTokens = [
+    "音视频",
+    "问诊",
+    "随访",
+    "医生",
+    "体检",
+    "报告",
+    "慢病",
+    "用药",
+    "门诊",
+    "陪诊",
+    "检查",
+    "会诊",
+    "住院",
+    "手术",
+    "出院",
+    "康复",
+    "护理",
+  ]
+  for (const token of knownTokens) {
+    if (value.includes(token)) tokens.add(token)
+  }
+  for (let size = 4; size >= 2; size--) {
+    for (let index = 0; index <= value.length - size; index++) {
+      tokens.add(value.slice(index, index + size))
+    }
+  }
+  return Array.from(tokens)
 }
 
 function upsertServiceRelations(content: string, edges: PersistedRelationEdge[]): string {
