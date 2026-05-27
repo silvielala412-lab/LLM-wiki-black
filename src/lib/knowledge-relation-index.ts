@@ -159,13 +159,35 @@ export async function buildKnowledgeRelationIndex(projectPath: string): Promise<
       const parsedRelation = parseCompactRelation(relationLine)
       if (!parsedRelation) continue
       const target = resolveTarget(parsedRelation.target, byId, byTitle)
-      // Frontmatter relations are explicitly written — treat as llm with existing evidence check
       const hasEvidence = frontmatterList(parsed.frontmatter, "claims").length > 0
       const scores = computeRelationScore(parsedRelation.type, "llm", hasEvidence, pageConf)
       pushRelation(
         relations, seen, page, target, parsedRelation.target,
         parsedRelation.type, scores, "llm",
         hasEvidence ? frontmatterList(parsed.frontmatter, "source_files") : [],
+      )
+    }
+
+    // Read relation_edges: structured YAML block (written by postprocess harvestRelationCandidates).
+    // These have full provenance metadata and supersede compact relations: entries of the same edge.
+    // Priority: user_confirmed > explicit_ingest > postprocess_inferred (all higher than wikilink).
+    for (const edge of parseRelationEdgesBlock(parsed.frontmatter)) {
+      const target = resolveTarget(edge.target, byId, byTitle)
+      const prov: RelationProvenance =
+        edge.provenance === "user_confirmed"      ? "user_confirmed"      :
+        edge.provenance === "explicit_ingest"     ? "explicit_ingest"     :
+        edge.provenance === "postprocess_inferred"? "explicit"            :
+        "explicit"
+      const scores = computeRelationScoreByProvenance(
+        edge.type as RelationType, prov, edge.confidence > 0.8, pageConf,
+      )
+      // Override score with the stored confidence directly for user_confirmed / explicit_ingest
+      const finalScore = { ...scores, confidence: Math.min(1, edge.confidence), score: Math.min(1, edge.confidence) * scores.strength }
+      pushRelationWithProvenance(
+        relations, seen, page, target, edge.target,
+        edge.type as RelationType, finalScore, "system",
+        edge.source_files ?? [],
+        prov,
       )
     }
   }
@@ -593,4 +615,43 @@ function resolvePageForExpansion(index: KnowledgeRelationIndex, entityId: string
     normalizeLookup(page.id) === normalizedId ||
     normalizeLookup(page.title) === normalizedId
   ) ?? null
+}
+
+/**
+ * Parse the structured `relation_edges:` YAML block from a page's frontmatter.
+ * Returns typed edge objects with provenance, confidence, evidence, and source_files.
+ * Written by postprocess harvestRelationCandidates; read here to build the relation index
+ * with accurate confidence values instead of re-deriving them from the compact string form.
+ */
+function parseRelationEdgesBlock(frontmatter: string): Array<{
+  target: string
+  type: string
+  provenance: string
+  confidence: number
+  evidence: string
+  source_files: string[]
+}> {
+  // Match the relation_edges: block (multi-line YAML list)
+  const block = frontmatter.match(/^relation_edges:\s*\n((?:\s+-[\s\S]*?(?=\n\S|\n*$))+)/m)?.[1]
+  if (!block) return []
+
+  const results: ReturnType<typeof parseRelationEdgesBlock> = []
+
+  // Split into individual list entries (each starts with "  - ")
+  const rawEntries = block.split(/\n(?=\s+-)/)
+  for (const entry of rawEntries) {
+    const target = entry.match(/target:\s*['""]?([^'""\n]+)['""]?/)?.[1]?.trim().replace(/^"|"$/g, "")
+    const type   = entry.match(/\btype:\s*([^\n]+)/)?.[1]?.trim()
+    if (!target || !type) continue
+
+    const provenance = entry.match(/provenance:\s*([^\n]+)/)?.[1]?.trim() ?? "explicit_ingest"
+    const confidenceRaw = entry.match(/confidence:\s*([\d.]+)/)?.[1]
+    const confidence = confidenceRaw ? parseFloat(confidenceRaw) : 0.75
+    const evidence = entry.match(/evidence:\s*['""]?([^'""\n]*)['""]?/)?.[1]?.trim() ?? ""
+    const sfRaw = entry.match(/source_files:\s*\[([^\]]*)\]/)?.[1] ?? ""
+    const source_files = sfRaw ? sfRaw.split(",").map((s) => s.trim().replace(/^"|"$/g, "")).filter(Boolean) : []
+
+    results.push({ target, type, provenance, confidence, evidence, source_files })
+  }
+  return results
 }

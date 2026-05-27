@@ -247,31 +247,108 @@ function harvestRelationCandidates(
 
   const candidates = raw as RelationCandidate[]
 
-  // Read existing relations: list to avoid duplicates
+  // Read source_files for evidence attribution
+  const fm = content.match(/^---\r?\n([\s\S]*?)\r?\n---/m)?.[1] ?? ""
+  const sourceFilesMatch = fm.match(/^source_files:\s*\[([^\]]*)]/m)
+  const sourceFiles = sourceFilesMatch
+    ? sourceFilesMatch[1].split(",").map((s) => s.trim().replace(/^"|"$/g, "")).filter(Boolean)
+    : []
+
+  // Read existing relations: list and relation_edges: to avoid duplicates
   const existingRelations = extractFrontmatterRelationLines(content)
   const existingTargets = new Set(existingRelations.map((r) => r.toLowerCase()))
+  const existingEdgeTargets = readExistingRelationEdgeTargets(content)
 
-  const toAdd: string[] = []
+  const toAddCompact: string[] = []
+  const toAddEdges: RelationEdge[] = []
+
   for (const c of candidates) {
     if (!c.target || !c.type) continue
     const relType = ALLOWED_LATERAL_TYPES.has(c.type) ? c.type : "related_to"
     const compactLine = `${relType}: ${c.target}`
-    if (existingTargets.has(compactLine.toLowerCase())) continue // already present
-    toAdd.push(compactLine)
-    warnings.push(`${fileName}: harvested relation_candidate ${compactLine} (confidence: ${c.confidence ?? "?"})`)
+
+    if (!existingTargets.has(compactLine.toLowerCase())) {
+      toAddCompact.push(compactLine)
+    }
+
+    // Always write to relation_edges if not already present, for structured metadata
+    const edgeKey = `${relType}::${c.target}`.toLowerCase()
+    if (!existingEdgeTargets.has(edgeKey)) {
+      toAddEdges.push({
+        target: c.target,
+        type: relType,
+        provenance: "explicit_ingest",
+        confidence: typeof c.confidence === "number" ? c.confidence : 0.75,
+        evidence: c.evidence ?? "",
+        source_files: sourceFiles,
+      })
+      warnings.push(`${fileName}: harvested relation_candidate ${compactLine} (confidence: ${c.confidence ?? "?"})`)
+    }
   }
 
-  if (toAdd.length === 0) {
-    // Still remove relation_candidates from attributes to keep schema clean
+  if (toAddCompact.length === 0 && toAddEdges.length === 0) {
     const cleaned = removeRelationCandidatesFromAttrs(content, attrs)
     return [cleaned, cleaned !== content, []]
   }
 
-  // Append to relations: block in frontmatter
-  let updated = appendToFrontmatterList(content, "relations", toAdd)
-  // Remove relation_candidates from attributes (prevent re-harvest on next run)
+  let updated = content
+  if (toAddCompact.length > 0) {
+    updated = appendToFrontmatterList(updated, "relations", toAddCompact)
+  }
+  if (toAddEdges.length > 0) {
+    updated = appendRelationEdges(updated, toAddEdges)
+  }
   updated = removeRelationCandidatesFromAttrs(updated, attrs)
   return [updated, true, warnings]
+}
+
+// ─── relation_edges structured YAML field ─────────────────────────────────────
+// Persists full-metadata relation edges (explicit_ingest, postprocess_inferred)
+// so that UI, audit tools, and buildKnowledgeRelationIndex can read them directly
+// without re-running postprocess. field_derived edges are NOT written to files —
+// they are recomputed at index-build time from the current global wiki state.
+
+interface RelationEdge {
+  target: string
+  type: string
+  provenance: "user_confirmed" | "explicit_ingest" | "postprocess_inferred" | "field_derived" | "wikilink"
+  confidence: number
+  evidence: string
+  source_files: string[]
+}
+
+function readExistingRelationEdgeTargets(content: string): Set<string> {
+  // Quick parse: look for target: + type: pairs under relation_edges:
+  const block = content.match(/^relation_edges:\s*\n((?:\s+-[\s\S]*?(?=\n\S|\n---\s*$|$))+)/m)?.[1] ?? ""
+  const targets = new Set<string>()
+  const entries = block.split(/\n(?=\s+-)/)
+  for (const entry of entries) {
+    const target = entry.match(/target:\s*["']?([^"'\n]+)["']?/)?.[1]?.trim()
+    const type = entry.match(/type:\s*["']?([^"'\n]+)["']?/)?.[1]?.trim()
+    if (target && type) targets.add(`${type}::${target}`.toLowerCase())
+  }
+  return targets
+}
+
+function appendRelationEdges(content: string, edges: RelationEdge[]): string {
+  const edgeLines = edges.map((e) => [
+    `  - target: "${e.target}"`,
+    `    type: ${e.type}`,
+    `    provenance: ${e.provenance}`,
+    `    confidence: ${e.confidence.toFixed(2)}`,
+    e.evidence ? `    evidence: "${e.evidence.replace(/"/g, "'")}"` : `    evidence: ""`,
+    e.source_files.length > 0
+      ? `    source_files: [${e.source_files.map((f) => `"${f}"`).join(", ")}]`
+      : `    source_files: []`,
+  ].join("\n")).join("\n")
+
+  // Try to append to existing relation_edges: block
+  const blockRe = /^(relation_edges:\s*\n(?:\s+-[\s\S]*?(?=\n\S|\n---\s*$))+)/m
+  if (blockRe.test(content)) {
+    return content.replace(blockRe, (match) => match.trimEnd() + "\n" + edgeLines)
+  }
+  // Insert before closing ---
+  return content.replace(/(\n---\s*$)/, `\nrelation_edges:\n${edgeLines}$1`)
 }
 
 function extractFrontmatterRelationLines(content: string): string[] {
