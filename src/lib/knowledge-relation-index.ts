@@ -155,6 +155,33 @@ export async function buildKnowledgeRelationIndex(projectPath: string): Promise<
       pushRelation(relations, seen, page, target, link, "mentions", scores, "system", [])
     }
 
+    // relation_edges: MUST be processed BEFORE compact relations: so that high-quality
+    // confidence/provenance wins the seen-set dedup race. Any compact relations: entry
+    // that duplicates an already-seen relation_edges edge will be skipped correctly.
+    for (const edge of parseRelationEdgesBlock(parsed.frontmatter)) {
+      const target = resolveTarget(edge.target, byId, byTitle)
+      const prov: RelationProvenance =
+        edge.provenance === "user_confirmed"       ? "user_confirmed"       :
+        edge.provenance === "explicit_ingest"      ? "explicit_ingest"      :
+        edge.provenance === "postprocess_inferred" ? "postprocess_inferred" :
+        "explicit"
+      const scores = computeRelationScoreByProvenance(
+        edge.type as RelationType, prov, edge.confidence > 0.8, pageConf,
+      )
+      // Use stored confidence directly (not re-derived from type base)
+      const finalScore = {
+        ...scores,
+        confidence: Math.min(1, edge.confidence),
+        score: Math.min(1, edge.confidence) * scores.strength,
+      }
+      pushRelationWithProvenance(
+        relations, seen, page, target, edge.target,
+        edge.type as RelationType, finalScore, "system",
+        edge.source_files ?? [],
+        prov,
+      )
+    }
+
     for (const relationLine of frontmatterList(parsed.frontmatter, "relations")) {
       const parsedRelation = parseCompactRelation(relationLine)
       if (!parsedRelation) continue
@@ -165,29 +192,6 @@ export async function buildKnowledgeRelationIndex(projectPath: string): Promise<
         relations, seen, page, target, parsedRelation.target,
         parsedRelation.type, scores, "llm",
         hasEvidence ? frontmatterList(parsed.frontmatter, "source_files") : [],
-      )
-    }
-
-    // Read relation_edges: structured YAML block (written by postprocess harvestRelationCandidates).
-    // These have full provenance metadata and supersede compact relations: entries of the same edge.
-    // Priority: user_confirmed > explicit_ingest > postprocess_inferred (all higher than wikilink).
-    for (const edge of parseRelationEdgesBlock(parsed.frontmatter)) {
-      const target = resolveTarget(edge.target, byId, byTitle)
-      const prov: RelationProvenance =
-        edge.provenance === "user_confirmed"      ? "user_confirmed"      :
-        edge.provenance === "explicit_ingest"     ? "explicit_ingest"     :
-        edge.provenance === "postprocess_inferred"? "explicit"            :
-        "explicit"
-      const scores = computeRelationScoreByProvenance(
-        edge.type as RelationType, prov, edge.confidence > 0.8, pageConf,
-      )
-      // Override score with the stored confidence directly for user_confirmed / explicit_ingest
-      const finalScore = { ...scores, confidence: Math.min(1, edge.confidence), score: Math.min(1, edge.confidence) * scores.strength }
-      pushRelationWithProvenance(
-        relations, seen, page, target, edge.target,
-        edge.type as RelationType, finalScore, "system",
-        edge.source_files ?? [],
-        prov,
       )
     }
   }

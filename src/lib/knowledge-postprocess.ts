@@ -331,7 +331,7 @@ function readExistingRelationEdgeTargets(content: string): Set<string> {
 }
 
 function appendRelationEdges(content: string, edges: RelationEdge[]): string {
-  const edgeLines = edges.map((e) => [
+  const edgeBlock = edges.map((e) => [
     `  - target: "${e.target}"`,
     `    type: ${e.type}`,
     `    provenance: ${e.provenance}`,
@@ -342,13 +342,27 @@ function appendRelationEdges(content: string, edges: RelationEdge[]): string {
       : `    source_files: []`,
   ].join("\n")).join("\n")
 
-  // Try to append to existing relation_edges: block
-  const blockRe = /^(relation_edges:\s*\n(?:\s+-[\s\S]*?(?=\n\S|\n---\s*$))+)/m
-  if (blockRe.test(content)) {
-    return content.replace(blockRe, (match) => match.trimEnd() + "\n" + edgeLines)
+  // Extract frontmatter bounds using the canonical non-greedy pattern.
+  // This is the ONLY reliable way to scope edits to frontmatter without
+  // risk of matching body-level --- lines (which \n---\s*$ in multiline regex does).
+  const fmMatch = content.match(/^(---\r?\n)([\s\S]*?)(\r?\n---)/m)
+  if (!fmMatch) {
+    // No frontmatter block found: prepend a new one
+    return `---\nrelation_edges:\n${edgeBlock}\n---\n\n${content}`
   }
-  // Insert before closing ---
-  return content.replace(/(\n---\s*$)/, `\nrelation_edges:\n${edgeLines}$1`)
+
+  const [fullFmBlock, open, fm, close] = fmMatch
+
+  // Try to append to existing relation_edges: block within frontmatter
+  const existingBlockRe = /^(relation_edges:[ \t]*\n(?:[ \t]+-[ \t][\s\S]*?\n?)+)/m
+  if (existingBlockRe.test(fm)) {
+    const newFm = fm.replace(existingBlockRe, (match) => match.trimEnd() + "\n" + edgeBlock + "\n")
+    return content.replace(fullFmBlock, open + newFm + close)
+  }
+
+  // No existing relation_edges block: append to end of frontmatter content
+  const newFm = fm.trimEnd() + `\nrelation_edges:\n${edgeBlock}`
+  return content.replace(fullFmBlock, open + newFm + close)
 }
 
 function extractFrontmatterRelationLines(content: string): string[] {

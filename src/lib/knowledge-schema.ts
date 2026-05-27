@@ -119,11 +119,13 @@ export type RelationType =
  *   user_confirmed  → Layer 1 (human override — highest trust)
  */
 export type RelationProvenance =
-  | "explicit"        // frontmatter relations: list or schema-inferred structural fact
-  | "field_derived"   // computed from matching field values (same_category, same_scene, etc.)
-  | "wikilink"        // body [[wikilink]] co-mention
-  | "llm_inferred"    // postprocess LLM semantic pass (must carry confidence + reason)
-  | "user_confirmed"  // human-annotated or human-approved
+  | "explicit"           // frontmatter relations: list or schema-inferred structural fact
+  | "explicit_ingest"    // LLM declared at ingest time from source evidence (relation_candidates)
+  | "postprocess_inferred" // structural inference during postprocess (e.g. part_of from related_product)
+  | "field_derived"      // computed from matching field values (same_category, same_scene, etc.)
+  | "wikilink"           // body [[wikilink]] co-mention
+  | "llm_inferred"       // postprocess LLM semantic pass (must carry confidence + reason)
+  | "user_confirmed"     // human-annotated or human-approved
 
 export interface KnowledgeRelation {
   id: string
@@ -355,12 +357,14 @@ export const RELATION_SOURCE_CONFIDENCE: Record<"system" | "llm" | "user" | Rela
   system: 1.00,
   user:   1.00,
   llm:    0.85,
-  // New provenance levels
-  user_confirmed: 1.00, // human ground truth
-  explicit:       0.92, // frontmatter schema-declared or postprocess-inferred structural fact
-  field_derived:  0.55, // structural field match — plausible but not confirmed
-  wikilink:       0.45, // body co-mention — weak signal
-  llm_inferred:   0.70, // LLM semantic judgment on candidate pair
+  // New provenance levels (ordered highest → lowest trust)
+  user_confirmed:        1.00, // human ground truth
+  explicit_ingest:       0.92, // LLM declared at ingest time from source document evidence
+  explicit:              0.92, // frontmatter schema-declared or postprocess structural fact
+  postprocess_inferred:  0.88, // structural inference in postprocess (e.g. part_of from related_product)
+  llm_inferred:          0.70, // LLM semantic judgment on candidate pair
+  field_derived:         0.55, // structural field match — plausible but not confirmed
+  wikilink:              0.45, // body co-mention — weak signal
 }
 
 /**
