@@ -42,6 +42,7 @@ interface PageAudit {
   missingCritical: string[]
   missingHigh: string[]
   relationCount: number
+  bodyRelationCount: number
   claimCount: number
   sourceCount: number
   knowledgeGapCount: number
@@ -94,7 +95,11 @@ function auditKnowledgePage(path: string, content: string): PageAudit {
     recommendedTotal: recommended.length,
     missingCritical,
     missingHigh,
-    relationCount: yamlList(fm, "related").length + yamlList(fm, "relations").length + relationLineCount(content),
+    // Only count schema-declared relations (frontmatter lists: relations / related).
+    // Body-text mentions of relation keywords are NOT schema relations — counting
+    // them inflates coverage and makes audit scores unreliable between runs.
+    relationCount: yamlList(fm, "related").length + yamlList(fm, "relations").length,
+    bodyRelationCount: relationLineCount(content),
     claimCount: yamlList(fm, "claims").length + claimLineCount(content),
     sourceCount: yamlList(fm, "sources").length + yamlList(fm, "source_files").length,
     knowledgeGapCount: countKnowledgeGaps(attributes, content),
@@ -220,10 +225,10 @@ function buildAuditMarkdown(
     pageAudits.length === 0
       ? "未生成可审计的实体/概念页。"
       : [
-          "| 页面 | 类型 | critical | high | recommended | 关系 | 证据 | 缺口 |",
-          "|---|---:|---:|---:|---:|---:|---:|---:|",
+        "| 页面 | 类型 | critical | high | recommended | schema关系 | 正文关系 | 证据 | 缺口 |",
+          "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
           ...pageAudits.map((page) =>
-            `| [[${page.title}]] | ${page.entityType} | ${page.criticalFilled}/${page.criticalTotal} | ${page.highFilled}/${page.highTotal} | ${page.recommendedFilled}/${page.recommendedTotal} | ${page.relationCount} | ${page.claimCount + page.sourceCount} | ${page.knowledgeGapCount} |`,
+            `| [[${page.title}]] | ${page.entityType} | ${page.criticalFilled}/${page.criticalTotal} | ${page.highFilled}/${page.highTotal} | ${page.recommendedFilled}/${page.recommendedTotal} | ${page.relationCount} | ${page.bodyRelationCount} | ${page.claimCount + page.sourceCount} | ${page.knowledgeGapCount} |`,
           ),
         ].join("\n"),
     "",
@@ -232,7 +237,7 @@ function buildAuditMarkdown(
     lowPages.length === 0
       ? "暂无明显低覆盖页面。"
       : lowPages.map((page) =>
-          `- [[${page.title}]]：missing critical=${page.missingCritical.join(", ") || "无"}；missing high=${page.missingHigh.slice(0, 8).join(", ") || "无"}；relations=${page.relationCount}`,
+          `- [[${page.title}]]：missing critical=${page.missingCritical.join(", ") || "无"}；missing high=${page.missingHigh.slice(0, 8).join(", ") || "无"}；schema关系=${page.relationCount}；正文关系=${page.bodyRelationCount}`,
         ).join("\n"),
     "",
     "## 建议",

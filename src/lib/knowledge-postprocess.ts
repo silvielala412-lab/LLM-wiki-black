@@ -249,6 +249,40 @@ function materializeAttributes(content: string, fileName: string): [string, bool
     warnings.push(`${fileName}: salvaged raw_attributes`)
   }
 
+  // Salvage previously-quarantined fields from extra_attributes back to canonical names.
+  // This handles the case where a field was quarantined in a prior postprocess run
+  // (because the alias map didn't include it yet), but now has a matching alias
+  // (e.g., after HealthServiceSkill added new fieldAliases). Fields are only salvaged
+  // when the canonical target is missing or null to avoid clobbering existing values.
+  const previousExtraAttrs = attrs["extra_attributes"]
+  if (previousExtraAttrs && typeof previousExtraAttrs === "object" && !Array.isArray(previousExtraAttrs)) {
+    const extraEntries = Object.entries(previousExtraAttrs as Record<string, unknown>)
+    let salvageCount = 0
+    for (const [key, val] of extraEntries) {
+      if (val === null || val === undefined) continue
+      const canonical = aliasMap[key.toLowerCase()] ?? aliasMap[key]
+      if (canonical && (!(canonical in attrs) || attrs[canonical] === null)) {
+        attrs[canonical] = val
+        salvageCount++
+        warnings.push(`${fileName}: salvaged extra_attributes.${key} → ${canonical}`)
+      }
+    }
+    if (salvageCount > 0) {
+      // Re-build extra_attributes without the successfully salvaged entries
+      const salvaged = new Set(
+        extraEntries
+          .filter(([key]) => {
+            const canonical = aliasMap[key.toLowerCase()] ?? aliasMap[key]
+            return canonical && attrs[canonical] !== null
+          })
+          .map(([key]) => key)
+      )
+      attrs["extra_attributes"] = Object.fromEntries(
+        extraEntries.filter(([key]) => !salvaged.has(key))
+      )
+    }
+  }
+
   // Remap non-standard field names to canonical names
   const standardNames = new Set(spec.fields.map((f) => f.name))
   const extraAttrs: Record<string, unknown> = {}
