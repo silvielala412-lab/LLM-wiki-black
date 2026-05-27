@@ -177,6 +177,12 @@ export async function runKnowledgePostProcess(projectPath: string): Promise<Post
         updated = reconciled_content
         lintWarnings.push(...recoWarnings)
 
+        // Harvest relation_candidates: promote ingest-declared lateral relations
+        // to frontmatter relations: list as explicit_ingest provenance edges.
+        const [harvested_content, harvestChanged, harvestWarnings] = harvestRelationCandidates(updated, file.name)
+        updated = harvested_content
+        lintWarnings.push(...harvestWarnings)
+
         // Second cleanup to normalize format after all mutations
         updated = cleanupKnowledgeFrontmatter(updated)
 
@@ -187,7 +193,7 @@ export async function runKnowledgePostProcess(projectPath: string): Promise<Post
           await writeFile(filePath, updated)
           if (matChanged) materialized++
           if (inferChanged) relationsInferred++
-          if (recoChanged) reconciled++
+          if (recoChanged || harvestChanged) reconciled++
         }
       } catch (err) {
         errors.push(`${file.name}: ${String(err)}`)
@@ -199,7 +205,108 @@ export async function runKnowledgePostProcess(projectPath: string): Promise<Post
 
   return { reconciled, materialized, relationsInferred, titlesNormalized, lintWarnings, errors }
 }
-// ─── Title Normalization ─────────────────────────────────────────────────────────────────────
+
+// ─── Relation Candidate Harvesting ───────────────────────────────────────────
+// Reads `attributes.relation_candidates` written by LLM during ingest (D method),
+// promotes each candidate to a formal frontmatter `relations:` entry, and removes
+// the raw candidates from `attributes` to keep the schema clean.
+// Promoted edges carry `source: explicit_ingest` in their compact relation line
+// which the relation index reads as the highest-trust provenance after user_confirmed.
+
+interface RelationCandidate {
+  target: string
+  type: string
+  confidence?: number
+  evidence?: string
+  source?: string
+}
+
+const ALLOWED_LATERAL_TYPES = new Set([
+  "complements", "next_step", "same_stage", "bundled_with", "governed_by",
+  "related_to", "applies_to", "recommended_for", "supports", "has_part", "part_of",
+])
+
+function harvestRelationCandidates(
+  content: string,
+  fileName: string,
+): [string, boolean, string[]] {
+  const warnings: string[] = []
+
+  // Extract attributes JSON blob
+  const attrsMatch = content.match(/^attributes:\s*(.+)$/m)
+  if (!attrsMatch) return [content, false, []]
+  let attrs: Record<string, unknown>
+  try {
+    attrs = JSON.parse(attrsMatch[1])
+  } catch {
+    return [content, false, []]
+  }
+
+  const raw = attrs["relation_candidates"]
+  if (!raw || !Array.isArray(raw) || raw.length === 0) return [content, false, []]
+
+  const candidates = raw as RelationCandidate[]
+
+  // Read existing relations: list to avoid duplicates
+  const existingRelations = extractFrontmatterRelationLines(content)
+  const existingTargets = new Set(existingRelations.map((r) => r.toLowerCase()))
+
+  const toAdd: string[] = []
+  for (const c of candidates) {
+    if (!c.target || !c.type) continue
+    const relType = ALLOWED_LATERAL_TYPES.has(c.type) ? c.type : "related_to"
+    const compactLine = `${relType}: ${c.target}`
+    if (existingTargets.has(compactLine.toLowerCase())) continue // already present
+    toAdd.push(compactLine)
+    warnings.push(`${fileName}: harvested relation_candidate ${compactLine} (confidence: ${c.confidence ?? "?"})`)
+  }
+
+  if (toAdd.length === 0) {
+    // Still remove relation_candidates from attributes to keep schema clean
+    const cleaned = removeRelationCandidatesFromAttrs(content, attrs)
+    return [cleaned, cleaned !== content, []]
+  }
+
+  // Append to relations: block in frontmatter
+  let updated = appendToFrontmatterList(content, "relations", toAdd)
+  // Remove relation_candidates from attributes (prevent re-harvest on next run)
+  updated = removeRelationCandidatesFromAttrs(updated, attrs)
+  return [updated, true, warnings]
+}
+
+function extractFrontmatterRelationLines(content: string): string[] {
+  const fm = content.match(/^---\r?\n([\s\S]*?)\r?\n---/m)?.[1] ?? ""
+  const inline = fm.match(/^relations:\s*\[([^\]]*)]$/m)
+  if (inline) return inline[1].split(",").map((s) => s.trim().replace(/^"|"$/g, "")).filter(Boolean)
+  const blockMatch = fm.match(/^relations:\s*\n((?:\s+-\s+.+\n?)+)/m)
+  if (!blockMatch) return []
+  return blockMatch[1].split(/\r?\n/).map((l) => l.match(/^\s+-\s+(.+)$/)?.[1]?.replace(/^"|"$/g, "").trim() ?? "").filter(Boolean)
+}
+
+function appendToFrontmatterList(content: string, key: string, items: string[]): string {
+  const itemLines = items.map((item) => `  - "${item}"`).join("\n")
+  // Try to append to existing block list
+  const blockRe = new RegExp(`^(${key}:\s*\\n(?:\\s+-\\s+.+\\n?)*)`, "m")
+  if (blockRe.test(content)) {
+    return content.replace(blockRe, (match) => match.trimEnd() + "\n" + itemLines + "\n")
+  }
+  // Try to expand inline empty list
+  const inlineEmptyRe = new RegExp(`^(${key}:\s*\\[\\])`, "m")
+  if (inlineEmptyRe.test(content)) {
+    return content.replace(inlineEmptyRe, `${key}:\n${itemLines}`)
+  }
+  // Append before closing ---
+  return content.replace(/(\n---\s*$)/, `\n${key}:\n${itemLines}$1`)
+}
+
+function removeRelationCandidatesFromAttrs(content: string, attrs: Record<string, unknown>): string {
+  if (!("relation_candidates" in attrs)) return content
+  const { relation_candidates: _removed, ...rest } = attrs
+  void _removed
+  const attrsStr = JSON.stringify(rest)
+  return content.replace(/^(attributes:\s*).+$/m, `$1${attrsStr}`)
+}
+
 
 function normalizeFrontmatterTitle(content: string, fileName: string): string {
   const titleMatch = content.match(/^(title:\s*)([^\n]+)(\n)/m)
