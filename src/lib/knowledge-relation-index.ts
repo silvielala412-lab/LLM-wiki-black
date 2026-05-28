@@ -118,6 +118,7 @@ export async function buildKnowledgeRelationIndex(projectPath: string): Promise<
   for (const page of pages) {
     byTitle.set(normalizeLookup(page.title), page)
     byTitle.set(normalizeLookup(page.id), page)
+    byTitle.set(normalizeLookup(fileBaseName(page.path)), page)
   }
 
   const relations: KnowledgeRelation[] = []
@@ -226,6 +227,9 @@ export async function buildKnowledgeRelationIndex(projectPath: string): Promise<
         try {
           const attrs = JSON.parse(attrsRaw) as Record<string, unknown>
           fieldVal = (attrs[field] as string | undefined) ?? ""
+          if (!fieldVal && field === "service_scene") {
+            fieldVal = serviceSceneFromCategory(attrs.service_category)
+          }
         } catch { /* ignore */ }
       }
       if (!fieldVal) fieldVal = frontmatterString(parsed.frontmatter, field)
@@ -559,6 +563,16 @@ function resolveTarget(
 
 function pageIdFromPath(path: string): string {
   return normalizePath(path).split("/wiki/").pop()?.replace(/\.md$/, "") ?? slugId(path)
+}
+
+function fileBaseName(path: string): string {
+  const normalized = normalizePath(path)
+  return normalized.split("/").pop()?.replace(/\.md$/i, "") ?? normalized
+}
+
+function serviceSceneFromCategory(value: unknown): string {
+  if (typeof value !== "string") return ""
+  return value.split("/").map((part) => part.trim()).filter(Boolean)[0] ?? ""
 }
 
 function slugId(value: string): string {
