@@ -154,6 +154,44 @@ const SOURCE_TYPE_WEIGHTS: Record<string, number> = {
   unknown: 10,
 }
 
+/**
+ * Brand/platform suffixes that should be stripped when computing dedup keys.
+ * These appear as `_Brand` or `(Brand)` suffixes on service titles and are
+ * NOT semantically discriminating — they identify the same service under a
+ * different product umbrella.
+ *
+ * Examples:
+ *   "音视频问诊_臻享家医" → "音视频问诊"
+ *   "就医陪诊_平安臻享家医" → "就医陪诊"
+ *   "特色体检服务_平安臻享家医" → "特色体检服务"
+ */
+const BRAND_SUFFIX_PATTERNS: RegExp[] = [
+  /[_\-\uff08\uff09()]臺享家医.*$/,
+  /[_\-\uff08\uff09()]平安臺享.*$/,
+  /[_\-\uff08\uff09()]平安健康.*$/,
+  /[_\-\uff08\uff09()]平安保险.*$/,
+  /[_\-\uff08\uff09()]绡通.*$/,
+  /[_\-\uff08\uff09()]健康管家.*$/,
+]
+
+/**
+ * Strip known brand/platform suffixes from a service title to get the
+ * canonical service name for dedup key computation.
+ *
+ * "音视频问诊_臺享家医" → "音视频问诊"
+ * "家庭医生服务_平安臻享家医" → "家庭医生服务"
+ *
+ * Does NOT strip discriminator words (门诊/住院/首访/随访/国内/海外)
+ * so sibling services remain distinct.
+ */
+export function stripBrandSuffix(title: string): string {
+  let result = title.trim()
+  for (const pattern of BRAND_SUFFIX_PATTERNS) {
+    result = result.replace(pattern, "")
+  }
+  return result.trim()
+}
+
 export const INSURANCE_SCHEMA_REGISTRY: InsuranceEntitySchemaSpec[] = [
   {
     schemaKey: "insurance.product.Product",
@@ -1094,13 +1132,18 @@ export function inferStableInsuranceDedupKey(input: {
   const parts: string[] = [entityType]
 
   for (const field of keyFields) {
-    const value = field === "title" ? input.title : attrs[field]
+    let value = field === "title" ? input.title : attrs[field]
+    // For title-based keys, strip brand suffixes before normalizing
+    if (field === "title" && typeof value === "string") {
+      value = stripBrandSuffix(value)
+    }
     const normalized = normalizeDedupPart(value)
     if (normalized) parts.push(normalized)
   }
 
   if (parts.length === 1) {
-    const fallback = normalizeDedupPart(input.fallback) || normalizeDedupPart(input.title) || "untitled"
+    const rawTitle = stripBrandSuffix(input.title || "")
+    const fallback = normalizeDedupPart(input.fallback) || normalizeDedupPart(rawTitle) || "untitled"
     parts.push(fallback)
   }
 
