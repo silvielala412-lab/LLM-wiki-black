@@ -13,6 +13,7 @@ import { checkIngestCache, saveIngestCache } from "@/lib/ingest-cache"
 import { withProjectLock } from "@/lib/project-mutex"
 import { writeExtractionQualityAudit } from "@/lib/extraction-quality-audit"
 import { runKnowledgePostProcess } from "@/lib/knowledge-postprocess"
+import { runGlobalRelationPass } from "@/lib/knowledge-global-relation"
 import {
   enrichServiceBenefitPagesFromText,
   parseServiceInventoryRows,
@@ -2756,6 +2757,24 @@ async function autoIngestImpl(
       }
     } catch (err) {
       console.warn("[ingest] Post-process failed (non-critical):", err)
+    }
+
+    // ── Step 3.4c: Global Relation Pass (cross-document semantic relation inference) ──
+    // Runs AFTER postprocess (D+C relation edges already on disk) and BEFORE audit
+    // (so audit scores reflect cross-document relations written here).
+    // Only runs when there are >= 2 entities in the project — short-circuits cheaply.
+    if (!signal?.aborted) {
+      try {
+        const grpResult = await runGlobalRelationPass(pp, llmConfig, signal)
+        if (grpResult.written > 0 || grpResult.errors.length > 0) {
+          console.log(`[ingest] Global relation pass: catalog=${grpResult.catalogSize} pairs=${grpResult.candidatePairs} written=${grpResult.written} queued=${grpResult.queued} discarded=${grpResult.discarded}`)
+        }
+        if (grpResult.errors.length > 0) {
+          console.warn("[ingest] Global relation pass errors:", grpResult.errors)
+        }
+      } catch (err) {
+        console.warn("[ingest] Global relation pass failed (non-critical):", err)
+      }
     }
 
     // ── Step 3.4a: Extraction quality audit ──────────────────────────────────
