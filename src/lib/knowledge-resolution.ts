@@ -32,9 +32,11 @@ interface AutoResolution {
   field: string
   chosenValue: unknown
   overriddenValue: unknown
-  reason: string            // e.g. "service_manual(4) > ocr_image(1)"
+  reason: string
   existingSourceType: string
   incomingSourceType: string
+  /** Distinguishes authority-based from date-based auto-resolutions. */
+  kind: "authority" | "version_update" | "existing_authority"
 }
 
 // ─── Authority-weighted conflict resolution ───────────────────────────────────
@@ -143,7 +145,24 @@ export function resolveIncomingKnowledgePage(
     chooseBetterSourceType(existingSourceType, incomingSourceType),
   )
 
-  return { content: mergedContent, reviewItems: [], hasBlockingConflict: false, action: "duplicate" }
+  // Version-update review item: non-blocking, allows spot-check after the fact.
+  // When same-authority sources differ on field values AND the incoming is newer,
+  // we auto-accept but leave a visible record so humans can verify the change
+  // wasn't caused by an LLM extraction error or a partial-scope document.
+  const versionUpdates = autoResolutions.filter(r => r.kind === "version_update")
+  const reviewItems: ResolutionResult["reviewItems"] = []
+  if (versionUpdates.length > 0) {
+    reviewItems.push(buildVersionUpdateReviewItem(
+      relativePath,
+      existing.title || incoming.title,
+      resolvedDedup,
+      versionUpdates,
+      existingSourceVersion,
+      incomingSourceVersion,
+    ))
+  }
+
+  return { content: mergedContent, reviewItems, hasBlockingConflict: false, action: "duplicate" }
 }
 
 // ─── Field-level merge with authority weighting ───────────────────────────────
@@ -219,6 +238,7 @@ function mergeAttributesByPolicy(
         reason: `${incomingSourceType}(${incomingWeight}) ×${incomingRatio.toFixed(1)} overrides ${existingSourceType}(${existingWeight})`,
         existingSourceType,
         incomingSourceType,
+        kind: "authority",
       })
       merged[field] = incomingValue
       continue
@@ -233,29 +253,35 @@ function mergeAttributesByPolicy(
         reason: `${existingSourceType}(${existingWeight}) ×${existingRatio.toFixed(1)} outranks ${incomingSourceType}(${incomingWeight}), kept existing`,
         existingSourceType,
         incomingSourceType,
+        kind: "existing_authority",
       })
       // merged[field] stays as existing (no change needed)
       continue
     }
 
-    // Same-authority conflict: check source version dates before giving up
+    // Same-authority conflict: check source version dates before giving up.
+    // IMPORTANT: even though the newer document wins here, this is NOT silent —
+    // the resolution is recorded as kind='version_update' and surfaces as a
+    // non-blocking spot-check item in the review queue (see buildVersionUpdateReviewItem).
+    // This protects against LLM extraction errors in the newer document.
     if (existingSourceVersion && incomingSourceVersion) {
       const dateCompare = compareDateStrings(incomingSourceVersion, existingSourceVersion)
       if (dateCompare > 0) {
-        // Incoming is clearly newer — treat as version update
+        // Incoming is newer — accept the update but flag for spot-check
         autoResolutions.push({
           field,
           chosenValue: incomingValue,
           overriddenValue: existingValue,
-          reason: `Newer source version ${incomingSourceVersion} > ${existingSourceVersion}`,
+          reason: `Version update ${existingSourceVersion} → ${incomingSourceVersion}`,
           existingSourceType,
           incomingSourceType,
+          kind: "version_update",
         })
         merged[field] = incomingValue
         continue
       }
       if (dateCompare < 0) {
-        // Existing is newer — keep it
+        // Existing is newer — discard incoming silently (not a meaningful event)
         continue
       }
     }
@@ -368,6 +394,51 @@ function buildFieldConflictReviewItem(
       { label: "采用新值", action: "accept-incoming" },
       { label: "追加为多值", action: "append-values" },
       { label: "标记旧值失效", action: "supersede-existing" },
+    ],
+  }
+}
+
+/**
+ * Non-blocking review item for version-based field updates.
+ *
+ * Unlike buildFieldConflictReviewItem (which BLOCKS the merge), this item is
+ * informational: the merge has already happened, but the human can verify
+ * whether the LLM extraction was correct for the newer document.
+ *
+ * Typical use case: 2025 version of the same service manual updates service_limit
+ * from 6次/年 to 8次/年. The system auto-accepts this but surfaces the change
+ * for spot-checking in case it was an extraction error.
+ */
+function buildVersionUpdateReviewItem(
+  relativePath: string,
+  title: string,
+  dedupKey: string,
+  updates: AutoResolution[],
+  fromVersion: string,
+  toVersion: string,
+): Omit<ReviewItem, "id" | "resolved" | "createdAt"> {
+  const rows = updates.slice(0, 12).map((u) =>
+    `- ${u.field}: ${formatValue(u.overriddenValue)} → ${formatValue(u.chosenValue)}`,
+  )
+  return {
+    type: "contradiction",
+    title: `版本更新确认：${title || dedupKey}（${fromVersion} → ${toVersion}）`,
+    description: [
+      `系统检测到同权重来源的新版本文档（${fromVersion} → ${toVersion}），已自动采用新版本值。`,
+      `⚠️  此条目不阻断知识库更新，仅供人工抽查确认 LLM 抽取无误。`,
+      `若发现新值有误，请人工修正并在 frontmatter 中添加 user_locked_fields: [字段名] 防止再次被覆盖。`,
+      "",
+      `dedup_key: ${dedupKey}`,
+      `页面: ${relativePath}`,
+      "",
+      "已自动更新的字段（旧值 → 新值）:",
+      ...rows,
+    ].join("\n"),
+    affectedPages: [relativePath],
+    options: [
+      { label: "确认无误，关闭", action: "keep-existing" },
+      { label: "新值有误，回滚旧值", action: "accept-incoming" },
+      { label: "锁定字段，防止再覆盖", action: "supersede-existing" },
     ],
   }
 }
