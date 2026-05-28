@@ -154,35 +154,103 @@ const SOURCE_TYPE_WEIGHTS: Record<string, number> = {
   unknown: 10,
 }
 
+// ─── Service identity canonicalization ───────────────────────────────────────
+//
+// The goal: two titles that refer to the same real-world service should produce
+// the same canonical name so that their dedup_keys match and the conflict-
+// resolution layer can merge them rather than creating duplicate entity pages.
+//
+// Three layers applied in order:
+//   1. Brand suffix stripping  ("音视频问诊_臻享家医" → "音视频问诊")
+//   2. Confirmed synonym map   ("家庭医生" → "家庭医生服务")
+//   3. Discriminator protection (never merge if discriminator words differ)
+//
+// IMPORTANT: this function is CONSERVATIVE by design.
+//   - Only strip suffixes that are known brand labels (not service descriptors).
+//   - Only remap titles that are in the confirmed whitelist.
+//   - If either title contains a discriminator word the other doesn't, the
+//     canonical name is left unchanged so sibling services stay distinct.
+
 /**
- * Brand/platform suffixes that should be stripped when computing dedup keys.
- * These appear as `_Brand` or `(Brand)` suffixes on service titles and are
- * NOT semantically discriminating — they identify the same service under a
- * different product umbrella.
+ * Known brand/platform suffixes that carry no semantic distinction.
+ * Format: separator + brand name. The separator chars are:
+ *   _ - （ ） ( )  (ASCII and full-width)
  *
- * Examples:
- *   "音视频问诊_臻享家医" → "音视频问诊"
- *   "就医陪诊_平安臻享家医" → "就医陪诊"
- *   "特色体检服务_平安臻享家医" → "特色体检服务"
+ * These strings match the ACTUAL characters in the codebase (verified manually).
  */
 const BRAND_SUFFIX_PATTERNS: RegExp[] = [
-  /[_\-\uff08\uff09()]臺享家医.*$/,
-  /[_\-\uff08\uff09()]平安臺享.*$/,
-  /[_\-\uff08\uff09()]平安健康.*$/,
-  /[_\-\uff08\uff09()]平安保险.*$/,
-  /[_\-\uff08\uff09()]绡通.*$/,
-  /[_\-\uff08\uff09()]健康管家.*$/,
+  // 臻享家医 variants  ← fixed: was incorrectly 臺享家医
+  /[_\-\uff08\uff09()]臻享家医[\s\S]*$/,
+  /[_\-\uff08\uff09()]平安臻享[\s\S]*$/,
+  // 绿通  ← fixed: was incorrectly 绡通
+  /[_\-\uff08\uff09()]绿通[\s\S]*$/,
+  // Other common brand suffixes
+  /[_\-\uff08\uff09()]平安健康[\s\S]*$/,
+  /[_\-\uff08\uff09()]平安保险[\s\S]*$/,
+  /[_\-\uff08\uff09()]健康管家[\s\S]*$/,
 ]
 
 /**
- * Strip known brand/platform suffixes from a service title to get the
- * canonical service name for dedup key computation.
+ * Confirmed-safe synonym pairs.  Only titles in this whitelist are remapped.
+ * Keys are the alias, values are the canonical (preferred) title.
  *
- * "音视频问诊_臺享家医" → "音视频问诊"
- * "家庭医生服务_平安臻享家医" → "家庭医生服务"
+ * Rules for adding entries here:
+ *   - The two services must be provably the same in all source documents.
+ *   - Neither contains a discriminator word the other lacks.
+ *   - A human has verified this is NOT a sibling-service relationship.
+ */
+const CONFIRMED_SYNONYMS: Record<string, string> = {
+  // Service name variants
+  "\u5bb6\u5ead\u533b\u751f": "\u5bb6\u5ead\u533b\u751f\u670d\u52a1",               // 家庭医生 → 家庭医生服务
+  "\u5bb6\u5ead\u533b\u751f\u670d\u52a1\u6743\u76ca": "\u5bb6\u5ead\u533b\u751f\u670d\u52a1",  // 家庭医生服务权益 → 家庭医生服务
+  "\u91cd\u75be\u4e13\u6848": "\u91cd\u75be\u4e13\u6848\u7ba1\u7406",             // 重疾专案 → 重疾专案管理
+  "21\u5929\u8bad\u7ec3\u8425": "21\u5929\u793e\u7fa4\u8bad\u7ec3\u8425",        // 21天训练营 → 21天社群训练营
+}
+
+/**
+ * Discriminator words: if a title contains one of these and the canonical
+ * form does NOT contain the same discriminator (or contains a different one),
+ * we abort the synonym remapping to prevent sibling-service merges.
  *
- * Does NOT strip discriminator words (门诊/住院/首访/随访/国内/海外)
- * so sibling services remain distinct.
+ * Example:
+ *   "康复门诊协助" contains "门诊"
+ *   "康复住院协助" contains "住院"
+ *   → different discriminators → NOT the same service → no merge
+ */
+const SERVICE_DISCRIMINATORS: string[] = [
+  "\u95e8\u8bca",   // 门诊
+  "\u4f4f\u9662",   // 住院
+  "\u6025\u8bca",   // 急诊
+  "\u624b\u672f",   // 手术
+  "\u672f\u540e",   // 术后
+  "\u9996\u8bbf",   // 首访
+  "\u968f\u8bbf",   // 随访
+  "\u95ee\u8bca",   // 问诊
+  "\u5eb7\u590d",   // 康复  (only discriminating in multi-service context)
+  "\u5b89\u7f6e",   // 安置
+  "\u56fd\u5185",   // 国内
+  "\u6d77\u5916",   // 海外
+  "\u5883\u5916",   // 境外
+  "\u57fa\u7840",   // 基础
+  "\u9ad8\u7ea7",   // 高级
+  "\u89e3\u8bfb",   // 解读
+  "\u8bad\u7ec3",   // 训练
+  "\u62a4\u7406",   // 护理
+  "\u966a\u8bca",   // 陪诊
+]
+
+/** Extract all discriminator words present in a title. */
+function extractDiscriminators(title: string): string[] {
+  return SERVICE_DISCRIMINATORS.filter(d => title.includes(d))
+}
+
+/**
+ * Strip known brand/platform suffixes from a title.
+ *
+ * "音视频问诊_臻享家医" → "音视频问诊"
+ * "就医陪诊_平安臻享家医" → "就医陪诊"
+ *
+ * Does NOT remove discriminator words, so sibling services stay distinct.
  */
 export function stripBrandSuffix(title: string): string {
   let result = title.trim()
@@ -190,6 +258,50 @@ export function stripBrandSuffix(title: string): string {
     result = result.replace(pattern, "")
   }
   return result.trim()
+}
+
+/**
+ * Compute the canonical service identity name for dedup key computation.
+ *
+ * Applies three steps in order:
+ *   1. Strip brand suffix  → removes platform labels
+ *   2. Apply synonym map   → collapses confirmed-safe aliases
+ *   3. Discriminator check → aborts remap if discriminators differ
+ *
+ * This is the ONLY place where title normalization for dedup should happen.
+ * Use this for both the `title` field and the `service_name` attribute.
+ *
+ * Examples:
+ *   "音视频问诊_臻享家医" → "音视频问诊"         (brand suffix stripped)
+ *   "家庭医生"           → "家庭医生服务"          (synonym remapped)
+ *   "重疾专案"           → "重疾专案管理"          (synonym remapped)
+ *   "康复门诊协助"        → "康复门诊协助"          (no change: has discriminator)
+ *   "康复住院协助"        → "康复住院协助"          (no change: different discriminator)
+ */
+export function canonicalServiceIdentityName(title: string): string {
+  if (!title) return title
+
+  // Step 1: strip brand suffix
+  const stripped = stripBrandSuffix(title)
+
+  // Step 2: look up in confirmed synonym map
+  const canonical = CONFIRMED_SYNONYMS[stripped] ?? stripped
+  if (canonical === stripped) return stripped
+
+  // Step 3: discriminator protection
+  // If the stripped title and its canonical form have DIFFERENT discriminator
+  // sets, the synonym mapping is not safe — abort and return the stripped form.
+  const fromDiscriminators = extractDiscriminators(stripped)
+  const toDiscriminators = extractDiscriminators(canonical)
+  const fromSet = new Set(fromDiscriminators)
+  const toSet = new Set(toDiscriminators)
+  const discriminatorMismatch =
+    fromDiscriminators.some(d => !toSet.has(d)) ||
+    toDiscriminators.some(d => !fromSet.has(d))
+
+  if (discriminatorMismatch) return stripped
+
+  return canonical
 }
 
 export const INSURANCE_SCHEMA_REGISTRY: InsuranceEntitySchemaSpec[] = [
@@ -1131,18 +1243,22 @@ export function inferStableInsuranceDedupKey(input: {
   const keyFields = DEDUP_KEY_FIELDS[entityType] ?? ["title"]
   const parts: string[] = [entityType]
 
+  // Fields where we apply canonicalServiceIdentityName (brand suffix + synonym map).
+  // Include both title and service_name so service_benefit entities are normalized
+  // regardless of whether their dedup key is derived from title or from service_name.
+  const IDENTITY_NORMALIZE_FIELDS = new Set(["title", "service_name"])
+
   for (const field of keyFields) {
     let value = field === "title" ? input.title : attrs[field]
-    // For title-based keys, strip brand suffixes before normalizing
-    if (field === "title" && typeof value === "string") {
-      value = stripBrandSuffix(value)
+    if (IDENTITY_NORMALIZE_FIELDS.has(field) && typeof value === "string") {
+      value = canonicalServiceIdentityName(value)
     }
     const normalized = normalizeDedupPart(value)
     if (normalized) parts.push(normalized)
   }
 
   if (parts.length === 1) {
-    const rawTitle = stripBrandSuffix(input.title || "")
+    const rawTitle = canonicalServiceIdentityName(input.title || "")
     const fallback = normalizeDedupPart(input.fallback) || normalizeDedupPart(rawTitle) || "untitled"
     parts.push(fallback)
   }
