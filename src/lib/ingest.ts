@@ -2762,12 +2762,23 @@ async function autoIngestImpl(
     // ── Step 3.4c: Global Relation Pass (cross-document semantic relation inference) ──
     // Runs AFTER postprocess (D+C relation edges already on disk) and BEFORE audit
     // (so audit scores reflect cross-document relations written here).
-    // Only runs when there are >= 2 entities in the project — short-circuits cheaply.
+    //
+    // IMPORTANT: we pass newEntityTitles so the pass only evaluates pairs that include
+    // at least one entity written during THIS ingest. Without this gate, the pass would
+    // re-evaluate all N² entity pairs on every subsequent ingest, producing duplicate edges.
     if (!signal?.aborted) {
       try {
-        const grpResult = await runGlobalRelationPass(pp, llmConfig, signal)
+        // Derive titles of entity pages written during this ingest
+        const newEntityTitles = new Set<string>()
+        for (const rel of writtenPaths) {
+          if (rel.startsWith("wiki/entities/") || rel.startsWith("wiki/concepts/")) {
+            const stem = rel.split("/").pop()?.replace(/\.md$/i, "")
+            if (stem) newEntityTitles.add(stem)
+          }
+        }
+        const grpResult = await runGlobalRelationPass(pp, llmConfig, signal, { newEntityTitles })
         if (grpResult.written > 0 || grpResult.errors.length > 0) {
-          console.log(`[ingest] Global relation pass: catalog=${grpResult.catalogSize} pairs=${grpResult.candidatePairs} written=${grpResult.written} queued=${grpResult.queued} discarded=${grpResult.discarded}`)
+          console.log(`[ingest] Global relation pass: catalog=${grpResult.catalogSize} newEntities=${newEntityTitles.size} pairs=${grpResult.candidatePairs} written=${grpResult.written} queued=${grpResult.queued} discarded=${grpResult.discarded}`)
         }
         if (grpResult.errors.length > 0) {
           console.warn("[ingest] Global relation pass errors:", grpResult.errors)

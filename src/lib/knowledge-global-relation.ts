@@ -87,6 +87,17 @@ export interface GlobalRelationPassResult {
   errors: string[]
 }
 
+/**
+ * Options for runGlobalRelationPass.
+ * @param newEntityTitles - When provided, only pairs that include at least one
+ *   new entity are generated. This prevents re-processing all N² pairs on every
+ *   subsequent ingest call (the primary cause of duplicate edge accumulation).
+ */
+export interface GlobalRelationPassOptions {
+  /** Titles of entities written during the current ingest. When omitted, all entities are candidates. */
+  newEntityTitles?: ReadonlySet<string>
+}
+
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 /** Whitelist of relation types the LLM is allowed to output. */
@@ -169,16 +180,22 @@ function parseEntityEntry(content: string, filePath: string): EntityEntry | null
     attrs.service_category = scalarBlock(fm, "service_category") || ""
   }
 
-  // existing relation targets
+  // existing relation targets — parse BOTH compact-list and YAML-block formats
   const existingTargets = new Set<string>()
-  const relBlock = fm.match(/^relations:\s*\n((?:\s+-\s+.+\n?)*)/m)?.[1] ?? ""
+
+  // Format A: compact list  `  - "complements: 音视频随访"`
+  const relBlock = fm.match(/^relations:\s*\n((?:[ \t]+-[ \t]+.+(?:\r?\n)?)*)/m)?.[1] ?? ""
   for (const line of relBlock.split(/\r?\n/)) {
-    const m = line.match(/^\s+-\s+"?[a-z_]+:\s*([^"]+)"?\s*$/i)
+    // matches `  - "reltype: target"` or `  - reltype: target`
+    const m = line.match(/^[ \t]+-[ \t]+"?[a-z_]+:\s*([^"\r\n]+)"?\s*$/i)
     if (m) existingTargets.add(m[1].trim())
   }
-  // also include relation_edges targets
-  const edgeBlock = fm.match(/^relation_edges:\s*\n([\s\S]*?)(?=\n\S|\n---\s*$|$)/m)?.[1] ?? ""
-  for (const m of edgeBlock.matchAll(/target:\s*"?([^"\n]+)"?/g)) {
+
+  // Format B: YAML object block  `  - target: "音视频随访"\n    type: complements`
+  // Scan the entire frontmatter for `target:` keys inside relation_edges
+  const edgeBlockM = fm.match(/^relation_edges:[ \t]*\n((?:[ \t]+.*(?:\r?\n)?)*)/m)
+  const edgeBlock = edgeBlockM ? edgeBlockM[1] : ""
+  for (const m of edgeBlock.matchAll(/^[ \t]+-?[ \t]*target:[ \t]*"?([^"\r\n]+)"?/gm)) {
     existingTargets.add(m[1].trim())
   }
 
@@ -215,7 +232,10 @@ function parseEntityEntry(content: string, filePath: string): EntityEntry | null
 
 const MAX_CANDIDATES_PER_ENTITY = 8
 
-export function generateCandidatePairs(catalog: EntityEntry[]): CandidatePair[] {
+export function generateCandidatePairs(
+  catalog: EntityEntry[],
+  newEntityTitles?: ReadonlySet<string>,
+): CandidatePair[] {
   // Only consider entity types that have lateral relations
   const candidates = catalog.filter(e =>
     ["service_benefit", "product", "persona", "pitch", "process"].includes(e.entityType) ||
@@ -235,6 +255,10 @@ export function generateCandidatePairs(catalog: EntityEntry[]): CandidatePair[] 
 
   function tryAdd(a: EntityEntry, b: EntityEntry, reason: string) {
     if (a.title === b.title) return
+    // Skip if neither is a new entity (avoid re-processing stable pairs on every ingest)
+    if (newEntityTitles && newEntityTitles.size > 0) {
+      if (!newEntityTitles.has(a.title) && !newEntityTitles.has(b.title)) return
+    }
     if (a.existingTargets.has(b.title) || b.existingTargets.has(a.title)) return
     if (getCount(a.title) >= MAX_CANDIDATES_PER_ENTITY) return
     if (getCount(b.title) >= MAX_CANDIDATES_PER_ENTITY) return
@@ -520,11 +544,32 @@ interface RelationEdge {
   source_files: string[]
 }
 
+/**
+ * Check whether a (type, target) edge already exists in the content,
+ * regardless of whether it was written as a compact list item or a YAML block.
+ *
+ * Compact:  `  - "complements: 音视频随访"`
+ * YAML:     `  - target: "音视频随访"\n    type: complements`
+ */
+export function hasRelationEdge(content: string, type: string, target: string): boolean {
+  // Compact format: the string "type: target" appears somewhere in the content
+  if (content.includes(`${type}: ${target}`)) return true
+  // YAML block format: target appears on a target: line AND type appears nearby
+  const targetRe = new RegExp(`target:\\s*"?${target.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"?`, "m")
+  if (targetRe.test(content)) {
+    // Verify the type field is also present adjacent to this target block
+    const typeRe = new RegExp(`type:\\s*${type}\\b`, "m")
+    if (typeRe.test(content)) return true
+  }
+  return false
+}
+
 function injectRelationEdge(content: string, edge: RelationEdge): string {
+  // Guard: skip if this (type, target) edge already exists in any format
+  if (hasRelationEdge(content, edge.type, edge.target)) return content
+
   // Append compact relation line
   const compactLine = `  - "${edge.type}: ${edge.target}"`
-  const hasRelation = content.includes(`${edge.type}: ${edge.target}`)
-  if (hasRelation) return content  // already present
 
   const edgeYaml = [
     `  - target: "${edge.target}"`,
@@ -575,6 +620,7 @@ export async function runGlobalRelationPass(
   projectPath: string,
   llmConfig: LlmConfig,
   signal?: AbortSignal,
+  options?: GlobalRelationPassOptions,
 ): Promise<GlobalRelationPassResult> {
   const errors: string[] = []
 
@@ -594,8 +640,10 @@ export async function runGlobalRelationPass(
     return { catalogSize: catalog.length, candidatePairs: 0, llmCallCount: 0, written: 0, queued: 0, discarded: 0, errors }
   }
 
-  // Phase 2
-  const candidatePairs = generateCandidatePairs(catalog)
+  // Phase 2 — only generate pairs involving new entities (if provided)
+  // This prevents the exponential re-processing of already-judged pairs on
+  // every subsequent ingest call, which was the primary cause of duplicate edges.
+  const candidatePairs = generateCandidatePairs(catalog, options?.newEntityTitles)
   if (candidatePairs.length === 0) {
     return { catalogSize: catalog.length, candidatePairs: 0, llmCallCount: 0, written: 0, queued: 0, discarded: 0, errors }
   }
