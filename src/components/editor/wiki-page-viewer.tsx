@@ -411,6 +411,20 @@ function relationLabel(relation: KnowledgeRelationView): string {
   return `${direction} · ${relation.display_type}`
 }
 
+interface RelationConceptCard {
+  key: string
+  name: string
+  path: string | null
+  detail?: string
+}
+
+function parseCompactRelationTarget(line: string): { type: string; target: string } | null {
+  const match = line.match(/^\s*([a-z_]+)\s*:\s*(.+?)\s*$/i)
+  if (!match) return null
+  const target = match[2].replace(/^["']|["']$/g, "").trim()
+  return target ? { type: match[1], target } : null
+}
+
 function extractKnowledgeGaps(attributes: string): string[] {
   if (!attributes) return []
   try {
@@ -730,6 +744,51 @@ export function WikiPageViewer({ filePath, content, onEditRequest, onDeleteCompl
       path: findWikiPage(edge.target, allPaths),
     }))
   }, [fm.relation_edges, allPaths])
+
+  const relationConceptCards = useMemo<RelationConceptCard[]>(() => {
+    const seen = new Set<string>()
+    const cards: RelationConceptCard[] = []
+    const push = (name: string, path: string | null, detail?: string, keyPrefix = "relation") => {
+      const normalized = name.trim().toLowerCase()
+      if (!normalized || seen.has(normalized)) return
+      seen.add(normalized)
+      cards.push({
+        key: `${keyPrefix}-${normalized}-${path ?? "missing"}`,
+        name,
+        path,
+        detail,
+      })
+    }
+
+    for (const relation of indexedRelations) {
+      push(
+        relation.display_title,
+        relation.display_path || findWikiPage(relation.display_title, allPaths),
+        relationLabel(relation),
+        "indexed",
+      )
+    }
+
+    for (const { edge, path } of relationEdgeResolved) {
+      push(
+        edge.target,
+        path,
+        [edge.type, edge.provenance, edge.confidence ? `confidence ${edge.confidence}` : ""].filter(Boolean).join(" / "),
+        "edge",
+      )
+    }
+
+    for (const relationLine of fm.relations) {
+      const parsed = parseCompactRelationTarget(relationLine)
+      if (parsed) push(parsed.target, findWikiPage(parsed.target, allPaths), parsed.type, "compact")
+    }
+
+    for (const { name, path } of relatedResolved) {
+      push(name, path, "related", "related")
+    }
+
+    return cards
+  }, [indexedRelations, relationEdgeResolved, fm.relations, relatedResolved, allPaths])
 
   useEffect(() => {
     let cancelled = false
@@ -1062,7 +1121,7 @@ export function WikiPageViewer({ filePath, content, onEditRequest, onDeleteCompl
             <span style={{ fontSize: 16 }}>🤖</span>
             <span style={{ color: "#4A5060" }}>
               <b style={{ color: "#7C3AED" }}>AI 编译</b>
-              {" — "}从 {fm.sources.map(s => `《${s}》`).join("、")} 自动抽取，关联 {fm.related.length} 个概念实体。
+              {" — "}从 {fm.sources.map(s => `《${s}》`).join("、")} 自动抽取，关联 {relationConceptCards.length} 个概念实体。
             </span>
           </div>
         )}
@@ -1108,13 +1167,13 @@ export function WikiPageViewer({ filePath, content, onEditRequest, onDeleteCompl
           </div>
         ))}
 
-        {/* ── Structured relations ── */}
-        {indexedRelations.length > 0 ? (
+        {/* ── Relation-backed concept links ── */}
+        {relationConceptCards.length > 0 ? (
           <div style={{ marginBottom: 28 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
               <div style={{ width: 4, height: 16, borderRadius: 2, background: "#0891B2" }} />
               <h2 style={{ fontSize: 14, fontWeight: 700, color: "#15181E", margin: 0, borderLeft: "none", paddingLeft: 0 }}>
-                结构化关联
+                关联概念
               </h2>
             </div>
             <div
@@ -1124,13 +1183,13 @@ export function WikiPageViewer({ filePath, content, onEditRequest, onDeleteCompl
                 gap: 8,
               }}
             >
-              {indexedRelations.map((relation) => (
+              {relationConceptCards.map((relation) => (
                 <WikiLinkCard
-                  key={`${relation.id}-${relation.direction}`}
-                  name={relation.display_title}
-                  detail={relationLabel(relation)}
-                  exists={Boolean(relation.display_path)}
-                  onClick={() => relation.display_path && openRelated(relation.display_path)}
+                  key={relation.key}
+                  name={relation.name}
+                  detail={relation.detail}
+                  exists={relation.path !== null}
+                  onClick={() => relation.path && openRelated(relation.path)}
                 />
               ))}
             </div>

@@ -135,4 +135,33 @@ describe("knowledge frontmatter cleanup", () => {
     expect(cleaned).toContain("- regulatory_filing_no")
     expect(cleaned).toContain("- 费率表")
   })
+
+  it("preserves structured relation_edges blocks and specific relation types", () => {
+    const cleaned = cleanupKnowledgeFrontmatter([
+      "---",
+      "schema_version: \"2.1\"",
+      "knowledge_domain: product",
+      "entity_type: service_benefit",
+      "type: entity",
+      "title: Audio Visit",
+      "relations:",
+      "  - same_scene: Video Followup",
+      "  - next_step: Care Plan",
+      "attributes: {}",
+      "relation_edges:",
+      "  - target: \"Video Followup\"",
+      "    type: same_scene",
+      "    provenance: postprocess_inferred",
+      "    confidence: 0.74",
+      "    evidence: \"same service scene\"",
+      "    source_files: [\"source.pdf\"]",
+      "---",
+      "# Audio Visit",
+    ].join("\n"))
+
+    expect(cleaned).toContain("relation_edges:\n  - target: \"Video Followup\"")
+    expect(cleaned).not.toContain("relation_edges: \"- target")
+    expect(cleaned).toContain("same_scene: Video Followup")
+    expect(cleaned).toContain("next_step: Care Plan")
+  })
 })

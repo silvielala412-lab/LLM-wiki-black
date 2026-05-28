@@ -354,7 +354,7 @@ function appendRelationEdges(content: string, edges: RelationEdge[]): string {
   const [fullFmBlock, open, fm, close] = fmMatch
 
   // Try to append to existing relation_edges: block within frontmatter
-  const existingBlockRe = /^(relation_edges:[ \t]*\n(?:[ \t]+-[ \t][\s\S]*?\n?)+)/m
+  const existingBlockRe = /^relation_edges:[ \t]*\n(?:[ \t]+.*(?:\r?\n|$))*/m
   if (existingBlockRe.test(fm)) {
     const newFm = fm.replace(existingBlockRe, (match) => match.trimEnd() + "\n" + edgeBlock + "\n")
     return content.replace(fullFmBlock, open + newFm + close)

@@ -25,6 +25,10 @@ const LIST_FIELDS = new Set([
   "claims",
 ])
 
+const STRUCTURED_BLOCK_FIELDS = new Set([
+  "relation_edges",
+])
+
 const SCALAR_KEEP_FIRST = new Set([
   "status",
   "confidence",
@@ -71,6 +75,11 @@ const RELATION_TYPES = new Set<RelationType>([
   "review_required_by",
   "bundled_with",
   "complements",
+  "next_step",
+  "same_stage",
+  "same_category",
+  "same_scene",
+  "adjacent_in_process",
 ])
 
 const CANONICAL_TARGETS: Record<string, string> = {
@@ -104,8 +113,14 @@ export function cleanupKnowledgeFrontmatter(content: string): string {
   const listValues = new Map<string, string[]>()
   const scalarValues = new Map<string, string>()
   const objectValues = new Map<string, string>()
+  const structuredBlockValues = new Map<string, string[]>()
 
   for (const block of blocks) {
+    if (STRUCTURED_BLOCK_FIELDS.has(block.key)) {
+      structuredBlockValues.set(block.key, normalizeStructuredBlock(block))
+      continue
+    }
+
     if (LIST_FIELDS.has(block.key)) {
       const merged = [...(listValues.get(block.key) ?? []), ...extractListValues(block)]
       listValues.set(block.key, dedupe(merged))
@@ -155,6 +170,7 @@ export function cleanupKnowledgeFrontmatter(content: string): string {
     "needs_review",
     "attributes",
     "claims",
+    "relation_edges",
     "ingested_at",
     "ingested_by",
     "ingested_by_user",
@@ -169,6 +185,7 @@ export function cleanupKnowledgeFrontmatter(content: string): string {
     ...scalarValues.keys(),
     ...listValues.keys(),
     ...objectValues.keys(),
+    ...structuredBlockValues.keys(),
   ])
   const keys = [
     ...orderedKeys.filter((key) => allKeys.has(key)),
@@ -184,6 +201,8 @@ export function cleanupKnowledgeFrontmatter(content: string): string {
       lines.push(...formatList(key, values))
     } else if (objectValues.has(key)) {
       lines.push(`${key}: ${objectValues.get(key)}`)
+    } else if (structuredBlockValues.has(key)) {
+      lines.push(...structuredBlockValues.get(key)!)
     } else {
       const value = scalarValues.get(key) ?? ""
       lines.push(`${key}: ${formatScalar(value)}`)
@@ -311,6 +330,39 @@ function blockValue(block: YamlBlock): string {
   const first = block.lines[0].replace(new RegExp(`^${escapeRegExp(block.key)}:\\s*`), "").trim()
   const rest = block.lines.slice(1).join("\n").trim()
   return [first, rest].filter(Boolean).join("\n").trim()
+}
+
+function normalizeStructuredBlock(block: YamlBlock): string[] {
+  if (block.key !== "relation_edges") return block.lines
+  const firstValue = block.lines[0].replace(/^relation_edges:\s*/, "").trim()
+  const bodyLines = block.lines.slice(1)
+  if (!firstValue) return ["relation_edges:", ...bodyLines]
+
+  const repaired = repairScalarRelationEdges([firstValue, ...bodyLines].join("\n"))
+  if (repaired.length > 0) return ["relation_edges:", ...repaired]
+  return ["relation_edges:", ...bodyLines]
+}
+
+function repairScalarRelationEdges(raw: string): string[] {
+  const cleaned = trimQuotes(raw)
+    .replace(/\\n/g, "\n")
+    .replace(/\\"/g, "\"")
+    .replace(/\\\\/g, "\\")
+  const targetIndex = cleaned.indexOf("- target:")
+  if (targetIndex < 0) return []
+
+  const body = cleaned.slice(targetIndex)
+  return body
+    .split(/\r?\n/)
+    .map((line, index) => {
+      const trimmed = line.trim()
+      if (!trimmed) return ""
+      if (trimmed.startsWith("- target:")) return `  ${trimmed}`
+      if (index === 1 && trimmed.startsWith("type:")) return `    ${trimmed}`
+      if (/^(type|provenance|confidence|evidence|source_files):/.test(trimmed)) return `    ${trimmed}`
+      return line
+    })
+    .filter(Boolean)
 }
 
 function extractListValues(block: YamlBlock): string[] {
