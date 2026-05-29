@@ -2,12 +2,12 @@
 
 > **Purpose**: This document records the agreed architecture decisions, pending
 > implementation items, and design constraints for the Codex team and future
-> developers. Last updated: 2026-05-26. Update this file whenever a major
+> developers. Last updated: 2026-05-29. Update this file whenever a major
 > decision is made or a phase is completed.
 
 ---
 
-## Current State (as of 2026-05-26, commit 53f9acd)
+## Current State (as of 2026-05-29)
 
 ### What's working
 - **DomainSkill plugin interface** (`knowledge-domain-skill.ts`) — extensibility contract for all future domains
@@ -18,6 +18,15 @@
 - YAML-format attributes parsing (`parseYamlAttributes`) — fixes the core materializer bug
 - Wikilink normalization (`normalizeBodyWikilinks`) — body text `[[旧名_臻享家医]]` → `[[规范名]]`
 - Reconcile drops unresolvable relation targets (no more broken links in frontmatter)
+- **Relation scoring layer** (`RELATION_TYPE_SCORES`, `RELATION_SOURCE_CONFIDENCE`, `RELATION_QUERY_AFFINITY`) with `expandGraphFromEntity()` API
+- **Authority-weighted conflict resolution** (`knowledge-resolution.ts`) — source_type weights, user_locked_fields, version audit trail
+- **`canonicalServiceIdentityName()`** — brand suffix stripping + discriminator-protected synonym map (28/28 tests pass)
+- **`knowledge-identity-resolution.ts`** — full 4-phase LLM Identity Pass:
+  - Phase 1: `buildIdentityCatalog()` — reads all entity pages with canonical dedup_key
+  - Phase 2: `generateIdentityCandidates()` — rule-based N-reduction (R1:dedup_key / R2:canonical_title / R3:prefix-suffix / R4:source+type)
+  - Phase 3: `llmJudgeIdentityPairs()` — LLM batch verdict (same_entity/alias_of/sibling_of/parent_child/distinct), 15 pairs/call
+  - Phase 4: `applyIdentityJudgments()` — writes relation edges + merge_suggestion frontmatter comments
+- **Ingest pipeline ordering**: postprocess → Identity Pass → Global Relation Pass → audit (correct sequence)
 
 ### Known remaining gaps
 | Issue | Severity | Owner |
@@ -28,6 +37,8 @@
 | high_confidence field completeness only 29% | P1 | LLM prompt improvement |
 | 7 remaining broken wikilinks in source pages (compliance/声明 pages not generated) | P1 | Codex |
 | Audit counts frontmatter + wikilinks + related as "relations" (misleading) | P2 | Either |
+| Identity Pass: merge_suggestion not yet auto-resolved on subsequent ingest | P2 | Future: add dedup pass in postprocess |
+| ReviewStore not yet accessible from lib — queued judgments (0.65-0.82) are discarded | P2 | Future: expose ReviewStore to lib layer |
 
 ---
 
@@ -89,10 +100,19 @@ These agents do NOT replace the deterministic postprocess pipeline — they augm
 - [x] Body wikilink normalization (`normalizeBodyWikilinks`)
 - [x] Broken relation target drop in `reconcileRelations`
 - [x] `DomainSkill` interface + `DomainSkillRegistry`
-- [ ] Fix candidate compiler to use `service_plan` schema (Codex: ingest-side)
+- [x] Fix candidate compiler to use `service_plan` schema (Codex: ingest-side)
+- [x] `canonicalServiceIdentityName()` — brand suffix stripping + discriminator protection
+- [x] **LLM Identity Pass** (`knowledge-identity-resolution.ts`) — 4-phase pipeline:
+  - same_entity / alias_of / sibling_of / parent_child detection
+  - Candidate pair generation with 4 rules (no N²)
+  - LLM batch judgment with discriminator guards and confidence thresholds
+  - Non-destructive apply: merge_suggestion for human review, relation edges for graph connectivity
+  - Integrated in ingest: Step 3.4c (after postprocess, before Global Relation Pass)
 - [ ] Re-salvage `extra_attributes` into canonical fields (特色体检 fix)
 - [ ] Audit: count only frontmatter `relations` (not body wikilinks)
 - [ ] Validate PA0526-02 → target: audit score ≥ 75, has_part coverage = 100%
+- [ ] Identity Pass: auto-resolve `merge_suggestion` on subsequent ingest (postprocess dedup)
+- [ ] ReviewStore bridge: expose low-confidence judgments (0.65-0.82) to review queue
 
 ### Phase 2 — Life Insurance Domain
 **Status**: Not started. Trigger: when first life insurance source doc is ingested.
@@ -156,23 +176,26 @@ Each agent:
 
 ```
 src/lib/
-├── knowledge-domain-skill.ts     ← DomainSkill interface + DomainSkillRegistry
-├── health-service-skill.ts       ← HealthServiceSkill (Phase 1)
-├── knowledge-postprocess.ts      ← main postprocess pipeline (skill-dispatched)
-├── knowledge-relation-index.ts   ← graph index + expandGraphFromEntity API
-├── knowledge-schema.ts           ← RelationType, RELATION_QUERY_AFFINITY, scoring constants
-├── insurance-schema-registry.ts  ← entity type specs (service_plan, service_benefit, ...)
-├── service-benefit-enrichment.ts ← LLM extraction helpers (health service specific)
-└── ingest.ts                     ← main ingest pipeline (calls postprocess after extraction)
+├── knowledge-domain-skill.ts         ← DomainSkill interface + DomainSkillRegistry
+├── health-service-skill.ts           ← HealthServiceSkill (Phase 1)
+├── knowledge-postprocess.ts          ← main postprocess pipeline (skill-dispatched)
+├── knowledge-relation-index.ts       ← graph index + expandGraphFromEntity API
+├── knowledge-schema.ts               ← RelationType, RELATION_QUERY_AFFINITY, scoring constants
+├── knowledge-global-relation.ts      ← Global Relation Pass (cross-doc lateral relations)
+├── knowledge-identity-resolution.ts  ← Identity Pass (same_entity/alias_of/sibling_of)
+├── knowledge-resolution.ts           ← authority-weighted conflict resolution
+├── insurance-schema-registry.ts      ← entity type specs + canonicalServiceIdentityName()
+├── service-benefit-enrichment.ts     ← LLM extraction helpers (health service specific)
+└── ingest.ts                         ← main pipeline: postprocess → identity → relation → audit
 
 Future:
-├── life-insurance-skill.ts       ← LifeInsuranceSkill (Phase 2)
-├── medical-insurance-skill.ts    ← MedicalInsuranceSkill (Phase 3)
+├── life-insurance-skill.ts           ← LifeInsuranceSkill (Phase 2)
+├── medical-insurance-skill.ts        ← MedicalInsuranceSkill (Phase 3)
 └── agent/
-    ├── orchestrator-agent.ts     ← OrchestratorAgent (Phase 5)
-    ├── extraction-agent.ts       ← ExtractionAgent (Phase 5)
-    ├── validation-agent.ts       ← ValidationAgent (Phase 5)
-    └── relation-agent.ts         ← RelationAgent (Phase 5)
+    ├── orchestrator-agent.ts         ← OrchestratorAgent (Phase 5)
+    ├── extraction-agent.ts           ← ExtractionAgent (Phase 5)
+    ├── validation-agent.ts           ← ValidationAgent (Phase 5)
+    └── relation-agent.ts             ← RelationAgent (Phase 5)
 ```
 
 ---

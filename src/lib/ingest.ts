@@ -14,6 +14,7 @@ import { withProjectLock } from "@/lib/project-mutex"
 import { writeExtractionQualityAudit } from "@/lib/extraction-quality-audit"
 import { runKnowledgePostProcess } from "@/lib/knowledge-postprocess"
 import { runGlobalRelationPass } from "@/lib/knowledge-global-relation"
+import { runIdentityPass } from "@/lib/knowledge-identity-resolution"
 import {
   enrichServiceBenefitPagesFromText,
   parseServiceInventoryRows,
@@ -2759,7 +2760,38 @@ async function autoIngestImpl(
       console.warn("[ingest] Post-process failed (non-critical):", err)
     }
 
-    // ── Step 3.4c: Global Relation Pass (cross-document semantic relation inference) ──
+    // ── Step 3.4c: Identity Pass (cross-document entity identity resolution) ──
+    // Runs AFTER postprocess and BEFORE Global Relation Pass.
+    // Resolves same_entity / alias_of / sibling_of / parent_child relationships
+    // so the graph is built on clean, deduplicated entities.
+    //
+    // Conservative by design: same_entity requires confidence >= 0.90 (hard-coded
+    // in the LLM prompt). Below that, falls back to alias_of (non-destructive).
+    // No entity pages are deleted — merge suggestions are written as frontmatter
+    // comments for human review.
+    if (!signal?.aborted) {
+      try {
+        // Derive titles of entity pages written during this ingest
+        const newEntityTitles = new Set<string>()
+        for (const rel of writtenPaths) {
+          if (rel.startsWith("wiki/entities/") || rel.startsWith("wiki/concepts/")) {
+            const stem = rel.split("/").pop()?.replace(/\.md$/i, "")
+            if (stem) newEntityTitles.add(stem)
+          }
+        }
+        const idResult = await runIdentityPass(pp, llmConfig, signal, { newEntityTitles })
+        if (idResult.merged > 0 || idResult.aliasEdges > 0 || idResult.siblingEdges > 0 || idResult.errors.length > 0) {
+          console.log(`[ingest] Identity pass: catalog=${idResult.catalogSize} pairs=${idResult.candidatePairs} merged=${idResult.merged} alias=${idResult.aliasEdges} sibling=${idResult.siblingEdges} parent_child=${idResult.parentChildEdges}`)
+        }
+        if (idResult.errors.length > 0) {
+          console.warn("[ingest] Identity pass errors:", idResult.errors)
+        }
+      } catch (err) {
+        console.warn("[ingest] Identity pass failed (non-critical):", err)
+      }
+    }
+
+    // ── Step 3.4d: Global Relation Pass (cross-document semantic relation inference) ──
     // Runs AFTER postprocess (D+C relation edges already on disk) and BEFORE audit
     // (so audit scores reflect cross-document relations written here).
     //
