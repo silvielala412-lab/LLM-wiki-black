@@ -107,7 +107,10 @@ export type RelationType =
   | "same_category"          // same service_category value
   | "same_scene"             // same service_scene value
   | "adjacent_in_process"    // same business_phase / sequential in process
-
+  // ── Identity resolution relations (IDENTITY_PASS provenance) ─────────────
+  // Written by the Identity Pass after LLM judgment on candidate pairs.
+  | "alias_of"               // different name, same service / concept
+  | "sibling_of"             // same family, distinct sub-service
 
 /**
  * Provenance of a relation edge: how was it created?
@@ -431,6 +434,9 @@ export const RELATION_TYPE_SCORES: Record<RelationType, { confidence_base: numbe
   same_category:         { confidence_base: 0.50, strength: 0.40 },
   same_scene:            { confidence_base: 0.48, strength: 0.38 },
   adjacent_in_process:   { confidence_base: 0.55, strength: 0.50 },
+  // Identity resolution (IDENTITY_PASS layer)
+  alias_of:              { confidence_base: 0.85, strength: 0.80 }, // same service, different name
+  sibling_of:            { confidence_base: 0.75, strength: 0.65 }, // same family, different scope
 }
 
 /**

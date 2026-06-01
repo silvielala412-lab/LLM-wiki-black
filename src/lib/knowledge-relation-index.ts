@@ -118,7 +118,6 @@ export async function buildKnowledgeRelationIndex(projectPath: string): Promise<
   for (const page of pages) {
     byTitle.set(normalizeLookup(page.title), page)
     byTitle.set(normalizeLookup(page.id), page)
-    byTitle.set(normalizeLookup(fileBaseName(page.path)), page)
   }
 
   const relations: KnowledgeRelation[] = []
@@ -152,8 +151,8 @@ export async function buildKnowledgeRelationIndex(projectPath: string): Promise<
 
     for (const link of extractWikilinks(parsed.body)) {
       const target = resolveTarget(link, byId, byTitle)
-      const scores = computeRelationScoreByProvenance("mentions", "wikilink", false, pageConf)
-      pushRelationWithProvenance(relations, seen, page, target, link, "mentions", scores, "system", [], "wikilink")
+      const scores = computeRelationScore("mentions", "system", false, pageConf)
+      pushRelation(relations, seen, page, target, link, "mentions", scores, "system", [])
     }
 
     // relation_edges: MUST be processed BEFORE compact relations: so that high-quality
@@ -162,10 +161,10 @@ export async function buildKnowledgeRelationIndex(projectPath: string): Promise<
     for (const edge of parseRelationEdgesBlock(parsed.frontmatter)) {
       const target = resolveTarget(edge.target, byId, byTitle)
       const prov: RelationProvenance =
-        edge.provenance === "user_confirmed"       ? "user_confirmed"       :
-        edge.provenance === "explicit_ingest"      ? "explicit_ingest"      :
-        edge.provenance === "postprocess_inferred" ? "postprocess_inferred" :
-        "explicit"
+        edge.provenance === "user_confirmed" ? "user_confirmed" :
+          edge.provenance === "explicit_ingest" ? "explicit_ingest" :
+            edge.provenance === "postprocess_inferred" ? "postprocess_inferred" :
+              "explicit"
       const scores = computeRelationScoreByProvenance(
         edge.type as RelationType, prov, edge.confidence > 0.8, pageConf,
       )
@@ -209,9 +208,9 @@ export async function buildKnowledgeRelationIndex(projectPath: string): Promise<
     topK: number
   }
   const fieldGroups: FieldGroupConfig[] = [
-    { field: "service_category",  relationType: "same_category",        topK: FIELD_DERIVED_TOP_K },
-    { field: "service_scene",     relationType: "same_scene",           topK: FIELD_DERIVED_TOP_K },
-    { field: "business_phase",    relationType: "adjacent_in_process",  topK: 3 },
+    { field: "service_category", relationType: "same_category", topK: FIELD_DERIVED_TOP_K },
+    { field: "service_scene", relationType: "same_scene", topK: FIELD_DERIVED_TOP_K },
+    { field: "business_phase", relationType: "adjacent_in_process", topK: 3 },
   ]
 
   for (const { field, relationType, topK } of fieldGroups) {
@@ -227,9 +226,6 @@ export async function buildKnowledgeRelationIndex(projectPath: string): Promise<
         try {
           const attrs = JSON.parse(attrsRaw) as Record<string, unknown>
           fieldVal = (attrs[field] as string | undefined) ?? ""
-          if (!fieldVal && field === "service_scene") {
-            fieldVal = serviceSceneFromCategory(attrs.service_category)
-          }
         } catch { /* ignore */ }
       }
       if (!fieldVal) fieldVal = frontmatterString(parsed.frontmatter, field)
@@ -242,21 +238,24 @@ export async function buildKnowledgeRelationIndex(projectPath: string): Promise<
     // For each group, emit topK lateral edges per source node
     for (const group of groups.values()) {
       if (group.length < 2) continue // singleton groups produce no edges
-      for (const source of group) {
-        const sourcePageConf = parseFloat(
+
+      // Pre-cache page confidence values to avoid redundant frontmatter parsing in sort
+      const pageConfCache = new Map<string, number>()
+      for (const p of group) {
+        const conf = parseFloat(
           frontmatterString(
-            parseMarkdownFrontmatter(pageContent.get(source.path) ?? "").frontmatter,
+            parseMarkdownFrontmatter(pageContent.get(p.path) ?? "").frontmatter,
             "confidence",
           ) ?? "0.6"
         ) || 0.6
+        pageConfCache.set(p.id, conf)
+      }
+
+      for (const source of group) {
+        const sourcePageConf = pageConfCache.get(source.id) ?? 0.6
         const candidates = group
           .filter(p => p.id !== source.id)
-          // Sort candidates: prefer higher-confidence pages as neighbors
-          .sort((a, b) => {
-            const confA = parseFloat(frontmatterString(parseMarkdownFrontmatter(pageContent.get(a.path) ?? "").frontmatter, "confidence") ?? "0.6") || 0.6
-            const confB = parseFloat(frontmatterString(parseMarkdownFrontmatter(pageContent.get(b.path) ?? "").frontmatter, "confidence") ?? "0.6") || 0.6
-            return confB - confA
-          })
+          .sort((a, b) => (pageConfCache.get(b.id) ?? 0.6) - (pageConfCache.get(a.id) ?? 0.6))
           .slice(0, topK)
 
         for (const target of candidates) {
@@ -349,7 +348,7 @@ export function expandGraphFromEntity(
   if (!byId.has(entityId) || topK <= 0) return []
 
   const preferredTypes = new Set(RELATION_QUERY_AFFINITY[queryIntent] ?? [])
-  const generalTypes   = new Set(RELATION_QUERY_AFFINITY["general"] ?? [])
+  const generalTypes = new Set(RELATION_QUERY_AFFINITY["general"] ?? [])
 
   // Collect candidates — try preferred types first, fall back to general if empty
   let rawCandidates = collectExpansionCandidates(
@@ -401,7 +400,7 @@ function collectExpansionCandidates(
     if (relation.score < minScore) return false
     if (allowedTypes.size > 0 && !allowedTypes.has(relation.type)) return false
     const outbound = relation.source_id === pageId
-    const inbound  = relation.target_id === pageId
+    const inbound = relation.target_id === pageId
     return (includeOutbound && outbound) || (includeInbound && inbound)
   })
 }
@@ -448,10 +447,15 @@ function computeRelationScore(
   hasEvidence: boolean,
   pageConfidence: number,
 ): { confidence: number; strength: number; score: number } {
-  return computeRelationScoreByProvenance(type,
-    createdBy === "system" ? "explicit" : createdBy === "user" ? "user_confirmed" : "explicit",
-    hasEvidence, pageConfidence
-  )
+  // Map legacy created_by to correct provenance layer:
+  //   user   → user_confirmed (highest trust)
+  //   llm    → explicit_ingest (LLM declared at ingest time from source document)
+  //   system → explicit (schema-inferred or postprocess structural fact)
+  const provenance: RelationProvenance =
+    createdBy === "user" ? "user_confirmed" :
+    createdBy === "llm"  ? "explicit_ingest" :
+    "explicit"
+  return computeRelationScoreByProvenance(type, provenance, hasEvidence, pageConfidence)
 }
 
 function computeRelationScoreByProvenance(
@@ -565,16 +569,6 @@ function pageIdFromPath(path: string): string {
   return normalizePath(path).split("/wiki/").pop()?.replace(/\.md$/, "") ?? slugId(path)
 }
 
-function fileBaseName(path: string): string {
-  const normalized = normalizePath(path)
-  return normalized.split("/").pop()?.replace(/\.md$/i, "") ?? normalized
-}
-
-function serviceSceneFromCategory(value: unknown): string {
-  if (typeof value !== "string") return ""
-  return value.split("/").map((part) => part.trim()).filter(Boolean)[0] ?? ""
-}
-
 function slugId(value: string): string {
   return value.trim().toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]+/g, "-").replace(/^-|-$/g, "")
 }
@@ -602,6 +596,7 @@ function normalizeBusinessPhase(value: string): BusinessPhase {
 function normalizeRelationType(value: string): RelationType {
   const normalized = value.trim().toLowerCase().replace(/[\s-]+/g, "_")
   const known: RelationType[] = [
+    // Structural
     "related_to", "mentions", "applies_to", "recommended_for", "supports", "conflicts_with",
     "updates", "supersedes", "governed_by", "derived_from", "uses_asset", "has_evidence",
     "parent_of", "child_of", "refines", "maps_to", "fills_gap_for", "describes", "described_by",
@@ -609,7 +604,12 @@ function normalizeRelationType(value: string): RelationType {
     "defines", "defined_by", "supported_by", "has_recommendation", "uses_pitch", "used_by_pitch",
     "uses_objection_handling", "used_by_objection_handling", "targets_persona", "targeted_by",
     "requires_review", "review_required_by", "bundled_with", "complements",
-    "next_step", "same_stage", "same_category", "same_scene", "adjacent_in_process",
+    // Process / versioning
+    "next_step", "same_stage",
+    // Field-derived lateral (FIELD_DERIVED layer)
+    "same_category", "same_scene", "adjacent_in_process",
+    // Identity resolution (IDENTITY_PASS layer)
+    "alias_of", "sibling_of",
   ]
   return known.includes(normalized as RelationType) ? normalized as RelationType : "related_to"
 }
@@ -626,15 +626,10 @@ function dedupeRelationViews(items: KnowledgeRelationView[]): KnowledgeRelationV
   return result
 }
 
-function resolvePageForExpansion(index: KnowledgeRelationIndex, entityId: string): KnowledgeIndexPage | null {
-  const normalizedId = normalizeLookup(entityId)
-  return index.pages.find((page) =>
-    page.id === entityId ||
-    page.path === normalizePath(entityId) ||
-    normalizeLookup(page.id) === normalizedId ||
-    normalizeLookup(page.title) === normalizedId
-  ) ?? null
-}
+// resolvePageForExpansion: intentionally removed — expandGraphFromEntity uses byId
+// directly for O(1) lookup. Title/path-based lookup is handled by buildKnowledgeRelationIndex
+// which populates byId with canonical page IDs at index build time.
+
 
 /**
  * Parse the structured `relation_edges:` YAML block from a page's frontmatter.
@@ -660,7 +655,7 @@ function parseRelationEdgesBlock(frontmatter: string): Array<{
   const rawEntries = block.split(/\n(?=\s+-)/)
   for (const entry of rawEntries) {
     const target = entry.match(/target:\s*['""]?([^'""\n]+)['""]?/)?.[1]?.trim().replace(/^"|"$/g, "")
-    const type   = entry.match(/\btype:\s*([^\n]+)/)?.[1]?.trim()
+    const type = entry.match(/\btype:\s*([^\n]+)/)?.[1]?.trim()
     if (!target || !type) continue
 
     const provenance = entry.match(/provenance:\s*([^\n]+)/)?.[1]?.trim() ?? "explicit_ingest"
