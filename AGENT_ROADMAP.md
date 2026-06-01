@@ -156,6 +156,34 @@ What needs to be added:
 ### Phase 5 — Sub-Agent Layer
 **Status**: Deferred. Activate when multi-domain scale justifies it.
 
+### Phase 6 — Storage Scaling (Large-Scale Graph Database)
+**Status**: Deferred. Trigger: entities > 10,000 OR query latency > 500ms.
+
+**当前方案（< 1万实体）**：
+- 关系边存 `.md` frontmatter YAML → 启动时全量读取建内存索引
+- 向量存本地 JSON 文件
+- 全文搜索：实时扫描 wiki/*.md 文件（16并发）
+
+**规模化后需要迁移的组件**：
+
+| 组件 | 当前 | 迁移目标 | 触发条件 |
+|------|------|---------|---------|
+| 全文检索 | 实时文件扫描 | SQLite FTS5 | 实体 > 1000 |
+| 关系图存储 | 内存索引（启动重建）| SQLite（nodes + edges 表）| 实体 > 2000，重启体验差 |
+| 向量检索 | 本地 JSON 文件 | Qdrant（本地部署）| 实体 > 5000 |
+| 图遍历引擎 | 内存 Map 遍历 | **Neo4j** 或 **NebulaGraph** | 实体 > 10万 |
+
+**推荐图数据库选型**：
+- **中等规模（< 100万实体）**：Neo4j Community Edition（免费，Cypher 语法，GraphRAG 生态最好）
+- **大规模（> 100万实体）**：NebulaGraph（字节/美团在用，分布式，性能最强）
+- **极速内存图（< 1000万边）**：FalkorDB（基于 Redis，图遍历 < 1ms）
+
+**迁移策略**：
+- `knowledge-relation-index.ts` 的 `buildKnowledgeRelationIndex()` 已经是统一入口，迁移时只需替换这一层的实现，上层 `expandGraphFromEntity()` API 不变
+- `.md` frontmatter 保持不变（Obsidian 兼容、Git 版本控制），数据库作为**读取加速层**，`.md` 文件仍是 source of truth
+
+
+
 Architecture:
 ```
 OrchestratorAgent

@@ -23,8 +23,9 @@
  */
 
 import { listDirectory, readFile, writeFile } from "@/commands/fs"
-import type { LlmConfig } from "@/stores/wiki-store"
+import type { LlmConfig, EmbeddingConfig } from "@/stores/wiki-store"
 import { streamChat } from "@/lib/llm-client"
+import { fetchEmbedding } from "@/lib/embedding"
 import {
   canonicalServiceIdentityName,
   inferStableInsuranceDedupKey,
@@ -81,6 +82,13 @@ export interface IdentityPassOptions {
   newEntityTitles?: ReadonlySet<string>
   /** Minimum confidence to act on a judgment. Default: 0.82 */
   writeThreshold?: number
+  /**
+   * If provided and enabled, adds vector-similarity candidates (R5).
+   * Entities with cosine similarity >= vectorThreshold are sent to LLM for judgment.
+   */
+  embeddingConfig?: EmbeddingConfig
+  /** Cosine similarity threshold for R5 vector candidates. Default: 0.82 */
+  vectorThreshold?: number
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -322,6 +330,92 @@ export function generateIdentityCandidates(
     }
   }
 
+  return pairs
+}
+
+// ─── Phase 2b: Vector Similarity Candidates (R5) ─────────────────────────────
+//
+// For entities whose names are completely different (e.g. "在线问诊" vs "音视频问诊"),
+// rules R1-R4 produce no candidates. R5 uses embedding cosine similarity to surface
+// semantically equivalent entities that naming rules miss.
+//
+// Embed text = title + entity_type + summary (richer than title alone).
+// Pairs with cosine >= vectorThreshold and no discriminator conflict enter the LLM pool.
+
+function cosineSimilarity(a: number[], b: number[]): number {
+  let dot = 0, normA = 0, normB = 0
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i]
+    normA += a[i] * a[i]
+    normB += b[i] * b[i]
+  }
+  const denom = Math.sqrt(normA) * Math.sqrt(normB)
+  return denom === 0 ? 0 : dot / denom
+}
+
+export async function generateVectorCandidates(
+  catalog: IdentityEntry[],
+  embeddingConfig: EmbeddingConfig,
+  existingPairKeys: ReadonlySet<string>,
+  newEntityTitles?: ReadonlySet<string>,
+  threshold = 0.82,
+): Promise<Array<{ a: IdentityEntry; b: IdentityEntry; reasons: string[] }>> {
+  if (!embeddingConfig.enabled || !embeddingConfig.model) return []
+
+  console.log(`[identity-pass/R5] Embedding ${catalog.length} entities for vector similarity…`)
+
+  // Build embed text: title + entity_type + summary
+  const embedTexts = catalog.map(e =>
+    [e.title, e.entityType, e.summary].filter(Boolean).join("\n")
+  )
+
+  // Fetch embeddings concurrently in batches of 8 to avoid API rate limits
+  const EMBED_CONCURRENCY = 8
+  const embeddings: (number[] | null)[] = new Array(catalog.length).fill(null)
+  for (let i = 0; i < embedTexts.length; i += EMBED_CONCURRENCY) {
+    const batch = embedTexts.slice(i, i + EMBED_CONCURRENCY)
+    const results = await Promise.all(batch.map(t => fetchEmbedding(t, embeddingConfig)))
+    results.forEach((emb, j) => { embeddings[i + j] = emb })
+  }
+
+  const indexed = embeddings.filter(Boolean).length
+  console.log(`[identity-pass/R5] Indexed ${indexed}/${catalog.length} entities`)
+  if (indexed === 0) return []
+
+  // Build set of new entity indices
+  const newIndices = newEntityTitles && newEntityTitles.size > 0
+    ? new Set(catalog.map((e, i) => newEntityTitles.has(e.title) ? i : -1).filter(i => i >= 0))
+    : null
+
+  const pairs: Array<{ a: IdentityEntry; b: IdentityEntry; reasons: string[] }> = []
+  const seen = new Set<string>()
+
+  for (let i = 0; i < catalog.length; i++) {
+    if (!embeddings[i]) continue
+    for (let j = i + 1; j < catalog.length; j++) {
+      if (!embeddings[j]) continue
+      // Incremental: at least one entity must be new
+      if (newIndices && !newIndices.has(i) && !newIndices.has(j)) continue
+      // Skip sibling discriminator conflicts
+      if (hasSiblingDiscriminators(catalog[i].title, catalog[j].title)) continue
+
+      const sim = cosineSimilarity(embeddings[i]!, embeddings[j]!)
+      if (sim < threshold) continue
+
+      const key = [catalog[i].title, catalog[j].title].sort().join("|||")
+      // Skip if rule-based pass already has this pair
+      if (existingPairKeys.has(key) || seen.has(key)) continue
+
+      seen.add(key)
+      pairs.push({
+        a: catalog[i],
+        b: catalog[j],
+        reasons: [`R5:vector_similarity(${sim.toFixed(3)})`],
+      })
+    }
+  }
+
+  console.log(`[identity-pass/R5] Found ${pairs.length} vector candidates (threshold=${threshold})`)
   return pairs
 }
 
@@ -652,8 +746,29 @@ export async function runIdentityPass(
     return { catalogSize: catalog.length, candidatePairs: 0, llmCallCount: 0, merged: 0, aliasEdges: 0, siblingEdges: 0, parentChildEdges: 0, discarded: 0, errors }
   }
 
-  // Phase 2
+  // Phase 2a: Rule-based candidates (R1–R4)
   const pairs = generateIdentityCandidates(catalog, options?.newEntityTitles)
+
+  // Phase 2b: Vector similarity candidates (R5) — only when embedding is configured
+  if (options?.embeddingConfig?.enabled && options.embeddingConfig.model) {
+    const rulePairKeys = new Set(pairs.map(p => [p.a.title, p.b.title].sort().join("|||")))
+    const vectorThreshold = options.vectorThreshold ?? 0.82
+    try {
+      const vectorPairs = await generateVectorCandidates(
+        catalog,
+        options.embeddingConfig,
+        rulePairKeys,
+        options.newEntityTitles,
+        vectorThreshold,
+      )
+      pairs.push(...vectorPairs)
+    } catch (err) {
+      const msg = `R5 vector candidates failed: ${err instanceof Error ? err.message : String(err)}`
+      console.warn(`[identity-pass] ${msg}`)
+      errors.push(msg)
+    }
+  }
+
   if (pairs.length === 0) {
     return { catalogSize: catalog.length, candidatePairs: 0, llmCallCount: 0, merged: 0, aliasEdges: 0, siblingEdges: 0, parentChildEdges: 0, discarded: 0, errors }
   }

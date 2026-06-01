@@ -1,6 +1,6 @@
 import { createDirectory, readFile, writeFile, listDirectory, readFileAsBase64 } from "@/commands/fs"
 import { streamChat } from "@/lib/llm-client"
-import type { LlmConfig } from "@/stores/wiki-store"
+import type { LlmConfig, EmbeddingConfig } from "@/stores/wiki-store"
 import { useWikiStore } from "@/stores/wiki-store"
 import { useChatStore } from "@/stores/chat-store"
 import { useActivityStore } from "@/stores/activity-store"
@@ -2779,7 +2779,11 @@ async function autoIngestImpl(
             if (stem) newEntityTitles.add(stem)
           }
         }
-        const idResult = await runIdentityPass(pp, llmConfig, signal, { newEntityTitles })
+        const embeddingConfig: EmbeddingConfig = useWikiStore.getState().embeddingConfig
+        const idResult = await runIdentityPass(pp, llmConfig, signal, {
+          newEntityTitles,
+          embeddingConfig: embeddingConfig.enabled ? embeddingConfig : undefined,
+        })
         if (idResult.merged > 0 || idResult.aliasEdges > 0 || idResult.siblingEdges > 0 || idResult.errors.length > 0) {
           console.log(`[ingest] Identity pass: catalog=${idResult.catalogSize} pairs=${idResult.candidatePairs} merged=${idResult.merged} alias=${idResult.aliasEdges} sibling=${idResult.siblingEdges} parent_child=${idResult.parentChildEdges}`)
         }
