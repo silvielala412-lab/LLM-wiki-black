@@ -159,6 +159,8 @@ export async function buildIdentityCatalog(
       const filePath = `${dir}/${file.name}`
       try {
         const content = await readFile(filePath)
+        // Skip pages already merged into a canonical entity
+        if (/^redirect_to:\s*".+"/m.test(content)) continue
         const entry = parseIdentityEntry(content, filePath)
         if (entry) catalog.push(entry)
       } catch { /* skip unreadable */ }

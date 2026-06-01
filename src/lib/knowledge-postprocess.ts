@@ -928,6 +928,9 @@ async function buildPageIndex(projectPath: string): Promise<PageIndex[]> {
         const content = await readFile(`${dir}/${file.name}`)
         const title = extractScalar(content, "title")
         if (!title) continue
+        // Skip pages merged into a canonical entity — they must not appear as
+        // valid relation targets or in the entity listing
+        if (extractScalar(content, "redirect_to")) continue
         const relativePath = dir.replace(projectPath + "/", "") + "/" + file.name
         index.push({
           title,

@@ -92,6 +92,12 @@ export async function buildKnowledgeRelationIndex(projectPath: string): Promise<
     }
 
     const parsed = parseMarkdownFrontmatter(content)
+
+    // Skip pages that have been merged into a canonical entity (redirect_to: marker).
+    // These are absorbed duplicates — they should not appear in the graph or be
+    // resolved as relation targets until the duplicate file is eventually deleted.
+    if (frontmatterString(parsed.frontmatter, "redirect_to")) continue
+
     const entityType = normalizeEntityType(frontmatterString(parsed.frontmatter, "entity_type"))
     const domain = normalizeDomain(
       frontmatterString(parsed.frontmatter, "knowledge_domain") ||
