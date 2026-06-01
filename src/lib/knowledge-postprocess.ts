@@ -156,8 +156,15 @@ export async function runKnowledgePostProcess(projectPath: string): Promise<Post
       try {
         const original = await readFile(filePath)
 
+        // Step -1: Sanitize colon-suffix malformed titles (deterministic, no comparison needed).
+        // Handles patterns like "X：属于Y" → title="X", service_category="Y"
+        //                       "X：需客户Y" → title="X", compliance_notes="需客户Y"
+        //                       "X:" → title="X"  (trailing colon stripped)
+        const [csContent, , csWarnings] = sanitizeColonSuffix(original, file.name)
+        lintWarnings.push(...csWarnings)
+
         // Step 0: Normalize the page title (strip HTML, OCR errors, suffix noise)
-        let updated = normalizeFrontmatterTitle(original, file.name)
+        let updated = normalizeFrontmatterTitle(csContent, file.name)
         if (updated !== original) titlesNormalized++
 
         // First pass: normalize domain/format
@@ -408,6 +415,79 @@ function removeRelationCandidatesFromAttrs(content: string, attrs: Record<string
   return content.replace(/^(attributes:\s*).+$/m, `$1${attrsStr}`)
 }
 
+
+// ─── Title Colon-Suffix Sanitization ────────────────────────────────────────
+// Detects and splits malformed entity titles where the LLM embedded attribute
+// metadata into the title using colon separators (full-width ： or half-width :).
+// Applied once per entity, per ingest, as a schema enforcement rule.
+//
+// Examples handled:
+//   "名医大咖：需客户另行付费使用"  → title="名医大咖",  compliance_notes="需客户另行付费使用"
+//   "門診預約協助：属于疾病全程管理服务" → title="門診預約協助", service_category="疾病全程管理服务"
+//   "数字化管理:"                  → title="数字化管理"  (trailing colon stripped)
+
+interface ColonSuffixRule {
+  /** Pattern: group 1 = base title, group 2 = extracted content */
+  pattern: RegExp
+  /** Attribute field to receive the extracted value */
+  field: string
+  /** Static prefix to prepend when writing the attribute value */
+  prefix?: string
+}
+
+const COLON_SUFFIX_RULES: ColonSuffixRule[] = [
+  // Classification metadata — "X 属于 Y 类服务"
+  { pattern: /^(.+?)[\uff1a:]\s*属于(.+)$/,  field: "service_category" },
+  // Customer-cost notes — "X 需客户另行付费 / 自费"
+  { pattern: /^(.+?)[\uff1a:]\s*需客户(.+)$/, field: "compliance_notes", prefix: "需客户" },
+  // Device/equipment notes
+  { pattern: /^(.+?)[\uff1a:]\s*智能设备(.*)$/, field: "compliance_notes", prefix: "智能设备" },
+]
+
+function sanitizeColonSuffix(content: string, fileName: string): [string, boolean, string[]] {
+  const warnings: string[] = []
+  const titleMatch = content.match(/^(title:\s*)([^\n]+)(\n)/m)
+  if (!titleMatch) return [content, false, warnings]
+
+  const rawTitle = titleMatch[2].replace(/^"|"$/g, "").trim()
+
+  // Case 1: Trailing colon with no content (e.g. "数字化管理:" or "数字化管理：")
+  const trailingColon = rawTitle.match(/^(.+?)[\uff1a:]\s*$/)
+  if (trailingColon) {
+    const cleanTitle = trailingColon[1].trim()
+    const updated = content.replace(/^(title:\s*)([^\n]+)(\n)/m, `${titleMatch[1]}${cleanTitle}${titleMatch[3]}`)
+    warnings.push(`${fileName}: colon-suffix: stripped trailing colon: "${rawTitle}" → "${cleanTitle}"`)
+    return [updated, true, warnings]
+  }
+
+  // Case 2: Semantic colon-suffix patterns
+  for (const rule of COLON_SUFFIX_RULES) {
+    const m = rawTitle.match(rule.pattern)
+    if (!m) continue
+    const cleanTitle = m[1].trim()
+    const extractedVal = (rule.prefix ?? "") + m[2].trim()
+
+    // Update title
+    let updated = content.replace(/^(title:\s*)([^\n]+)(\n)/m, `${titleMatch[1]}${cleanTitle}${titleMatch[3]}`)
+
+    // Inject into attributes (fill-null only — never overwrite existing non-null data)
+    const attrsMatch = updated.match(/^attributes:\s*(\{[^\n]*\})\s*$/m)
+    if (attrsMatch) {
+      try {
+        const attrs = JSON.parse(attrsMatch[1]) as Record<string, unknown>
+        if (!attrs[rule.field] || attrs[rule.field] === null) {
+          attrs[rule.field] = extractedVal
+          updated = updated.replace(/^attributes:\s*\{[^\n]*\}\s*$/m, `attributes: ${JSON.stringify(attrs)}`)
+        }
+      } catch { /* ignore — materializeAttributes will repair on next pass */ }
+    }
+
+    warnings.push(`${fileName}: colon-suffix: title="${cleanTitle}", ${rule.field}="${extractedVal}"`)
+    return [updated, true, warnings]
+  }
+
+  return [content, false, warnings]
+}
 
 function normalizeFrontmatterTitle(content: string, fileName: string): string {
   const titleMatch = content.match(/^(title:\s*)([^\n]+)(\n)/m)

@@ -75,6 +75,21 @@ export interface IdentityPassResult {
   parentChildEdges: number
   discarded: number
   errors: string[]
+  /** Structured audit log: one entry per acted-on candidate pair. */
+  auditLog: IdentityAuditEntry[]
+}
+
+/** Structured audit entry for one identity judgment action. */
+export interface IdentityAuditEntry {
+  entity_a: string
+  entity_b: string
+  source: string          // e.g. "R1:dedup_key", "R5:vector_similarity"
+  similarity?: number
+  llm_verdict: IdentityVerdict
+  confidence: number
+  action: string          // e.g. "merge_fields", "write_alias_edge", "discarded"
+  fields_merged?: string[]
+  conflicts?: string[]
 }
 
 export interface IdentityPassOptions {
@@ -543,6 +558,7 @@ interface ApplyResult {
   parentChildEdges: number
   discarded: number
   errors: string[]
+  auditLog: IdentityAuditEntry[]
 }
 
 async function applyIdentityJudgments(
@@ -552,15 +568,17 @@ async function applyIdentityJudgments(
 ): Promise<ApplyResult> {
   let merged = 0, aliasEdges = 0, siblingEdges = 0, parentChildEdges = 0, discarded = 0
   const errors: string[] = []
+  const auditLog: IdentityAuditEntry[] = []
 
   for (const j of judgments) {
     if (j.confidence < DISCARD_THRESHOLD || j.verdict === "distinct") {
       discarded++
+      auditLog.push({ entity_a: j.title_a, entity_b: j.title_b, source: "llm", llm_verdict: j.verdict, confidence: j.confidence, action: "discarded" })
       continue
     }
     if (j.confidence < writeThreshold) {
-      // Below write threshold — skip (future: ReviewStore)
       discarded++
+      auditLog.push({ entity_a: j.title_a, entity_b: j.title_b, source: "llm", llm_verdict: j.verdict, confidence: j.confidence, action: "below_threshold" })
       continue
     }
 
@@ -574,26 +592,41 @@ async function applyIdentityJudgments(
     try {
       switch (j.verdict) {
         case "same_entity": {
-          // Write a merge marker to A's page (postprocess will dedup on next ingest).
-          // We do NOT delete B here — that is a destructive operation requiring human review.
-          // Instead, we write an alias_of edge so the graph connects them, and add a
-          // merge_suggestion comment in A's frontmatter for human audit.
-          await writeMergeSuggestion(entA, entB, j)
-          // Also write alias edge so RAG can traverse
-          await writeIdentityEdge(entA, "alias_of", entB.title, j, "identity_inferred")
+          // Determine canonical entity: prefer whichever has more source_files;
+          // fall back to lexicographic order for stability.
+          const primary   = entA.sourceFiles.length >= entB.sourceFiles.length ? entA : entB
+          const duplicate = primary === entA ? entB : entA
+
+          const { fieldsMerged, conflicts, mergeErrors } = await mergeEntityFields(primary, duplicate, j)
+          errors.push(...mergeErrors)
+
+          // Also write the alias edge so RAG can traverse during transition period
+          await writeIdentityEdge(primary, "alias_of", duplicate.title, j, "identity_inferred")
+
+          auditLog.push({
+            entity_a: primary.title,
+            entity_b: duplicate.title,
+            source: "llm",
+            llm_verdict: "same_entity",
+            confidence: j.confidence,
+            action: "merge_fields",
+            fields_merged: fieldsMerged,
+            conflicts: conflicts.length > 0 ? conflicts : undefined,
+          })
           merged++
           break
         }
         case "alias_of": {
-          // Bidirectional alias edges
           await writeIdentityEdge(entA, "alias_of", entB.title, j, "identity_inferred")
           await writeIdentityEdge(entB, "alias_of", entA.title, j, "identity_inferred")
+          auditLog.push({ entity_a: entA.title, entity_b: entB.title, source: "llm", llm_verdict: "alias_of", confidence: j.confidence, action: "write_alias_edge" })
           aliasEdges++
           break
         }
         case "sibling_of": {
           await writeIdentityEdge(entA, "sibling_of", entB.title, j, "identity_inferred")
           await writeIdentityEdge(entB, "sibling_of", entA.title, j, "identity_inferred")
+          auditLog.push({ entity_a: entA.title, entity_b: entB.title, source: "llm", llm_verdict: "sibling_of", confidence: j.confidence, action: "write_sibling_edge" })
           siblingEdges++
           break
         }
@@ -602,6 +635,7 @@ async function applyIdentityJudgments(
           const child  = j.direction === "b_is_parent" ? entA : entB
           await writeIdentityEdge(parent, "has_part", child.title, j, "identity_inferred")
           await writeIdentityEdge(child,  "part_of", parent.title, j, "identity_inferred")
+          auditLog.push({ entity_a: parent.title, entity_b: child.title, source: "llm", llm_verdict: "parent_child", confidence: j.confidence, action: "write_parent_child_edge" })
           parentChildEdges++
           break
         }
@@ -611,7 +645,7 @@ async function applyIdentityJudgments(
     }
   }
 
-  return { merged, aliasEdges, siblingEdges, parentChildEdges, discarded, errors }
+  return { merged, aliasEdges, siblingEdges, parentChildEdges, discarded, errors, auditLog }
 }
 
 // ─── Edge Writers ─────────────────────────────────────────────────────────────
@@ -696,6 +730,167 @@ async function writeMergeSuggestion(
   const newFm = fm.trimEnd() + "\n" + annotation
   const updated = content.replace(fmMatch[0], open + newFm + close)
   if (updated !== content) await writeFile(primary.filePath, updated)
+}
+
+// ─── Real Field-Level Entity Merge ────────────────────────────────────────────────
+//
+// Merge strategy per field category:
+//   source_files  — union (append + dedup all file references)
+//   claims        — append all from duplicate (multi-source evidence is additive)
+//   attributes.*  — fill-null only (never overwrite existing non-null primary data)
+//   confidence    — keep max of both
+//
+// Fields that would conflict (both non-null, semantically different) are logged
+// as conflicts for human review. They are NOT auto-overwritten.
+//
+// The duplicate page receives a redirect_to: marker so the system knows it has
+// been absorbed. It is NOT deleted (human audit trail).
+
+async function mergeEntityFields(
+  primary: IdentityEntry,
+  duplicate: IdentityEntry,
+  j: IdentityJudgment,
+): Promise<{ fieldsMerged: string[]; conflicts: string[]; mergeErrors: string[] }> {
+  const fieldsMerged: string[] = []
+  const conflicts: string[] = []
+  const mergeErrors: string[] = []
+
+  let primaryContent: string
+  let dupContent: string
+  try {
+    primaryContent = await readFile(primary.filePath)
+    dupContent     = await readFile(duplicate.filePath)
+  } catch (err) {
+    mergeErrors.push(`mergeEntityFields: readFile failed: ${String(err)}`)
+    return { fieldsMerged, conflicts, mergeErrors }
+  }
+
+  let updated = primaryContent
+
+  // ── 1. Merge source_files (union + dedup) ───────────────────────────
+  const dupSfMatch = dupContent.match(/^source_files:\s*\[([^\]]*)\]/m)
+  const dupSourceFiles = dupSfMatch
+    ? dupSfMatch[1].split(",").map(s => s.trim().replace(/^"|"$/g, "")).filter(Boolean)
+    : []
+  if (dupSourceFiles.length > 0) {
+    const primSfMatch = updated.match(/^source_files:\s*\[([^\]]*)\]/m)
+    const primSourceFiles = primSfMatch
+      ? primSfMatch[1].split(",").map(s => s.trim().replace(/^"|"$/g, "")).filter(Boolean)
+      : []
+    const unionFiles = [...new Set([...primSourceFiles, ...dupSourceFiles])]
+    const newSfLine = `source_files: [${unionFiles.map(f => `"${f}"`).join(", ")}]`
+    if (primSfMatch) {
+      updated = updated.replace(/^source_files:\s*\[[^\]]*\]/m, newSfLine)
+    } else {
+      // Insert before closing ---
+      updated = updated.replace(/(\n---\s*)$/, `\n${newSfLine}$1`)
+    }
+    fieldsMerged.push(`source_files (+${dupSourceFiles.length})`)
+  }
+
+  // ── 2. Merge claims (append new, dedup by trimmed text) ───────────────
+  const dupClaims = extractFrontmatterList(dupContent, "claims")
+  if (dupClaims.length > 0) {
+    const primClaimsSet = new Set(extractFrontmatterList(updated, "claims").map(c => c.trim()))
+    const newClaims = dupClaims.filter(c => !primClaimsSet.has(c.trim()))
+    if (newClaims.length > 0) {
+      const newLines = newClaims.map(c => `  - "${c.replace(/"/g, "'")}"`).join("\n")
+      const claimsBlockRe = /^(claims:\s*\n(?:\s+-\s+.+\n?)*)/m
+      if (claimsBlockRe.test(updated)) {
+        updated = updated.replace(claimsBlockRe, m => m.trimEnd() + "\n" + newLines + "\n")
+      } else if (/^claims:\s*\[\]/m.test(updated)) {
+        updated = updated.replace(/^claims:\s*\[\]/m, `claims:\n${newLines}`)
+      } else {
+        updated = updated.replace(/(\n---\s*)$/, `\nclaims:\n${newLines}$1`)
+      }
+      fieldsMerged.push(`claims (+${newClaims.length})`)
+    }
+  }
+
+  // ── 3. Merge attributes: fill-null only ────────────────────────────
+  const primAttrMatch = updated.match(/^attributes:\s*(\{[^\n]*\})\s*$/m)
+  const dupAttrMatch  = dupContent.match(/^attributes:\s*(\{[^\n]*\})\s*$/m)
+  if (primAttrMatch && dupAttrMatch) {
+    try {
+      const primAttrs = JSON.parse(primAttrMatch[1]) as Record<string, unknown>
+      const dupAttrs  = JSON.parse(dupAttrMatch[1])  as Record<string, unknown>
+      let attrChanged = false
+
+      for (const [key, dupVal] of Object.entries(dupAttrs)) {
+        if (key === "knowledge_gaps" || key === "extra_attributes") continue
+        if (dupVal === null || dupVal === undefined) continue
+        const primVal = primAttrs[key]
+        if (primVal === null || primVal === undefined) {
+          primAttrs[key] = dupVal
+          attrChanged = true
+          fieldsMerged.push(`attributes.${key}`)
+        } else if (JSON.stringify(primVal) !== JSON.stringify(dupVal)) {
+          // Both non-null and different — log for human review, never auto-overwrite
+          conflicts.push(`${key}: primary="${primVal}" vs duplicate="${dupVal}"`)
+        }
+      }
+
+      if (attrChanged) {
+        updated = updated.replace(/^attributes:\s*\{[^\n]*\}\s*$/m, `attributes: ${JSON.stringify(primAttrs)}`)
+      }
+      if (conflicts.length > 0) {
+        // Write a comment into primary frontmatter so human reviewer can see conflicts
+        const conflictNote = `# MERGE_CONFLICT: ${conflicts.slice(0, 3).join(" | ")}`.replace(/\n/g, " ")
+        const fmMatch = updated.match(/^(---\r?\n)([\s\S]*?)(\r?\n---)/m)
+        if (fmMatch && !updated.includes("MERGE_CONFLICT:")) {
+          const [, open, fm, close] = fmMatch
+          updated = updated.replace(fmMatch[0], `${open}${fm.trimEnd()}\n${conflictNote}${close}`)
+        }
+      }
+    } catch (err) {
+      mergeErrors.push(`attributes merge parse error: ${String(err)}`)
+    }
+  }
+
+  // ── 4. Confidence: keep max ───────────────────────────────────
+  const primConf = parseFloat(updated.match(/^confidence:\s*([\d.]+)/m)?.[1] ?? "0.75")
+  const dupConf  = parseFloat(dupContent.match(/^confidence:\s*([\d.]+)/m)?.[1] ?? "0.75")
+  if (dupConf > primConf) {
+    updated = updated.replace(/^(confidence:\s*)[\d.]+/m, `$1${dupConf.toFixed(2)}`)
+    fieldsMerged.push(`confidence (${primConf.toFixed(2)}→${dupConf.toFixed(2)})`)
+  }
+
+  // ── 5. Write merged primary ───────────────────────────────────
+  if (updated !== primaryContent) {
+    try { await writeFile(primary.filePath, updated) }
+    catch (err) { mergeErrors.push(`writeFile primary failed: ${String(err)}`) }
+  }
+
+  // ── 6. Mark duplicate as redirect (do NOT delete — keep audit trail) ───
+  const fmMatch = dupContent.match(/^(---\r?\n)([\s\S]*?)(\r?\n---)/m)
+  if (fmMatch && !dupContent.includes("redirect_to:")) {
+    const [, open, fm, close] = fmMatch
+    const redirectNote = [
+      `redirect_to: "${primary.title}"`,
+      `# IDENTITY_PASS: merged into "${primary.title}" on ${new Date().toISOString().slice(0, 10)}`,
+      `#   confidence: ${j.confidence.toFixed(2)} | reason: ${j.reason.replace(/"/g, "'").slice(0, 120)}`,
+    ].join("\n")
+    const newDupContent = dupContent.replace(fmMatch[0], `${open}${fm.trimEnd()}\n${redirectNote}${close}`)
+    try { await writeFile(duplicate.filePath, newDupContent) }
+    catch (err) { mergeErrors.push(`writeFile duplicate failed: ${String(err)}`) }
+  }
+
+  return { fieldsMerged, conflicts, mergeErrors }
+}
+
+/** Extract a YAML list from frontmatter (handles both inline [] and block list formats). */
+function extractFrontmatterList(content: string, key: string): string[] {
+  const fm = content.match(/^---\r?\n([\s\S]*?)\r?\n---/m)?.[1] ?? ""
+  const escKey = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+  // Inline: key: ["a", "b"]
+  const inline = fm.match(new RegExp(`^${escKey}:\\s*\\[([^\\]]*)\\]`, "m"))
+  if (inline) return inline[1].split(",").map(s => s.trim().replace(/^"|"$/g, "")).filter(Boolean)
+  // Block list: key:\n  - item
+  const block = fm.match(new RegExp(`^${escKey}:\\s*\\n((?:\\s+-\\s+.+\\n?)*)`, "m"))
+  if (!block) return []
+  return block[1].split(/\r?\n/)
+    .map(l => l.match(/^\s+-\s+"?([^"\n]+?)"?\s*$/)?.[1]?.trim() ?? "")
+    .filter(Boolean)
 }
 
 function hasIdentityEdge(content: string, relType: string, target: string): boolean {
@@ -784,7 +979,7 @@ export async function runIdentityPass(
 
   // Phase 4
   const catalogMap = new Map(catalog.map(e => [e.title, e]))
-  const { merged, aliasEdges, siblingEdges, parentChildEdges, discarded, errors: applyErrors } =
+  const { merged, aliasEdges, siblingEdges, parentChildEdges, discarded, errors: applyErrors, auditLog } =
     await applyIdentityJudgments(judgments, catalogMap, threshold)
   errors.push(...applyErrors)
 
@@ -792,8 +987,13 @@ export async function runIdentityPass(
     `[identity-pass] catalog=${catalog.length} pairs=${pairs.length} calls=${llmCallCount}` +
     ` merged=${merged} alias=${aliasEdges} sibling=${siblingEdges} parent_child=${parentChildEdges} discarded=${discarded}`,
   )
+  if (auditLog.length > 0) {
+    console.log("[identity-pass] audit:\n" + auditLog.map(e =>
+      `  ${e.entity_a} ↔ ${e.entity_b} → ${e.action} (${e.llm_verdict} conf=${e.confidence.toFixed(2)})`
+    ).join("\n"))
+  }
 
-  return { catalogSize: catalog.length, candidatePairs: pairs.length, llmCallCount, merged, aliasEdges, siblingEdges, parentChildEdges, discarded, errors }
+  return { catalogSize: catalog.length, candidatePairs: pairs.length, llmCallCount, merged, aliasEdges, siblingEdges, parentChildEdges, discarded, errors, auditLog }
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
