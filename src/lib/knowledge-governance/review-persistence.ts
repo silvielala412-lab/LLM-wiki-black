@@ -29,7 +29,19 @@ export async function loadReviewQueue(projectPath: string): Promise<ReviewItem[]
 // ── Write ────────────────────────────────────────────────────────────────────
 
 async function saveReviewQueue(projectPath: string, items: ReviewItem[]): Promise<void> {
-  await writeFile(queuePath(projectPath), JSON.stringify(items, null, 2))
+  // Guard: filter items that fail serialization before touching the file.
+  const safeItems = items.filter(item => {
+    try { JSON.stringify(item); return true } catch { return false }
+  })
+  let json: string
+  try {
+    json = JSON.stringify(safeItems, null, 2)
+    JSON.parse(json) // round-trip validate
+  } catch (err) {
+    console.error("[review-persistence] saveReviewQueue: JSON validation failed, aborting write:", err)
+    return
+  }
+  await writeFile(queuePath(projectPath), json)
 }
 
 /** Append a new ReviewItem. Silently deduplicates by newPagePath. */

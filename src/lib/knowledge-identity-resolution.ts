@@ -825,8 +825,46 @@ async function mergeEntityFields(
       fieldsMerged.push(`claims (+${newClaims.length})`)
     }
   }
+  // ── 2b. Merge relation_edges (append edges from dup not already in primary) ──
+  // Parse the relation_edges YAML block from both files.
+  // Each edge is an object starting with "- target:"; we keep the whole entry block.
+  {
+    const dupEdgesBlock  = dupContent.match(/^relation_edges:[ \t]*\n((?:[ \t]+[\s\S]*?)(?=\n\S|\n*$))/m)?.[1] ?? ""
+    const primEdgesBlock = updated.match(/^relation_edges:[ \t]*\n((?:[ \t]+[\s\S]*?)(?=\n\S|\n*$))/m)?.[1] ?? ""
 
-  // ── 3. Merge attributes: schema-driven field-level policy ─────────────────
+    if (dupEdgesBlock.trim()) {
+      // Extract unique targets already in primary
+      const primTargets = new Set<string>()
+      for (const m of primEdgesBlock.matchAll(/^[ \t]+-?[ \t]*target:[ \t]*"?([^"\r\n]+)"?/gm)) {
+        primTargets.add(m[1].trim())
+      }
+
+      // Split dup block into individual edge entries (each starts with "  - target:" or "  -")
+      const dupEdges = dupEdgesBlock.split(/(?=[ \t]+-[ \t]*\n?[ \t]*target:)/m).filter(e => e.trim())
+      const newEdges: string[] = []
+      for (const edge of dupEdges) {
+        const targetMatch = edge.match(/target:[ \t]*"?([^"\r\n]+)"?/)
+        if (!targetMatch) continue
+        const target = targetMatch[1].trim()
+        if (!primTargets.has(target)) {
+          newEdges.push(edge.trimEnd())
+          primTargets.add(target)
+        }
+      }
+
+      if (newEdges.length > 0) {
+        const appendBlock = newEdges.join("\n") + "\n"
+        const edgesBlockRe = /^(relation_edges:[ \t]*\n(?:[ \t]+[\s\S]*?)(?=\n\S|\n*$))/m
+        if (edgesBlockRe.test(updated)) {
+          updated = updated.replace(edgesBlockRe, m => m.trimEnd() + "\n" + appendBlock)
+        } else {
+          updated = updated.replace(/(\n---\s*)$/, `\nrelation_edges:\n${appendBlock}$1`)
+        }
+        fieldsMerged.push(`relation_edges (+${newEdges.length})`)
+      }
+    }
+  }
+
   //
   //  Policy lookup:
   //    compliance_notes / knowledge_gaps  → append   (always multi-source)
@@ -1061,10 +1099,11 @@ export async function runIdentityPass(
     return { catalogSize: catalog.length, candidatePairs: pairs.length, llmCallCount: 0, merged: 0, aliasEdges: 0, siblingEdges: 0, parentChildEdges: 0, discarded: 0, errors, auditLog: [] }
   }
 
-  // Phase 2.5: Deterministic merge — same-dedup-key pairs skip LLM entirely.
-  // Confidence = 1.0: identical dedup_key is a schema-level fact, not a probabilistic signal.
-  const deterministicPairs = pairs.filter(p => p.reasons.length === 1 && p.reasons[0] === "R1:same_dedup_key")
-  const ambiguousPairs    = pairs.filter(p => !(p.reasons.length === 1 && p.reasons[0] === "R1:same_dedup_key"))
+  // Phase 2.5: Deterministic merge — any pair that hit R1 (same dedup_key) skips LLM.
+  // Use .includes() not length===1, because the same pair can also match R2/R3/R4;
+  // the R1 signal is sufficient regardless of other corroborating reasons.
+  const deterministicPairs = pairs.filter(p => p.reasons.includes("R1:same_dedup_key"))
+  const ambiguousPairs    = pairs.filter(p => !p.reasons.includes("R1:same_dedup_key"))
 
   const deterministicJudgments: IdentityJudgment[] = deterministicPairs.map(p => ({
     title_a: p.a.title,
@@ -1104,8 +1143,10 @@ export async function runIdentityPass(
     // Persist auditLog to disk so it survives process restart.
     // Written to wiki/.identity-audit/{timestamp}.json — non-critical, never throws.
     try {
+      const { createDirectory } = await import("@/commands/fs")
       const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19)
       const auditDir = `${projectPath}/wiki/.identity-audit`
+      await createDirectory(auditDir).catch(() => {}) // ensure dir exists
       await writeFile(`${auditDir}/${timestamp}.json`, JSON.stringify(auditLog, null, 2))
     } catch { /* non-critical — do not fail the ingest */ }
   }

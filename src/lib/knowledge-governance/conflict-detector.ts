@@ -69,8 +69,14 @@ function frontmatterScalar(content: string, key: string): string {
 }
 
 function isSourceTypedContent(content: string): boolean {
-  return frontmatterScalar(content, "type") === "source" ||
-    frontmatterScalar(content, "entity_type") === "source"
+  const et = frontmatterScalar(content, "entity_type")
+  const tp = frontmatterScalar(content, "type")
+  // Skip source documents, audit reports, query pages, and already-merged entities
+  if (["source", "audit_report", "source_summary", "query", "audit", "report"].includes(et)) return true
+  if (["source", "query"].includes(tp)) return true
+  // Skip pages already absorbed by Identity Pass (redirect_to marker)
+  if (/^redirect_to:\s*".+"/m.test(content)) return true
+  return false
 }
 
 // ── Vector-based detection ───────────────────────────────────────────────────
