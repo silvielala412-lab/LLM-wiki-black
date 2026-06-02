@@ -44,6 +44,8 @@ export interface IdentityEntry {
   serviceScene: string
   serviceStage: string
   sourceFiles: string[]
+  /** Parsed confidence score from frontmatter [0,1]. Default 0.75 if absent. */
+  confidence: number
   filePath: string
   /** Existing relation targets — prevents creating duplicate edges. */
   existingTargets: Set<string>
@@ -224,6 +226,9 @@ function parseIdentityEntry(content: string, filePath: string): IdentityEntry | 
     fallback: filePath,
   })
 
+  // Parse confidence score — default 0.75 if absent
+  const confidence = parseFloat(fm.match(/^confidence:\s*([\d.]+)/m)?.[1] ?? "0.75")
+
   return {
     title,
     canonicalTitle,
@@ -233,6 +238,7 @@ function parseIdentityEntry(content: string, filePath: string): IdentityEntry | 
     serviceScene: String(attrs.service_scene ?? ""),
     serviceStage: String(attrs.service_stage ?? ""),
     sourceFiles,
+    confidence: isNaN(confidence) ? 0.75 : Math.min(1, Math.max(0, confidence)),
     filePath,
     existingTargets,
   }
@@ -868,10 +874,28 @@ async function mergeEntityFields(
           fieldsMerged.push(`attributes.${key} (null→filled)`)
         } else if (JSON.stringify(primVal) !== JSON.stringify(dupVal)) {
           switch (policy) {
-            case "conflict":
-              // Critical/high-confidence field differs — flag for human review
-              conflicts.push(`${key}[${importanceMap.get(key) ?? "?"}]: primary="${String(primVal).slice(0, 60)}" vs dup="${String(dupVal).slice(0, 60)}"`)
+            case "conflict": {
+              // Source Authority resolution: higher-confidence source wins.
+              // Only flag for human review when confidences are too close to call
+              // (gap <= 0.05 — treated as a genuine ambiguity).
+              const AUTHORITY_GAP = 0.05
+              const primConf = primary.confidence
+              const dupConf  = duplicate.confidence
+
+              if (primConf > dupConf + AUTHORITY_GAP) {
+                // Primary has meaningfully higher authority — keep primary silently
+                fieldsMerged.push(`attributes.${key} (authority: primary conf=${primConf.toFixed(2)}>${dupConf.toFixed(2)})`)
+              } else if (dupConf > primConf + AUTHORITY_GAP) {
+                // Duplicate has higher authority — overwrite primary
+                primAttrs[key] = dupVal
+                attrChanged = true
+                fieldsMerged.push(`attributes.${key} (authority: dup overwrite conf=${dupConf.toFixed(2)}>${primConf.toFixed(2)})`)
+              } else {
+                // True tie — cannot auto-resolve, flag for human review
+                conflicts.push(`${key}[${importanceMap.get(key) ?? "?"}] tie(${primConf.toFixed(2)}): primary="${String(primVal).slice(0, 60)}" vs dup="${String(dupVal).slice(0, 60)}"`)
+              }
               break
+            }
             case "keep_best":
               // Auto-derived: take whichever string is longer/more complete
               if (typeof dupVal === "string" && typeof primVal === "string" && dupVal.length > primVal.length) {
