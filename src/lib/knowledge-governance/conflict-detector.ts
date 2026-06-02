@@ -11,6 +11,21 @@
 
 import { readFile } from "@/commands/fs"
 
+// ─── Path segments that are ALWAYS skipped ─────────────────────────────────
+// Add new non-entity wiki subdirectories here — the check runs on
+// both the vector branch and the title-scan branch automatically.
+const SKIP_PATH_SEGMENTS = [
+  "/wiki/audits/",
+  "/wiki/sources/",
+  "/wiki/queries/",
+  "/wiki/.identity-audit/",
+] as const
+
+function isSkippedPath(filePath: string): boolean {
+  const normalized = filePath.replace(/\\/g, "/")
+  return SKIP_PATH_SEGMENTS.some(seg => normalized.includes(seg))
+}
+
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 export interface ConflictCandidate {
@@ -271,6 +286,7 @@ export async function findSimilarByTitle(
       if (SKIP.has(base)) continue
       if (filePath === newPagePath) continue
       if (isSourcePagePath(filePath)) continue
+      if (isSkippedPath(filePath)) continue  // path-based audit/source/query filter
 
       try {
         const content = await readFile(filePath)

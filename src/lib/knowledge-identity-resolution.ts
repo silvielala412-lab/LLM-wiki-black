@@ -33,6 +33,34 @@ import {
 } from "@/lib/insurance-schema-registry"
 import type { FieldMergePolicy } from "@/lib/insurance-schema-registry"
 
+// ─── Module-level field-policy constants ─────────────────────────────────────
+//
+// Centralised here so adding a new internal / append field never requires
+// hunting through the merge logic — just update the relevant Set.
+
+/** Attributes that are internal/debug and must never enter conflict judgments. */
+const SYSTEM_INTERNAL_ATTRS = new Set([
+  "extra_attributes",   // extraction overflow — not a business field
+  "raw_attributes",     // raw extraction residue — not a business field
+  "debug_attributes",   // debug-only — not a business field
+])
+
+/** Attributes that always append across sources (evidence is additive). */
+const APPEND_ATTR_KEYS = new Set([
+  "compliance_notes",
+  "knowledge_gaps",
+])
+
+// ─── Canonical selection score weights ───────────────────────────────────────
+// Driven by INSURANCE_SCHEMA_REGISTRY importance levels — not by field names.
+// Adjust weights here; the algorithm auto-adapts to any entity type.
+const CANONICAL_SCORE_WEIGHTS = {
+  fieldCompleteness: 10, // schema critical+high_confidence fill rate (highest signal)
+  confidence:         5, // source extraction confidence
+  sourceFileCount:    2, // number of source files backing the entity
+  titleLength:        0.1, // tiebreaker: longer name ≈ more complete service name
+} as const
+
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 export interface IdentityEntry {
@@ -46,6 +74,13 @@ export interface IdentityEntry {
   sourceFiles: string[]
   /** Parsed confidence score from frontmatter [0,1]. Default 0.75 if absent. */
   confidence: number
+  /**
+   * Schema-driven field completeness [0,1]: fraction of critical+high_confidence
+   * fields (per INSURANCE_SCHEMA_REGISTRY) that are non-null/non-empty in attrs.
+   * Used as the primary signal for canonical entity selection.
+   * 0 when entity type has no schema spec (safe — still beats on confidence).
+   */
+  fieldCompleteness: number
   filePath: string
   /** Existing relation targets — prevents creating duplicate edges. */
   existingTargets: Set<string>
@@ -243,6 +278,16 @@ function parseIdentityEntry(content: string, filePath: string): IdentityEntry | 
   // Parse confidence score — default 0.75 if absent
   const confidence = parseFloat(fm.match(/^confidence:\s*([\d.]+)/m)?.[1] ?? "0.75")
 
+  // Schema-driven field completeness: fraction of critical+high_confidence fields
+  // that have a non-null, non-empty value in attrs.
+  // Computed from INSURANCE_SCHEMA_REGISTRY — no field names hardcoded here.
+  const schemaSpecForCompleteness = INSURANCE_SCHEMA_REGISTRY.find(s => s.entityType === (entityType || "general"))
+  const importantFieldNames = (schemaSpecForCompleteness?.fields ?? [])
+    .filter(f => f.importance === "critical" || f.importance === "high_confidence")
+    .map(f => f.name)
+  const filledImportant = importantFieldNames.filter(f => attrs[f] != null && String(attrs[f]).trim() !== "").length
+  const fieldCompleteness = importantFieldNames.length > 0 ? filledImportant / importantFieldNames.length : 0
+
   return {
     title,
     canonicalTitle,
@@ -253,6 +298,7 @@ function parseIdentityEntry(content: string, filePath: string): IdentityEntry | 
     serviceStage: String(attrs.service_stage ?? ""),
     sourceFiles,
     confidence: isNaN(confidence) ? 0.75 : Math.min(1, Math.max(0, confidence)),
+    fieldCompleteness,
     filePath,
     existingTargets,
   }
@@ -592,6 +638,8 @@ interface ApplyResult {
   discarded: number
   errors: string[]
   auditLog: IdentityAuditEntry[]
+  /** oldTitle → canonicalTitle for every same_entity merge in this run. */
+  redirectMap: Map<string, string>
 }
 
 async function applyIdentityJudgments(
@@ -602,6 +650,7 @@ async function applyIdentityJudgments(
   let merged = 0, aliasEdges = 0, siblingEdges = 0, parentChildEdges = 0, discarded = 0
   const errors: string[] = []
   const auditLog: IdentityAuditEntry[] = []
+  const redirectMap = new Map<string, string>()
 
   for (const j of judgments) {
     if (j.confidence < DISCARD_THRESHOLD || j.verdict === "distinct") {
@@ -625,9 +674,13 @@ async function applyIdentityJudgments(
     try {
       switch (j.verdict) {
         case "same_entity": {
-          // Determine canonical entity: prefer whichever has more source_files;
-          // fall back to lexicographic order for stability.
-          const primary   = entA.sourceFiles.length >= entB.sourceFiles.length ? entA : entB
+          // Determine canonical entity using a schema-driven score.
+          // See CANONICAL_SCORE_WEIGHTS at top of file for weight rationale.
+          // fieldCompleteness (critical+high_confidence schema fill rate) is the
+          // dominant signal — the more complete entity becomes the canonical primary.
+          const scoreA = canonicalScore(entA)
+          const scoreB = canonicalScore(entB)
+          const primary   = scoreA >= scoreB ? entA : entB
           const duplicate = primary === entA ? entB : entA
 
           const { fieldsMerged, conflicts, mergeErrors } = await mergeEntityFields(primary, duplicate, j)
@@ -646,6 +699,8 @@ async function applyIdentityJudgments(
             fields_merged: fieldsMerged,
             conflicts: conflicts.length > 0 ? conflicts : undefined,
           })
+          // Record this redirect so rewriteRelationTargets can fix dangling edges
+          redirectMap.set(duplicate.title, primary.title)
           merged++
           break
         }
@@ -678,10 +733,179 @@ async function applyIdentityJudgments(
     }
   }
 
-  return { merged, aliasEdges, siblingEdges, parentChildEdges, discarded, errors, auditLog }
+  return { merged, aliasEdges, siblingEdges, parentChildEdges, discarded, errors, auditLog, redirectMap }
 }
 
 // ─── Edge Writers ─────────────────────────────────────────────────────────────
+
+// ─── Relation Rewrite & Dedup (Fix 2) ─────────────────────────────────────────
+//
+// After a same_entity merge, any entity file that had a relation pointing to
+// the old (redirect) title must be updated to point to the canonical title.
+// Additionally, duplicate edges (same source+target+type) are collapsed into
+// one, merging source_files/evidence as evidence grows across multiple ingests.
+
+/** Provenance trust ranking — lower index = higher trust. */
+const PROVENANCE_TRUST_ORDER = [
+  "user_confirmed",
+  "explicit_ingest",
+  "identity_inferred",
+  "field_derived",
+  "wikilink",
+] as const
+type KnownProvenance = (typeof PROVENANCE_TRUST_ORDER)[number]
+
+function provenanceRank(p: string): number {
+  const idx = (PROVENANCE_TRUST_ORDER as readonly string[]).indexOf(p)
+  return idx === -1 ? PROVENANCE_TRUST_ORDER.length : idx
+}
+
+/** Highest-trust provenance from two strings. */
+function bestProvenance(a: string, b: string): string {
+  return provenanceRank(a) <= provenanceRank(b) ? a : b
+}
+
+interface ParsedEdge {
+  target: string
+  type: string
+  confidence: number
+  provenance: string
+  source_files: string[]
+  evidence: string[]
+  raw: string   // original YAML block for the edge
+}
+
+const MAX_EVIDENCE_PER_EDGE = 2
+
+/**
+ * Scan every entity .md under wiki/entities/ (and wiki/concepts/):
+ *   1. Rewrite any relation/relation_edges target that appears in redirectMap.
+ *   2. Deduplicate relation_edges by (sourceCanonical|targetCanonical|relationType),
+ *      merging source_files (union), evidence (top-MAX_EVIDENCE_PER_EDGE),
+ *      confidence (max), provenance (highest-trust).
+ *
+ * This is a pure text-transform pass — no LLM calls.
+ */
+async function rewriteRelationTargets(
+  projectPath: string,
+  redirectMap: Map<string, string>,
+): Promise<{ rewrites: number; errors: string[] }> {
+  if (redirectMap.size === 0) return { rewrites: 0, errors: [] }
+
+  const { normalizePath } = await import("@/lib/path-utils")
+  const pp = normalizePath(projectPath)
+  const dirs = ["entities", "concepts"]
+  let rewrites = 0
+  const errors: string[] = []
+
+  for (const dir of dirs) {
+    let files: string[] = []
+    try {
+      const tree = await listDirectory(`${pp}/wiki/${dir}`)
+      files = (tree as { path: string; is_dir?: boolean }[])
+        .filter(n => !n.is_dir && n.path.endsWith(".md"))
+        .map(n => n.path)
+    } catch { continue }
+
+    for (const filePath of files) {
+      try {
+        const original = await readFile(filePath)
+        // Skip redirected pages — they're no longer active entities
+        if (/^redirect_to:\s*".+"/m.test(original)) continue
+
+        let updated = original
+
+        // ── Step 1: Rewrite old titles to canonical in compact relations list ──
+        // Matches: - "relType: OldTitle" or - relType: OldTitle
+        for (const [oldTitle, canonTitle] of redirectMap.entries()) {
+          const escapedOld = oldTitle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+          updated = updated
+            .replace(
+              new RegExp(`(^\\s+-\\s+"?[a-z_]+:\\s*)${escapedOld}("?)\\s*$`, "gm"),
+              (_, prefix, quote) => `${prefix}${canonTitle}${quote}`,
+            )
+            // relation_edges target: "OldTitle" or target: OldTitle
+            .replace(
+              new RegExp(`(^\\s+target:\\s*"?)${escapedOld}("?)\\s*$`, "gm"),
+              (_, prefix, quote) => `${prefix}${canonTitle}${quote}`,
+            )
+        }
+
+        // ── Step 2: Deduplicate relation_edges by composite key ─────────────
+        const edgeBlockMatch = updated.match(
+          /^(relation_edges:[ \t]*\n)((?:[ \t]+-[ \t][\s\S]*?(?=\n[ \t]+-[ \t]|\nrelation_edges:|\n[a-z_]+:|\n---|\z))*)/m,
+        )
+        if (edgeBlockMatch) {
+          const rawEdgesBlock = edgeBlockMatch[2]
+          // Split into individual edge YAML blobs (each starts with "  - target:")
+          const edgeBlobs = rawEdgesBlock.split(/(?=\n?[ \t]+-[ \t]+target:)/m).filter(Boolean)
+
+          const mergedEdges = new Map<string, ParsedEdge>()
+          for (const blob of edgeBlobs) {
+            const tgt  = blob.match(/target:\s*"?([^"\n]+)"?/m)?.[1]?.trim() ?? ""
+            const type = blob.match(/type:\s*(\S+)/m)?.[1]?.trim() ?? "related"
+            if (!tgt) continue
+
+            const canonTarget = redirectMap.get(tgt) ?? tgt
+            const key = `${filePath}|${canonTarget}|${type}`
+            const conf = parseFloat(blob.match(/confidence:\s*([\d.]+)/m)?.[1] ?? "0.75")
+            const prov = blob.match(/provenance:\s*(\S+)/m)?.[1]?.trim() ?? "field_derived"
+            const sfRaw = blob.match(/source_files:\s*\[([^\]]*)\]/m)?.[1] ?? ""
+            const sf = sfRaw.split(",").map(s => s.trim().replace(/^"|"$/g, "")).filter(Boolean)
+            const ev = blob.match(/evidence:\s*"([^"]+)"/m)?.[1]?.trim() ?? ""
+
+            const existing = mergedEdges.get(key)
+            if (!existing) {
+              mergedEdges.set(key, {
+                target: canonTarget, type, confidence: conf, provenance: prov,
+                source_files: sf, evidence: ev ? [ev] : [], raw: blob,
+              })
+            } else {
+              // Merge: confidence max, provenance highest-trust, union source_files+evidence
+              existing.confidence = Math.max(existing.confidence, conf)
+              existing.provenance = bestProvenance(existing.provenance, prov)
+              for (const s of sf) if (!existing.source_files.includes(s)) existing.source_files.push(s)
+              if (ev && !existing.evidence.includes(ev)) existing.evidence.push(ev)
+              if (existing.evidence.length > MAX_EVIDENCE_PER_EDGE) {
+                existing.evidence = existing.evidence.slice(0, MAX_EVIDENCE_PER_EDGE)
+              }
+            }
+          }
+
+          // Re-serialise deduplicated edges
+          const newEdgesYaml = [...mergedEdges.values()].map(e => [
+            `  - target: "${e.target}"`,
+            `    type: ${e.type}`,
+            `    confidence: ${e.confidence.toFixed(2)}`,
+            `    provenance: ${e.provenance}`,
+            e.source_files.length > 0
+              ? `    source_files: [${e.source_files.map(s => `"${s}"`).join(", ")}]`
+              : `    source_files: []`,
+            e.evidence.length > 0
+              ? `    evidence: "${e.evidence.join(" | ").replace(/"/g, "'").slice(0, 200)}"`
+              : null,
+          ].filter(Boolean).join("\n")).join("\n")
+
+          updated = updated.replace(
+            edgeBlockMatch[0],
+            `${edgeBlockMatch[1]}${newEdgesYaml}\n`,
+          )
+        }
+
+        if (updated !== original) {
+          await writeFile(filePath, updated)
+          rewrites++
+        }
+      } catch (err) {
+        errors.push(`rewriteRelationTargets(${filePath}): ${String(err)}`)
+      }
+    }
+  }
+
+  return { rewrites, errors }
+}
+
+
 
 async function writeIdentityEdge(
   entry: IdentityEntry,
@@ -903,10 +1127,9 @@ async function mergeEntityFields(
       }
 
       function fieldPolicy(key: string): FieldMergePolicy {
-        // These fields always append regardless of entity type
-        if (["compliance_notes", "knowledge_gaps"].includes(key)) return "append"
-        // extra_attributes is a catch-all — skip
-        if (key === "extra_attributes") return "ignore_empty"
+        if (SYSTEM_INTERNAL_ATTRS.has(key)) return "ignore_empty" // internal — skip entirely
+        if (APPEND_ATTR_KEYS.has(key)) return "append"             // evidence always additive
+        if (key === "extra_attributes") return "ignore_empty"      // legacy alias
         const imp = importanceMap.get(key)
         if (!imp) return "ignore_empty"           // unknown field → safe default
         if (imp === "critical" || imp === "high_confidence") return "conflict"
@@ -1141,9 +1364,20 @@ export async function runIdentityPass(
 
   // Phase 4
   const catalogMap = new Map(catalog.map(e => [e.title, e]))
-  const { merged, aliasEdges, siblingEdges, parentChildEdges, discarded, errors: applyErrors, auditLog } =
+  const { merged, aliasEdges, siblingEdges, parentChildEdges, discarded, errors: applyErrors, auditLog, redirectMap } =
     await applyIdentityJudgments(judgments, catalogMap, threshold)
   errors.push(...applyErrors)
+
+  // Phase 4.5: Rewrite relation targets for all merged entities + dedup edges
+  // This ensures no dangling edges point to redirect pages and prevents edge inflation.
+  if (redirectMap.size > 0) {
+    const { rewrites, errors: rewriteErrors } = await rewriteRelationTargets(projectPath, redirectMap)
+    errors.push(...rewriteErrors)
+    if (rewrites > 0) {
+      console.log(`[identity-pass] relation rewrite: ${rewrites} file(s) updated, ${redirectMap.size} redirect(s) applied`)
+    }
+  }
+
 
   console.log(
     `[identity-pass] catalog=${catalog.length} pairs=${pairs.length} (det=${deterministicJudgments.length} llm=${ambiguousPairs.length}) calls=${llmCallCount}` +
@@ -1192,6 +1426,21 @@ export async function runIdentityPass(
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/**
+ * Schema-driven canonical selection score.
+ * Higher score = this entity should be the canonical primary.
+ * Weights are defined in CANONICAL_SCORE_WEIGHTS (top of file).
+ */
+function canonicalScore(entry: IdentityEntry): number {
+  return (
+    entry.fieldCompleteness  * CANONICAL_SCORE_WEIGHTS.fieldCompleteness +
+    entry.confidence          * CANONICAL_SCORE_WEIGHTS.confidence         +
+    entry.sourceFiles.length  * CANONICAL_SCORE_WEIGHTS.sourceFileCount    +
+    entry.canonicalTitle.length * CANONICAL_SCORE_WEIGHTS.titleLength
+  )
+}
+
 
 function scalar(text: string, key: string): string {
   const m = text.match(new RegExp(`^${escRe(key)}:\\s*"?([^"\\n]+)"?\\s*$`, "m"))
