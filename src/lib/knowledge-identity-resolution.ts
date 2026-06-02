@@ -29,7 +29,9 @@ import { fetchEmbedding } from "@/lib/embedding"
 import {
   canonicalServiceIdentityName,
   inferStableInsuranceDedupKey,
+  INSURANCE_SCHEMA_REGISTRY,
 } from "@/lib/insurance-schema-registry"
+import type { FieldMergePolicy } from "@/lib/insurance-schema-registry"
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -818,7 +820,15 @@ async function mergeEntityFields(
     }
   }
 
-  // ── 3. Merge attributes: fill-null only ────────────────────────────
+  // ── 3. Merge attributes: schema-driven field-level policy ─────────────────
+  //
+  //  Policy lookup:
+  //    compliance_notes / knowledge_gaps  → append   (always multi-source)
+  //    importance: critical / high_confidence → conflict  (flag for human review)
+  //    importance: recommended               → ignore_empty (fill-null only)
+  //    importance: auto_derived              → keep_best   (take longer/more-complete)
+  //    unknown field                         → ignore_empty (safe default)
+  //
   const primAttrMatch = updated.match(/^attributes:\s*(\{[^\n]*\})\s*$/m)
   const dupAttrMatch  = dupContent.match(/^attributes:\s*(\{[^\n]*\})\s*$/m)
   if (primAttrMatch && dupAttrMatch) {
@@ -827,17 +837,61 @@ async function mergeEntityFields(
       const dupAttrs  = JSON.parse(dupAttrMatch[1])  as Record<string, unknown>
       let attrChanged = false
 
+      // Build field-importance lookup for this entity type
+      const schemaSpec = INSURANCE_SCHEMA_REGISTRY.find(s => s.entityType === primary.entityType)
+      const importanceMap = new Map<string, string>()
+      for (const field of schemaSpec?.fields ?? []) {
+        importanceMap.set(field.name, field.importance)
+      }
+
+      function fieldPolicy(key: string): FieldMergePolicy {
+        // These fields always append regardless of entity type
+        if (["compliance_notes", "knowledge_gaps"].includes(key)) return "append"
+        // extra_attributes is a catch-all — skip
+        if (key === "extra_attributes") return "ignore_empty"
+        const imp = importanceMap.get(key)
+        if (!imp) return "ignore_empty"           // unknown field → safe default
+        if (imp === "critical" || imp === "high_confidence") return "conflict"
+        if (imp === "auto_derived") return "keep_best"
+        return "ignore_empty"                     // recommended → fill-null only
+      }
+
       for (const [key, dupVal] of Object.entries(dupAttrs)) {
-        if (key === "knowledge_gaps" || key === "extra_attributes") continue
         if (dupVal === null || dupVal === undefined) continue
         const primVal = primAttrs[key]
+        const policy  = fieldPolicy(key)
+
         if (primVal === null || primVal === undefined) {
+          // Always fill null regardless of policy — no existing data to protect
           primAttrs[key] = dupVal
           attrChanged = true
-          fieldsMerged.push(`attributes.${key}`)
+          fieldsMerged.push(`attributes.${key} (null→filled)`)
         } else if (JSON.stringify(primVal) !== JSON.stringify(dupVal)) {
-          // Both non-null and different — log for human review, never auto-overwrite
-          conflicts.push(`${key}: primary="${primVal}" vs duplicate="${dupVal}"`)
+          switch (policy) {
+            case "conflict":
+              // Critical/high-confidence field differs — flag for human review
+              conflicts.push(`${key}[${importanceMap.get(key) ?? "?"}]: primary="${String(primVal).slice(0, 60)}" vs dup="${String(dupVal).slice(0, 60)}"`)
+              break
+            case "keep_best":
+              // Auto-derived: take whichever string is longer/more complete
+              if (typeof dupVal === "string" && typeof primVal === "string" && dupVal.length > primVal.length) {
+                primAttrs[key] = dupVal
+                attrChanged = true
+                fieldsMerged.push(`attributes.${key} (keep_best: dup richer)`)
+              }
+              break
+            case "append":
+              // Multi-source fields: concatenate with separator
+              if (typeof dupVal === "string" && typeof primVal === "string" && !primVal.includes(dupVal)) {
+                primAttrs[key] = `${primVal} | ${dupVal}`
+                attrChanged = true
+                fieldsMerged.push(`attributes.${key} (appended)`)
+              }
+              break
+            case "ignore_empty":
+              // Recommended field — keep primary, don't overwrite
+              break
+          }
         }
       }
 
@@ -845,7 +899,7 @@ async function mergeEntityFields(
         updated = updated.replace(/^attributes:\s*\{[^\n]*\}\s*$/m, `attributes: ${JSON.stringify(primAttrs)}`)
       }
       if (conflicts.length > 0) {
-        // Write a comment into primary frontmatter so human reviewer can see conflicts
+        // Write conflict note into primary frontmatter for human reviewer
         const conflictNote = `# MERGE_CONFLICT: ${conflicts.slice(0, 3).join(" | ")}`.replace(/\n/g, " ")
         const fmMatch = updated.match(/^(---\r?\n)([\s\S]*?)(\r?\n---)/m)
         if (fmMatch && !updated.includes("MERGE_CONFLICT:")) {
