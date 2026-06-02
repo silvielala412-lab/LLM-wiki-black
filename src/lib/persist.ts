@@ -11,14 +11,36 @@ async function ensureDir(projectPath: string): Promise<void> {
 export async function saveReviewItems(projectPath: string, items: ReviewItem[]): Promise<void> {
   const pp = normalizePath(projectPath)
   await ensureDir(pp)
-  await writeFile(`${pp}/.llm-wiki/review.json`, JSON.stringify(items, null, 2))
+
+  // Guard: filter items that fail serialization (circular refs, undefined slots, etc.)
+  const safeItems = items.filter(item => {
+    try { JSON.stringify(item); return true } catch { return false }
+  })
+
+  // Validate the output is round-trip parseable BEFORE touching the file.
+  // If stringify itself throws (shouldn't after filter, but defensive), abort.
+  let json: string
+  try {
+    json = JSON.stringify(safeItems, null, 2)
+    JSON.parse(json) // validate
+  } catch (err) {
+    console.error("[persist] saveReviewItems: JSON validation failed, aborting write:", err)
+    return
+  }
+
+  await writeFile(`${pp}/.llm-wiki/review.json`, json)
 }
 
 export async function loadReviewItems(projectPath: string): Promise<ReviewItem[]> {
   const pp = normalizePath(projectPath)
   try {
     const content = await readFile(`${pp}/.llm-wiki/review.json`)
-    return JSON.parse(content) as ReviewItem[]
+    const parsed: unknown = JSON.parse(content)
+    if (!Array.isArray(parsed)) {
+      console.warn("[persist] loadReviewItems: content is not an array, resetting")
+      return []
+    }
+    return parsed as ReviewItem[]
   } catch {
     return []
   }

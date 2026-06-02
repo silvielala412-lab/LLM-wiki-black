@@ -161,6 +161,11 @@ export async function buildIdentityCatalog(
         const content = await readFile(filePath)
         // Skip pages already merged into a canonical entity
         if (/^redirect_to:\s*".+"/m.test(content)) continue
+        // Skip non-entity pages (audit reports, query summaries, source pages)
+        // These must not participate in identity comparison.
+        const entityTypeInFile = content.match(/^entity_type:\s*(\S+)/m)?.[1]?.trim() ?? ""
+        const SKIP_TYPES = new Set(["audit_report","source_summary","query","audit","report","source"])
+        if (SKIP_TYPES.has(entityTypeInFile)) continue
         const entry = parseIdentityEntry(content, filePath)
         if (entry) catalog.push(entry)
       } catch { /* skip unreadable */ }
@@ -260,9 +265,13 @@ export function generateIdentityCandidates(
     countMap.set(b, count(b) + 1)
   }
 
-  function tryAdd(a: IdentityEntry, b: IdentityEntry, reason: string) {
+  function tryAdd(a: IdentityEntry, b: IdentityEntry, reason: string, forceInclude = false) {
     if (a.title === b.title) return
-    if (newEntityTitles && newEntityTitles.size > 0) {
+    // newEntityTitles is an incremental optimization: only compare entities
+    // involved in this ingest batch. R1 (same dedup_key) bypasses this filter
+    // because identical dedup_keys are a deterministic fact — we must always
+    // merge them regardless of which batch created them.
+    if (!forceInclude && newEntityTitles && newEntityTitles.size > 0) {
       if (!newEntityTitles.has(a.title) && !newEntityTitles.has(b.title)) return
     }
     if (count(a.title) >= MAX_PER_ENTITY || count(b.title) >= MAX_PER_ENTITY) return
@@ -277,7 +286,7 @@ export function generateIdentityCandidates(
     inc(a.title, b.title)
   }
 
-  // R1: same dedup_key
+  // R1: same dedup_key — deterministic signal, forceInclude bypasses newEntityTitles
   const byDedup = new Map<string, IdentityEntry[]>()
   for (const e of catalog) {
     if (!e.dedupKey) continue
@@ -288,7 +297,7 @@ export function generateIdentityCandidates(
   for (const group of byDedup.values()) {
     for (let i = 0; i < group.length; i++) {
       for (let j = i + 1; j < group.length; j++) {
-        tryAdd(group[i], group[j], "R1:same_dedup_key")
+        tryAdd(group[i], group[j], "R1:same_dedup_key", true)  // always compare same-dedup-key pairs
       }
     }
   }
@@ -928,7 +937,7 @@ export async function runIdentityPass(
   const threshold = options?.writeThreshold ?? WRITE_THRESHOLD
 
   if (signal?.aborted) {
-    return { catalogSize: 0, candidatePairs: 0, llmCallCount: 0, merged: 0, aliasEdges: 0, siblingEdges: 0, parentChildEdges: 0, discarded: 0, errors }
+    return { catalogSize: 0, candidatePairs: 0, llmCallCount: 0, merged: 0, aliasEdges: 0, siblingEdges: 0, parentChildEdges: 0, discarded: 0, errors, auditLog: [] }
   }
 
   // Phase 1
@@ -936,11 +945,11 @@ export async function runIdentityPass(
   try {
     catalog = await buildIdentityCatalog(projectPath)
   } catch (err) {
-    return { catalogSize: 0, candidatePairs: 0, llmCallCount: 0, merged: 0, aliasEdges: 0, siblingEdges: 0, parentChildEdges: 0, discarded: 0, errors: [String(err)] }
+    return { catalogSize: 0, candidatePairs: 0, llmCallCount: 0, merged: 0, aliasEdges: 0, siblingEdges: 0, parentChildEdges: 0, discarded: 0, errors: [String(err)], auditLog: [] }
   }
 
   if (catalog.length < 2) {
-    return { catalogSize: catalog.length, candidatePairs: 0, llmCallCount: 0, merged: 0, aliasEdges: 0, siblingEdges: 0, parentChildEdges: 0, discarded: 0, errors }
+    return { catalogSize: catalog.length, candidatePairs: 0, llmCallCount: 0, merged: 0, aliasEdges: 0, siblingEdges: 0, parentChildEdges: 0, discarded: 0, errors, auditLog: [] }
   }
 
   // Phase 2a: Rule-based candidates (R1–R4)
@@ -967,17 +976,37 @@ export async function runIdentityPass(
   }
 
   if (pairs.length === 0) {
-    return { catalogSize: catalog.length, candidatePairs: 0, llmCallCount: 0, merged: 0, aliasEdges: 0, siblingEdges: 0, parentChildEdges: 0, discarded: 0, errors }
+    return { catalogSize: catalog.length, candidatePairs: 0, llmCallCount: 0, merged: 0, aliasEdges: 0, siblingEdges: 0, parentChildEdges: 0, discarded: 0, errors, auditLog: [] }
   }
 
   if (signal?.aborted) {
-    return { catalogSize: catalog.length, candidatePairs: pairs.length, llmCallCount: 0, merged: 0, aliasEdges: 0, siblingEdges: 0, parentChildEdges: 0, discarded: 0, errors }
+    return { catalogSize: catalog.length, candidatePairs: pairs.length, llmCallCount: 0, merged: 0, aliasEdges: 0, siblingEdges: 0, parentChildEdges: 0, discarded: 0, errors, auditLog: [] }
   }
 
-  // Phase 3
-  const { judgments, errors: llmErrors } = await llmJudgeIdentityPairs(pairs, llmConfig)
+  // Phase 2.5: Deterministic merge — same-dedup-key pairs skip LLM entirely.
+  // Confidence = 1.0: identical dedup_key is a schema-level fact, not a probabilistic signal.
+  const deterministicPairs = pairs.filter(p => p.reasons.length === 1 && p.reasons[0] === "R1:same_dedup_key")
+  const ambiguousPairs    = pairs.filter(p => !(p.reasons.length === 1 && p.reasons[0] === "R1:same_dedup_key"))
+
+  const deterministicJudgments: IdentityJudgment[] = deterministicPairs.map(p => ({
+    title_a: p.a.title,
+    title_b: p.b.title,
+    verdict: "same_entity" as const,
+    confidence: 1.0,
+    reason: `Identical canonical dedup_key (${p.a.dedupKey}) — deterministic merge, no LLM needed`,
+    evidence: `dedup_key: ${p.a.dedupKey}`,
+  }))
+  if (deterministicJudgments.length > 0) {
+    console.log(`[identity-pass] deterministic merges (R1): ${deterministicJudgments.length} pair(s)`)
+  }
+
+  // Phase 3: LLM judgment for ambiguous pairs only
+  const { judgments: llmJudgments, errors: llmErrors } = ambiguousPairs.length > 0
+    ? await llmJudgeIdentityPairs(ambiguousPairs, llmConfig)
+    : { judgments: [], errors: [] }
   errors.push(...llmErrors)
-  const llmCallCount = Math.ceil(pairs.length / BATCH_SIZE)
+  const llmCallCount = Math.ceil(ambiguousPairs.length / BATCH_SIZE)
+  const judgments = [...deterministicJudgments, ...llmJudgments]
 
   // Phase 4
   const catalogMap = new Map(catalog.map(e => [e.title, e]))
@@ -986,13 +1015,21 @@ export async function runIdentityPass(
   errors.push(...applyErrors)
 
   console.log(
-    `[identity-pass] catalog=${catalog.length} pairs=${pairs.length} calls=${llmCallCount}` +
+    `[identity-pass] catalog=${catalog.length} pairs=${pairs.length} (det=${deterministicJudgments.length} llm=${ambiguousPairs.length}) calls=${llmCallCount}` +
     ` merged=${merged} alias=${aliasEdges} sibling=${siblingEdges} parent_child=${parentChildEdges} discarded=${discarded}`,
   )
   if (auditLog.length > 0) {
     console.log("[identity-pass] audit:\n" + auditLog.map(e =>
       `  ${e.entity_a} ↔ ${e.entity_b} → ${e.action} (${e.llm_verdict} conf=${e.confidence.toFixed(2)})`
     ).join("\n"))
+
+    // Persist auditLog to disk so it survives process restart.
+    // Written to wiki/.identity-audit/{timestamp}.json — non-critical, never throws.
+    try {
+      const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19)
+      const auditDir = `${projectPath}/wiki/.identity-audit`
+      await writeFile(`${auditDir}/${timestamp}.json`, JSON.stringify(auditLog, null, 2))
+    } catch { /* non-critical — do not fail the ingest */ }
   }
 
   return { catalogSize: catalog.length, candidatePairs: pairs.length, llmCallCount, merged, aliasEdges, siblingEdges, parentChildEdges, discarded, errors, auditLog }
