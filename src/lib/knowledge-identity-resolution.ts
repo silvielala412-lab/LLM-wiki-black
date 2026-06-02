@@ -190,14 +190,22 @@ function parseIdentityEntry(content: string, filePath: string): IdentityEntry | 
   const domain = scalar(fm, "knowledge_domain") || scalar(fm, "domain")
 
   // Attributes — JSON inline or YAML block
+  //
+  // IMPORTANT: scalar() uses [^"\n]+ which stops at the first quote,
+  // making it unable to parse {"key": "val"} objects with string values.
+  // Use a brace-balanced regex to capture the full inline JSON object,
+  // then JSON.parse the whole thing.
   let attrs: Record<string, string> = {}
-  const attrsRaw = scalar(fm, "attributes")
-  if (attrsRaw) {
-    try { attrs = JSON.parse(attrsRaw) } catch { /* yaml fallback */ }
+  const attrsJsonMatch = fm.match(/^attributes:\s*(\{[^\n]*\})\s*$/m)
+  if (attrsJsonMatch) {
+    try { attrs = JSON.parse(attrsJsonMatch[1]) } catch { /* malformed JSON */ }
   }
-  if (!attrs.service_scene) {
+  if (Object.keys(attrs).length === 0) {
+    // Fallback: individual scalar fields at top level (older format)
     attrs.service_scene  = scalarBlock(fm, "service_scene")  || ""
     attrs.service_stage  = scalarBlock(fm, "service_stage")  || ""
+    attrs.service_name   = scalarBlock(fm, "service_name")   || ""
+    attrs.related_product = scalarBlock(fm, "related_product") || ""
   }
 
   // Existing relation targets (both compact-list and YAML-block formats)
@@ -219,7 +227,13 @@ function parseIdentityEntry(content: string, filePath: string): IdentityEntry | 
     : []
 
   const canonicalTitle = canonicalServiceIdentityName(title)
-  const dedupKey = inferStableInsuranceDedupKey({
+
+  // Priority 1: use existing dedup_key written by the ingest pipeline.
+  // The ingest pipeline already ran inferStableInsuranceDedupKey with the full
+  // parsed schema, so reading the written value avoids re-inference drift.
+  // Priority 2: re-infer as fallback if the field is absent (older pages).
+  const existingDedupKey = fm.match(/^dedup_key:\s*["']?([^"'\r\n]+)["']?\s*$/m)?.[1]?.trim() ?? ""
+  const dedupKey = existingDedupKey || inferStableInsuranceDedupKey({
     entityType: entityType || "general",
     title: canonicalTitle,
     attributes: attrs,
@@ -1150,6 +1164,29 @@ export async function runIdentityPass(
       await writeFile(`${auditDir}/${timestamp}.json`, JSON.stringify(auditLog, null, 2))
     } catch { /* non-critical — do not fail the ingest */ }
   }
+
+  // ── Validation gate: unresolved same-dedup-key pairs ────────────────────────
+  // After applyIdentityJudgments, re-build the catalog and check for pages
+  // that share a dedup_key but have NO redirect_to — these are unresolved
+  // duplicates that should have been merged. Log them as errors so they
+  // surface in the review queue instead of silently persisting.
+  try {
+    const postCatalog = await buildIdentityCatalog(projectPath)
+    const byDedup2 = new Map<string, string[]>()
+    for (const e of postCatalog) {
+      if (!e.dedupKey || e.dedupKey === e.filePath) continue // skip filePath-fallback keys
+      const bucket = byDedup2.get(e.dedupKey) ?? []
+      bucket.push(e.title)
+      byDedup2.set(e.dedupKey, bucket)
+    }
+    for (const [key, titles] of byDedup2.entries()) {
+      if (titles.length > 1) {
+        const msg = `[identity-pass] UNRESOLVED DUPLICATE: dedup_key="${key}" titles=[${titles.join(", ")}]`
+        console.warn(msg)
+        errors.push(msg)
+      }
+    }
+  } catch { /* non-critical gate — never fail the ingest */ }
 
   return { catalogSize: catalog.length, candidatePairs: pairs.length, llmCallCount, merged, aliasEdges, siblingEdges, parentChildEdges, discarded, errors, auditLog }
 }

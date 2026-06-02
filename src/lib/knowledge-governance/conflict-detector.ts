@@ -125,6 +125,8 @@ export async function findSimilarByVector(
         const candidate = `${pp}/wiki/${dir}/${r.id}.md`
         try {
           const content = await readFile(candidate)
+          // Skip audit/source/redirect pages even if vector-similar
+          if (isSourceTypedContent(content)) break
           const { title: existingTitle, excerpt: existingExcerpt } = extractTitleAndExcerpt(content)
           candidates.push({
             pageId: r.id,
@@ -146,15 +148,18 @@ export async function findSimilarByVector(
         const candidate = `${pp}/wiki/${r.id}.md`
         try {
           const content = await readFile(candidate)
-          const { title: existingTitle, excerpt: existingExcerpt } = extractTitleAndExcerpt(content)
-          candidates.push({
-            pageId: r.id,
-            pagePath: candidate,
-            title: existingTitle,
-            score: r.score,
-            excerpt: existingExcerpt,
-            matchMethod: "vector",
-          })
+          // Skip audit/source/redirect pages even if vector-similar
+          if (!isSourceTypedContent(content)) {
+            const { title: existingTitle, excerpt: existingExcerpt } = extractTitleAndExcerpt(content)
+            candidates.push({
+              pageId: r.id,
+              pagePath: candidate,
+              title: existingTitle,
+              score: r.score,
+              excerpt: existingExcerpt,
+              matchMethod: "vector",
+            })
+          }
         } catch {
           // Page ID found in vector store but can't read file — skip
         }
