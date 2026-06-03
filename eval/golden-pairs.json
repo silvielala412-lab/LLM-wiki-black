@@ -1,0 +1,42 @@
+[
+  {
+    "id": "GP001",
+    "a": "21天训练营",
+    "b": "21天社群训练营",
+    "expected_verdict": "same_entity",
+    "expected_canonical": "21天社群训练营",
+    "reason": "训练营是社群训练营的简称，社群训练营包含更多字段信息"
+  },
+  {
+    "id": "GP002",
+    "a": "重疾专案",
+    "b": "重疾专案管理",
+    "expected_verdict": "same_entity",
+    "expected_canonical": "重疾专案管理",
+    "reason": "重疾专案管理是更完整的名称，包含管理属性字段"
+  },
+  {
+    "id": "GP003",
+    "a": "门诊就医服务",
+    "b": "住院就医服务",
+    "expected_verdict": "distinct",
+    "expected_canonical": null,
+    "reason": "discriminator: 门诊 vs 住院 — 明确的兄弟服务，不可合并"
+  },
+  {
+    "id": "GP004",
+    "a": "首访服务",
+    "b": "随访服务",
+    "expected_verdict": "distinct",
+    "expected_canonical": null,
+    "reason": "discriminator: 首访 vs 随访 — 服务阶段不同"
+  },
+  {
+    "id": "GP005",
+    "a": "家庭医生",
+    "b": "家庭医生服务",
+    "expected_verdict": "same_entity",
+    "expected_canonical": "家庭医生服务",
+    "reason": "家庭医生是家庭医生服务的简称，服务版本包含更完整的属性"
+  }
+]
