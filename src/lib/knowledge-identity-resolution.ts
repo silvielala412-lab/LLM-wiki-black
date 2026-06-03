@@ -26,12 +26,14 @@ import { listDirectory, readFile, writeFile } from "@/commands/fs"
 import type { LlmConfig, EmbeddingConfig } from "@/stores/wiki-store"
 import { streamChat } from "@/lib/llm-client"
 import { fetchEmbedding } from "@/lib/embedding"
+import { normalizePath } from "@/lib/path-utils"
 import {
   canonicalServiceIdentityName,
   inferStableInsuranceDedupKey,
   INSURANCE_SCHEMA_REGISTRY,
 } from "@/lib/insurance-schema-registry"
 import type { FieldMergePolicy } from "@/lib/insurance-schema-registry"
+
 
 // ─── Module-level field-policy constants ─────────────────────────────────────
 //
@@ -792,7 +794,6 @@ async function rewriteRelationTargets(
 ): Promise<{ rewrites: number; errors: string[] }> {
   if (redirectMap.size === 0) return { rewrites: 0, errors: [] }
 
-  const { normalizePath } = await import("@/lib/path-utils")
   const pp = normalizePath(projectPath)
   const dirs = ["entities", "concepts"]
   let rewrites = 0

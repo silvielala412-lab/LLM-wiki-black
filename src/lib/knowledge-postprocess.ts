@@ -27,6 +27,7 @@
  */
 
 import { deleteFile, listDirectory, readFile, writeFile } from "@/commands/fs"
+import { buildAliasMap, rewriteWikilinks } from "@/lib/wiki-alias-map"
 import { INSURANCE_SCHEMA_REGISTRY } from "@/lib/insurance-schema-registry"
 import { cleanupKnowledgeFrontmatter } from "@/lib/knowledge-frontmatter-cleanup"
 import { DomainSkillRegistry } from "@/lib/knowledge-domain-skill"
@@ -148,6 +149,9 @@ export async function runKnowledgePostProcess(projectPath: string): Promise<Post
     }
 
     const index = await buildPageIndex(projectPath)
+    // Build canonical alias map once — used for wikilink canonicalization below.
+    // Sources (highest priority first): manual_override > redirect_to > identity_inferred > frontmatter_aliases > title_canonicalizer
+    const aliasMap = await buildAliasMap(projectPath)
 
     const entityFiles = await safeList(entityDirPath)
     for (const file of entityFiles) {
@@ -193,8 +197,14 @@ export async function runKnowledgePostProcess(projectPath: string): Promise<Post
         // Second cleanup to normalize format after all mutations
         updated = cleanupKnowledgeFrontmatter(updated)
 
-        // Normalize body-text wikilinks to match canonical page titles
+        // Normalize body-text wikilinks to match canonical page titles (index-based)
         updated = normalizeBodyWikilinks(updated, index)
+        // Alias-map canonicalization: rewrite any [[OldTitle]] whose title appears
+        // in the alias map (from redirect_to, identity_inferred, manual overrides).
+        // This is Fix 5 — resolves broken wikilinks pointing to redirected entities.
+        if (aliasMap.size > 0) {
+          updated = rewriteWikilinks(updated, aliasMap)
+        }
 
         if (updated !== original) {
           await writeFile(filePath, updated)
