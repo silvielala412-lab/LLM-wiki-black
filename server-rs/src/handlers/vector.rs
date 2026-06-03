@@ -16,6 +16,7 @@ use futures::TryStreamExt;
 use crate::error::Result;
 
 const TABLE: &str = "chunks";
+const VECTOR_DIM: usize = 384;
 
 fn db_path(project_path: &str) -> String {
     format!("{project_path}/.llm-wiki/lancedb")
@@ -27,7 +28,7 @@ fn schema() -> Arc<Schema> {
         Field::new("chunk_text", DataType::Utf8, false),
         Field::new(
             "vector",
-            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 384),
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), VECTOR_DIM as i32),
             true,
         ),
     ]))
@@ -82,7 +83,7 @@ pub async fn upsert_chunks(Json(body): Json<UpsertBody>) -> Result<Json<Value>> 
         Err(_) => db.create_empty_table(TABLE, schema.clone()).execute().await?,
     };
 
-    let dim = 384i32;
+    let dim = VECTOR_DIM as i32;
     let mut flat_vectors: Vec<f32> = Vec::new();
     for v in &body.vectors {
         let mut padded = v.clone();
@@ -124,7 +125,10 @@ pub async fn search_chunks(Json(body): Json<SearchBody>) -> Result<Json<Value>> 
     };
 
     let limit = body.limit.unwrap_or(10);
-    let mut q = tbl.vector_search(body.query_vector)?.limit(limit);
+    let mut query_vector = body.query_vector;
+    query_vector.resize(VECTOR_DIM, 0.0);
+
+    let mut q = tbl.vector_search(query_vector)?.limit(limit);
     if let Some(filter) = &body.filter_expr {
         if !filter.is_empty() {
             q = q.only_if(filter.as_str());

@@ -26,6 +26,7 @@ interface ServerLlmConfig {
 interface ServerEmbeddingConfig {
   endpoint?: string
   model?: string
+  has_api_key?: boolean
 }
 
 interface ServerVisionConfig {
@@ -125,8 +126,9 @@ export async function applyServerConfig(): Promise<void> {
   if (embedding.endpoint || embedding.model) {
     const embCfg = store.embeddingConfig ?? {}
     const embPatch: Record<string, unknown> = {}
-    if (embedding.endpoint && !embCfg.endpoint) embPatch.endpoint = embedding.endpoint
-    if (embedding.model && !embCfg.model)       embPatch.model = embedding.model
+    if (embedding.endpoint && (embedding.has_api_key || !embCfg.endpoint)) embPatch.endpoint = embedding.endpoint
+    if (embedding.model && (embedding.has_api_key || !embCfg.model))       embPatch.model = embedding.model
+    if (embedding.endpoint && embedding.model && embedding.has_api_key) embPatch.enabled = true
     if (Object.keys(embPatch).length > 0) {
       store.setEmbeddingConfig({ ...embCfg, ...embPatch })
     }

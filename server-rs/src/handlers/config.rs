@@ -30,6 +30,7 @@ pub async fn get_config(State(state): State<Arc<AppState>>) -> Result<Json<Value
         "embedding": {
             "endpoint": cfg.embedding_endpoint,
             "model":    cfg.embedding_model,
+            "has_api_key": cfg.has_embedding_api_key,
         },
         // Vision / multimodal (for image-PDF OCR)
         "vision": {

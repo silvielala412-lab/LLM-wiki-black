@@ -311,10 +311,26 @@ pub async fn embed(
     };
 
     let model = cfg.embedding_model.clone().unwrap_or_default();
-    let req_body = json!({
-        "model": model,
-        "input": body.input,
-    });
+    let is_dashscope_multimodal = endpoint.contains("/multimodal-embedding/")
+        || model.starts_with("tongyi-embedding-vision")
+        || model == "qwen3-vl-embedding"
+        || model == "qwen2.5-vl-embedding"
+        || model == "multimodal-embedding-v1";
+    let req_body = if is_dashscope_multimodal {
+        json!({
+            "model": model,
+            "input": {
+                "contents": [
+                    { "text": body.input }
+                ]
+            }
+        })
+    } else {
+        json!({
+            "model": model,
+            "input": body.input,
+        })
+    };
 
     tracing::debug!("Embedding proxy → {endpoint} model={model} input_len={}", body.input.len());
 
@@ -323,7 +339,7 @@ pub async fn embed(
         .post(&endpoint)
         .header("Content-Type", "application/json");
 
-    if let Some(key) = cfg.api_key() {
+    if let Some(key) = cfg.embedding_api_key() {
         req = req.header("Authorization", format!("Bearer {key}"));
     }
 
@@ -350,9 +366,33 @@ pub async fn embed(
             .into_response();
     }
 
-    // Forward the full embedding response JSON
     match upstream.json::<Value>().await {
-        Ok(data) => (StatusCode::OK, Json(data)).into_response(),
+        Ok(data) => {
+            if is_dashscope_multimodal {
+                if let Some(embedding) = data.pointer("/output/embeddings/0/embedding") {
+                    let usage = data.get("usage").cloned().unwrap_or_else(|| json!({}));
+                    let normalized = json!({
+                        "object": "list",
+                        "data": [
+                            {
+                                "object": "embedding",
+                                "index": 0,
+                                "embedding": embedding,
+                            }
+                        ],
+                        "model": model,
+                        "usage": usage,
+                    });
+                    return (StatusCode::OK, Json(normalized)).into_response();
+                }
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({"error": "DashScope multimodal embedding response missing output.embeddings[0].embedding"})),
+                )
+                    .into_response();
+            }
+            (StatusCode::OK, Json(data)).into_response()
+        },
         Err(e) => (
             StatusCode::BAD_GATEWAY,
             Json(json!({"error": format!("Failed to parse embedding response: {e}")})),

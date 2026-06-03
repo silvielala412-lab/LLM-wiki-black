@@ -217,10 +217,10 @@ export const useWikiStore = create<WikiState>((set) => ({
 
   embeddingConfig: {
     enabled: false,
-    // Pre-configured: Alibaba Cloud DashScope (百炼) OpenAI-compatible embedding API.
-    // Toggle enabled=true in Settings → Embedding to activate — no extra setup needed.
-    endpoint: "https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings",
-    apiKey: "sk-c1d4ede4ff5a451da0824904fa8d6bce",
+    // Pre-configured: Alibaba Cloud DashScope (百炼) multimodal embedding API.
+    // API keys must come from Settings or the server-side proxy; do not ship secrets in the frontend bundle.
+    endpoint: "https://dashscope.aliyuncs.com/api/v1/services/embeddings/multimodal-embedding/multimodal-embedding",
+    apiKey: "",
     model: "tongyi-embedding-vision-plus-2026-03-06",
   },
 

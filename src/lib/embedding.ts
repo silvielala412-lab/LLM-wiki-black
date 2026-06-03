@@ -66,6 +66,44 @@ export function looksLikeOversizeError(httpStatus: number, body: string): boolea
   )
 }
 
+function isDashScopeMultimodalEmbedding(endpoint: string, model: string): boolean {
+  return (
+    endpoint.includes("/multimodal-embedding/") ||
+    model.startsWith("tongyi-embedding-vision") ||
+    model === "qwen3-vl-embedding" ||
+    model === "qwen2.5-vl-embedding" ||
+    model === "multimodal-embedding-v1"
+  )
+}
+
+function buildEmbeddingRequestBody(endpoint: string, model: string, input: string): unknown {
+  if (isDashScopeMultimodalEmbedding(endpoint, model)) {
+    return {
+      model,
+      input: {
+        contents: [{ text: input }],
+      },
+    }
+  }
+  return { model, input }
+}
+
+function readEmbeddingFromResponse(data: unknown): number[] | null {
+  const value = data as {
+    data?: Array<{ embedding?: number[] }>
+    output?: {
+      embedding?: number[]
+      embeddings?: Array<{ embedding?: number[] }>
+    }
+  }
+  return (
+    value?.data?.[0]?.embedding ??
+    value?.output?.embeddings?.[0]?.embedding ??
+    value?.output?.embedding ??
+    null
+  )
+}
+
 /**
  * POST one embedding request; on an oversize rejection, halve the text
  * and retry up to `maxRetries` times. Returns null on definitive
@@ -114,17 +152,17 @@ export async function fetchEmbedding(
       const resp = await httpFetch(cfg.endpoint, {
         method: "POST",
         headers,
-        body: JSON.stringify({ model: cfg.model, input: current }),
+        body: JSON.stringify(buildEmbeddingRequestBody(cfg.endpoint, cfg.model, current)),
       })
 
       if (resp.ok) {
         const data = await resp.json()
-        const embedding = data?.data?.[0]?.embedding ?? null
+        const embedding = readEmbeddingFromResponse(data)
         if (embedding) {
           lastEmbeddingError = null
           return embedding
         }
-        lastEmbeddingError = `Embedding response missing data[0].embedding (got ${JSON.stringify(data).slice(0, 200)})`
+        lastEmbeddingError = `Embedding response missing embedding vector (got ${JSON.stringify(data).slice(0, 200)})`
         console.warn(`[Embedding] ${lastEmbeddingError}`)
         return null
       }
@@ -184,13 +222,12 @@ async function fetchEmbeddingViaProxy(
 
       if (resp.ok) {
         const data = await resp.json()
-        // OpenAI format: { data: [{ embedding: [...] }] }
-        const embedding = data?.data?.[0]?.embedding ?? null
+        const embedding = readEmbeddingFromResponse(data)
         if (embedding) {
           lastEmbeddingError = null
           return embedding
         }
-        lastEmbeddingError = `Embedding proxy response missing data[0].embedding`
+        lastEmbeddingError = `Embedding proxy response missing embedding vector`
         console.warn(`[Embedding] ${lastEmbeddingError}`)
         return null
       }
