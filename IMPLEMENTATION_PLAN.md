@@ -270,3 +270,100 @@ Step 5: KnowledgeTree UI
 | 浏览器 I/O | 全量扫 wiki/*.md | 只发 1 个 HTTP 请求 |
 | 向量协议 | ❌ 前后端不对齐 | ✅ 统一结构化 chunk |
 | API 模块化 | ❌ 检索逻辑在前端，耦合业务 | ✅ Rust 通用检索层，零业务耦合 |
+
+---
+
+## Codex Review Notes（给 Claude 实施前参考）
+
+> Codex 更新：2026-06-04。整体同意本计划，但建议把 Step 1 从“动态维度修复”提升为“向量索引协议修复 + 可恢复迁移”。下面是实施时需要额外锁住的细节。
+
+### 1. 不要静默兼容旧 384 表，必须显式判定并要求重建
+
+LanceDB 的 `FixedSizeList` 维度和列结构是表 schema 的一部分。代码改成动态维度以后，已有 `chunks` 表不会自动从 384 变 1152，也不会自动拥有 `page_title/chunk_index/heading_path` 等新列。
+
+实施建议：
+- 打开现有表后先读取 schema：校验 `vector` 维度、必需列、字段类型。
+- 如发现旧 schema，返回明确错误，例如 `409 index_schema_mismatch`，响应体包含 `expected_dim / actual_dim / missing_columns / reset_required: true`。
+- `drop_legacy` 当前实际是在 drop `chunks` 表，建议改名或新增 `POST /api/vector/reset-index`，同时删除 `vector-meta.json`，避免语义误导。
+- 禁止继续对旧表 `add()` 新 batch；否则会出现新旧协议混存，后续排查非常困难。
+
+### 2. `score = 1 - distance` 只有在 metric 明确为 cosine 时才成立
+
+LanceDB 返回的 `_distance` 语义取决于向量索引/查询 metric。计划里直接 `1.0 - distance` 有风险。
+
+实施建议：
+- 创建/查询向量索引时明确使用 cosine metric；如果当前 lancedb API 不方便设置 metric，就不要承诺 `score` 是相似度。
+- 返回字段至少保留 `distance`、`rank`、`score_kind`。
+- 如果确认是 cosine distance，`score = clamp(1 - distance, 0, 1)`；否则先用 rank/RRF 排序，不把 distance 伪装成 0-1 置信度。
+
+### 3. 元数据必须记录模型，而模型信息不能只靠 Rust 推断
+
+当前 embedding 可能来自前端设置，也可能来自服务端环境变量。Rust `vector/upsert-chunks` 只收到 vectors，不一定知道这些 vectors 是哪个模型产生的。
+
+实施建议：
+- `UpsertBody` 增加 `embedding_model`、`embedding_endpoint` 可选字段，至少记录 `embedding_model` 和 `dim`。
+- `vector-meta.json` 建议包含：
+  ```json
+  {
+    "schema_version": 2,
+    "dim": 1152,
+    "embedding_model": "tongyi-embedding-vision-plus-2026-03-06",
+    "embedding_endpoint_fingerprint": "...",
+    "metric": "cosine",
+    "created_at": "...",
+    "updated_at": "..."
+  }
+  ```
+- 查询时如果 query vector 维度或模型与 meta 不一致，返回明确错误，不要 truncate/pad。
+
+### 4. 前后端协议变更要避免部署瞬间破坏旧页面
+
+Step 1 和 Step 2 是破坏性 API 变更。如果后端先上线、浏览器还缓存旧前端，旧请求仍会发送 `{ chunks: string[], vectors: number[][] }`。
+
+实施建议二选一：
+- 最稳：新增 `/vector/upsert-chunks-v2` 和 `/vector/search-chunks-v2`，旧端点暂时保留；ChatPanel/embedding.ts 切 v2。
+- 或者：同一个端点同时接受 v1/v2 请求体。v1 只作为兼容入口，写入时可以生成 `chunk_index`，`heading_path=""`，但应在响应/日志里提示 deprecated。
+
+### 5. `/api/rag/retrieve` 的 fallback 不应默认回到前端全量扫描
+
+计划中 Step 4 写了 `/api/rag/retrieve` 非 200 时 fallback 回 `searchWiki()`。这对小项目可接受，但对 `rag` 这种 65MB 项目会把几分钟卡顿重新带回来。
+
+实施建议：
+- 默认 fallback 应该是后端轻量 token fallback，而不是前端 `searchWiki()`。
+- 如果必须临时 fallback 到前端，至少加项目大小阈值：wiki 总字节数或 md 文件数超过阈值时不走前端全量扫描，直接提示“后端检索不可用/索引需要重建”。
+- `retrieve` 响应需要带 `timings`：`embed_ms / vector_ms / token_ms / graph_ms / total_ms`，后续排查速度才有抓手。
+
+### 6. 后端检索接口必须做路径边界校验
+
+`project_path` 来自前端请求，后端读 LanceDB、wiki 文件或未来 SQLite 时要避免任意路径访问。
+
+实施建议：
+- 将 `project_path` normalize 后校验必须位于 `WIKI_DATA_PATH` 下，或来自已打开/已登记 project 列表。
+- 所有新接口都复用同一套 project path guard，不在各 handler 里重复拼字符串。
+
+### 7. Step 3 第一版不要只做向量检索
+
+向量索引损坏、未重建、embedding 临时关闭时，纯 vector retrieve 会无结果。迁后端的核心目标是“不要让浏览器扫 65MB”，因此第一版也应该有后端 token fallback。
+
+实施建议：
+- Phase 1 最小可用：`vector topK + server-side token fallback + RRF by rank`。
+- server-side token fallback 可以先扫描 wiki，但扫描发生在服务器并加缓存/manifest；不要再让浏览器逐文件 `readFile`。
+- graph 扩展可以 Phase 2，但 `retrieve` 响应结构先预留 `related` 或 `sources` 字段。
+
+### 8. KnowledgeTree 可以独立提前修
+
+`KnowledgeTree` 的实体/七大域显示问题和 RAG 后端迁移解耦，改动小、风险低。
+
+建议作为单独小提交先做：
+- `/wiki/entities/` 路径优先归入 Entities。
+- `domain` 同时兼容 `knowledge_domain` 和 `domain`。
+- 七大域固定显示 7 个桶，空桶显示 0。
+
+### 9. 验证清单
+
+最低验证建议：
+- Rust：`cargo check`，最好加 vector handler 单测覆盖维度不一致、旧 schema、返回 `_distance` 解析。
+- 前端：`tsc --noEmit` 或现有 `npm run build`。
+- 数据：reset `rag` 的旧 `chunks` 表后重新 embed，确认 chunk count、meta dim=1152。
+- 接口：`/api/vector/search-chunks` 返回完整字段；`/api/rag/retrieve` 在 embedding 可用/不可用两种状态下都不会触发浏览器全量扫文件。
+- 服务：7777 当前运行态之前曾临时关闭 embedding。重建索引前要用 `start-7777.ps1` 恢复百炼配置，确认 `/api/config` 中 embedding endpoint/model/key 均存在。
