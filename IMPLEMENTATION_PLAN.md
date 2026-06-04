@@ -367,3 +367,54 @@ Step 1 和 Step 2 是破坏性 API 变更。如果后端先上线、浏览器还
 - 数据：reset `rag` 的旧 `chunks` 表后重新 embed，确认 chunk count、meta dim=1152。
 - 接口：`/api/vector/search-chunks` 返回完整字段；`/api/rag/retrieve` 在 embedding 可用/不可用两种状态下都不会触发浏览器全量扫文件。
 - 服务：7777 当前运行态之前曾临时关闭 embedding。重建索引前要用 `start-7777.ps1` 恢复百炼配置，确认 `/api/config` 中 embedding endpoint/model/key 均存在。
+
+---
+
+## Codex Deployment Gate（5141f42 后补充）
+
+> Codex 更新：2026-06-04。已拉取并检查 Claude 提交 `5141f42 feat: vector protocol v2 + /api/rag/retrieve endpoint + port 8081 dev script`。结论：这版完成了后端方向的一部分，但还没有形成“用户可验证对话框提速”的闭环。
+
+### 当前不建议直接部署给用户验证对话框速度
+
+原因：
+- `server-rs` 已新增 `/api/rag/retrieve`，但前端 `src/components/chat/chat-panel.tsx` 仍在调用 `searchWiki(pp, text)` 和 `buildRetrievalGraph(pp, dataVersion)`。
+- 也就是说，浏览器对话框提问仍会走旧链路：前端全量扫 `wiki/*.md` + 冷启动构建 retrieval graph。
+- 因此即使启动 8081，用户在 `rag` 项目对话框里提问，大概率仍会慢；这不能验证 `/api/rag/retrieve` 的效果。
+- 8081 当前只适合做后端接口 smoke test，不适合交给用户验证“rag 对话框搜索和回答速度是否变快”。
+
+### 什么时候可以部署 8081 给用户验证
+
+满足以下条件后再部署：
+1. `ChatPanel` 已优先调用 `/api/rag/retrieve`。
+2. `/api/rag/retrieve` 成功时，不再执行 `searchWiki()` 和 `buildRetrievalGraph()`。
+3. `/api/rag/retrieve` 失败时，大项目不能 fallback 到前端全量扫描；应提示索引/检索不可用，或走后端轻量 token fallback。
+4. 前端能把 `chunks/sources/timings` 转成现有 prompt context 和 source chips。
+5. `rag` 项目旧 384 维 LanceDB 表已 reset，并用百炼 1152 维重新 embed。
+6. 8081 的 `/api/config` 显示 embedding endpoint/model/key 均已配置。
+
+### Claude 下一步建议
+
+优先补齐前端接线，而不是继续扩后端功能：
+- 新增 `src/lib/rag-client.ts` 或在 `src/commands/api-client.ts` 增加 `retrieveRagContext()`。
+- 在 `chat-panel.tsx` 中替换问答主链路的 retrieval 阶段：
+  - 调 `/api/rag/retrieve`
+  - 用返回 chunks 组装 context
+  - 填充 `queryRefs`
+  - 记录并展示/打印 `retrieval_ms` 和分项 timings
+- 保留 `searchWiki()` 给顶部搜索页或小项目 fallback，但不要在 `rag` 这类大项目默认走它。
+- `buildRetrievalGraph()` 暂时只保留给图谱视图或后端 graph phase，不要再放在每次对话提问主链路。
+
+### 只有一种情况现在可以部署
+
+如果目标只是验证“后端接口能否启动、`/api/rag/retrieve` 能否返回 chunks”，可以启动 8081 做接口测试。但要对用户说明：
+- 这不是最终体验验证。
+- 对话框速度不会因为只启动 8081 自动变快。
+- 需要用 curl/HTTP 请求直接打 `/api/rag/retrieve`，而不是在前端对话框里测试。
+
+### 构建环境备注
+
+本机依赖并非完全缺失，但默认 shell 环境未必带齐 PATH：
+- `protoc.exe` 可用位置：`C:\tools\protoc-25.3-win64\bin\protoc.exe` 或 `C:\llm-wiki\.runtime\protoc\bin\protoc.exe`
+- `perl.exe` 可用位置：`C:\Program Files\Git\usr\bin\perl.exe` 或 `C:\llm-wiki\.runtime\strawberry-perl\perl\bin\perl.exe`
+
+若 `cargo check/build` 报 `protoc` 或 `perl` 找不到，不代表代码一定错；应先用带好 PATH/PROTOC 的构建脚本或 shell。建议把 8081 构建/启动脚本也显式设置这些路径，避免不同终端环境行为不一致。
