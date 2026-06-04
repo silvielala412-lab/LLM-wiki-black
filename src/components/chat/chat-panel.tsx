@@ -359,11 +359,71 @@ export function ChatPanel() {
           readFile(`${pp}/purpose.md`).catch(() => ""),
         ])
 
-        // ── Phase 1: Tokenized search → top 10 ────────────────
-        const searchResults = await searchWiki(pp, text)
-        const topSearchResults = searchResults.slice(0, 10)
+        // ── Retrieval: try backend /api/rag/retrieve first ─────
+        // Falls back to legacy frontend searchWiki() if:
+        //   a) backend endpoint not available (7777 old binary), OR
+        //   b) project is small (< 50 files) and vector index not built
+        //
+        // With backend retrieval: chunks are returned directly, no file scanning.
+        // With fallback: full page content read (slow for large projects).
+        let usedBackendRetrieval = false
+        let ragChunks: Array<{ page_path: string; page_title: string; chunk_text: string; heading_path: string; score: number; source: string }> = []
+        let retrievalMs = 0
 
-        // ── Trim index by relevance if over budget ─────────────
+        try {
+          const ragRes = await fetch('/api/rag/retrieve', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ project_path: pp, query: text, top_k: 10 }),
+            signal: AbortSignal.timeout(15000), // 15s timeout
+          })
+          if (ragRes.ok) {
+            const ragData = await ragRes.json()
+            if (Array.isArray(ragData.chunks) && ragData.chunks.length > 0) {
+              ragChunks = ragData.chunks
+              retrievalMs = ragData.retrieval_ms ?? 0
+              usedBackendRetrieval = true
+              console.log(`[RAG] backend retrieve: ${ragChunks.length} chunks in ${retrievalMs}ms`)
+            }
+          }
+        } catch (err) {
+          console.warn('[RAG] backend retrieve unavailable, falling back to searchWiki:', err)
+        }
+
+        let topSearchResults: Awaited<ReturnType<typeof searchWiki>> = []
+        const graphExpansions: { title: string; path: string; relevance: number }[] = []
+
+        if (!usedBackendRetrieval) {
+          // ── Fallback: legacy frontend token+vector search ────────
+          const searchResults = await searchWiki(pp, text)
+          topSearchResults = searchResults.slice(0, 10)
+
+          // Graph expansion — only in fallback mode to avoid double latency
+          const graph = await buildRetrievalGraph(pp, dataVersion)
+          const expandedIds = new Set<string>()
+          const searchHitPaths = new Set(topSearchResults.map((r) => r.path))
+
+          for (const result of topSearchResults) {
+            const fileName = getFileName(result.path)
+            const nodeId = fileName.replace(/\.md$/, '')
+            const related = getRelatedNodes(nodeId, graph, 3)
+            for (const { node, relevance } of related) {
+              if (relevance < 2.0) continue
+              if (searchHitPaths.has(node.path)) continue
+              if (expandedIds.has(node.id)) continue
+              expandedIds.add(node.id)
+              graphExpansions.push({ title: node.title, path: node.path, relevance })
+            }
+          }
+          graphExpansions.sort((a, b) => b.relevance - a.relevance)
+        }
+
+        // ── Context assembly ─────────────────────────────────────
+        let usedChars = 0
+        type PageEntry = { title: string; path: string; content: string; priority: number }
+        const relevantPages: PageEntry[] = []
+
+        // Trim index by relevance if over budget (shared by both paths)
         let index = rawIndex
         if (rawIndex.length > INDEX_BUDGET) {
           const { tokenizeQuery } = await import("@/lib/search")
@@ -371,82 +431,60 @@ export function ChatPanel() {
           const lines = rawIndex.split("\n")
           const keptLines: string[] = []
           let keptSize = 0
-
           for (const line of lines) {
             const isHeader = line.startsWith("##")
-            const lower = line.toLowerCase()
-            const isRelevant = tokens.some((t) => lower.includes(t))
-
-            if (isHeader || isRelevant) {
-              if (keptSize + line.length + 1 <= INDEX_BUDGET) {
-                keptLines.push(line)
-                keptSize += line.length + 1
-              }
+            const isRelevant = tokens.some((t) => line.toLowerCase().includes(t))
+            if ((isHeader || isRelevant) && keptSize + line.length + 1 <= INDEX_BUDGET) {
+              keptLines.push(line)
+              keptSize += line.length + 1
             }
           }
           index = keptLines.join("\n")
-          if (index.length < rawIndex.length) {
-            index += "\n\n[...index trimmed to relevant entries...]"
+          if (index.length < rawIndex.length) index += "\n\n[...index trimmed to relevant entries...]"
+        }
+
+        if (usedBackendRetrieval) {
+          // ── Backend RAG path: use chunks directly, no file reads ──
+          // Deduplicate by page, group chunks per page, respect PAGE_BUDGET
+          const seenPages = new Map<string, { title: string; chunks: string[] }>()
+          for (const chunk of ragChunks) {
+            const key = chunk.page_path
+            if (!seenPages.has(key)) seenPages.set(key, { title: chunk.page_title || key, chunks: [] })
+            seenPages.get(key)!.chunks.push(
+              chunk.heading_path ? `**${chunk.heading_path}**\n${chunk.chunk_text}` : chunk.chunk_text
+            )
           }
-        }
-
-        // ── Phase 2: Graph 1-level expansion ───────────────────
-        // Note: Vector search (if enabled) is already merged into searchResults
-        // by searchWiki() in search.ts — no duplicate code needed here.
-        const graph = await buildRetrievalGraph(pp, dataVersion)
-        const expandedIds = new Set<string>()
-        const searchHitPaths = new Set(topSearchResults.map((r) => r.path))
-        const graphExpansions: { title: string; path: string; relevance: number }[] = []
-
-        for (const result of topSearchResults) {
-          const fileName = getFileName(result.path)
-          const nodeId = fileName.replace(/\.md$/, "")
-          const related = getRelatedNodes(nodeId, graph, 3)
-          for (const { node, relevance } of related) {
-            if (relevance < 2.0) continue
-            if (searchHitPaths.has(node.path)) continue
-            if (expandedIds.has(node.id)) continue
-            expandedIds.add(node.id)
-            graphExpansions.push({ title: node.title, path: node.path, relevance })
+          let priority = 0
+          for (const [pagePath, { title, chunks }] of seenPages) {
+            const content = chunks.join("\n\n")
+            const relativePath = getRelativePath(`${pp}/${pagePath}`, pp)
+            if (usedChars + content.length > PAGE_BUDGET) break
+            usedChars += content.length
+            relevantPages.push({ title, path: relativePath, content, priority: priority++ })
           }
-        }
-        graphExpansions.sort((a, b) => b.relevance - a.relevance)
-
-        // ── Phase 3 & 4: Page budget control ───────────────────
-        let usedChars = 0
-        type PageEntry = { title: string; path: string; content: string; priority: number }
-        const relevantPages: PageEntry[] = []
-
-        const tryAddPage = async (title: string, filePath: string, priority: number): Promise<boolean> => {
-          if (usedChars >= PAGE_BUDGET) return false
-          try {
-            const raw = await readFile(filePath)
-            const relativePath = getRelativePath(filePath, pp)
-            const truncated = raw.length > MAX_PAGE_SIZE
-              ? raw.slice(0, MAX_PAGE_SIZE) + "\n\n[...truncated...]"
-              : raw
-            if (usedChars + truncated.length > PAGE_BUDGET) return false
-            usedChars += truncated.length
-            relevantPages.push({ title, path: relativePath, content: truncated, priority })
-            return true
-          } catch { return false }
-        }
-
-        // P0: Title matches
-        for (const r of topSearchResults.filter((r) => r.titleMatch)) {
-          await tryAddPage(r.title, r.path, 0)
-        }
-        // P1: Content matches
-        for (const r of topSearchResults.filter((r) => !r.titleMatch)) {
-          await tryAddPage(r.title, r.path, 1)
-        }
-        // P2: Graph expansions
-        for (const exp of graphExpansions) {
-          await tryAddPage(exp.title, exp.path, 2)
-        }
-        // P3: Overview fallback
-        if (relevantPages.length === 0) {
-          await tryAddPage("Overview", `${pp}/wiki/overview.md`, 3)
+          // Fallback if chunks gave nothing
+          if (relevantPages.length === 0) {
+            const overview = await readFile(`${pp}/wiki/overview.md`).catch(() => "")
+            if (overview) relevantPages.push({ title: "Overview", path: "wiki/overview.md", content: overview.slice(0, MAX_PAGE_SIZE), priority: 99 })
+          }
+        } else {
+          // ── Legacy fallback: read full pages from disk ────────────
+          const tryAddPage = async (title: string, filePath: string, priority: number): Promise<boolean> => {
+            if (usedChars >= PAGE_BUDGET) return false
+            try {
+              const raw = await readFile(filePath)
+              const relativePath = getRelativePath(filePath, pp)
+              const truncated = raw.length > MAX_PAGE_SIZE ? raw.slice(0, MAX_PAGE_SIZE) + "\n\n[...truncated...]" : raw
+              if (usedChars + truncated.length > PAGE_BUDGET) return false
+              usedChars += truncated.length
+              relevantPages.push({ title, path: relativePath, content: truncated, priority })
+              return true
+            } catch { return false }
+          }
+          for (const r of topSearchResults.filter((r) => r.titleMatch)) await tryAddPage(r.title, r.path, 0)
+          for (const r of topSearchResults.filter((r) => !r.titleMatch)) await tryAddPage(r.title, r.path, 1)
+          for (const exp of graphExpansions) await tryAddPage(exp.title, exp.path, 2)
+          if (relevantPages.length === 0) await tryAddPage("Overview", `${pp}/wiki/overview.md`, 3)
         }
 
         const pagesContext = relevantPages.length > 0
@@ -505,7 +543,6 @@ export function ChatPanel() {
         })
 
         // Reminder injected later, right before the user's current message
-        // (after history so it's the last system instruction the LLM sees).
         langReminder = buildLanguageReminder(text)
 
         lastQueryPages = relevantPages.map((p) => ({ title: p.title, path: p.path }))
