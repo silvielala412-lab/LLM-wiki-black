@@ -348,6 +348,11 @@ export const RELATION_INVERSE_LABELS: Partial<Record<RelationType, string>> = {
   complements: "complements",
   next_step: "previous_step",
   same_stage: "same_stage",
+  same_category: "same_category",
+  same_scene: "same_scene",
+  adjacent_in_process: "adjacent_in_process",
+  alias_of: "alias_of",
+  sibling_of: "sibling_of",
 }
 
 // ─── Relation Scoring Constants ───────────────────────────────────────────────

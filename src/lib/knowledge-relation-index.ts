@@ -164,7 +164,7 @@ export async function buildKnowledgeRelationIndex(projectPath: string): Promise<
     // relation_edges: MUST be processed BEFORE compact relations: so that high-quality
     // confidence/provenance wins the seen-set dedup race. Any compact relations: entry
     // that duplicates an already-seen relation_edges edge will be skipped correctly.
-    for (const edge of parseRelationEdgesBlock(parsed.frontmatter)) {
+    for (const edge of parseRelationEdgesBlock(content)) {
       const target = resolveTarget(edge.target, byId, byTitle)
       const prov: RelationProvenance =
         edge.provenance === "user_confirmed" ? "user_confirmed" :
@@ -491,7 +491,7 @@ function pushRelation(
   evidenceRefs: string[],
 ): void {
   pushRelationWithProvenance(relations, seen, source, target, targetLabel, type, scores, createdBy, evidenceRefs,
-    createdBy === "system" ? "explicit" : createdBy === "user" ? "user_confirmed" : "explicit"
+    createdBy === "system" ? "explicit" : createdBy === "user" ? "user_confirmed" : "explicit_ingest"
   )
 }
 
