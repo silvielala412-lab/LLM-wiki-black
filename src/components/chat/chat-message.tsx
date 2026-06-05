@@ -635,6 +635,7 @@ interface StreamingMessageProps {
 export function StreamingMessage({ content }: StreamingMessageProps) {
   const { thinking, answer } = useMemo(() => separateThinking(content), [content])
   const isThinking = thinking !== null && answer.length === 0
+  const hasContent = content.trim().length > 0
 
   return (
     <div className="flex gap-2 flex-row">
@@ -642,7 +643,9 @@ export function StreamingMessage({ content }: StreamingMessageProps) {
         <Bot className="h-4 w-4" />
       </div>
       <div className="max-w-[80%] rounded-lg px-3 py-2 text-sm bg-muted text-foreground">
-        {isThinking ? (
+        {!hasContent ? (
+          <span className="text-muted-foreground">Thinking...</span>
+        ) : isThinking ? (
           <StreamingThinkingBlock content={thinking} />
         ) : (
           <>

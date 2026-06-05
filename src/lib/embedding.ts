@@ -281,22 +281,29 @@ interface ChunkUpsertInput {
 async function vectorUpsertChunks(
   projectPath: string,
   pageId: string,
+  pageTitle: string,
   chunks: ChunkUpsertInput[],
 ): Promise<void> {
   await apiVectorUpsert(
     normalizePath(projectPath),
     pageId,
-    chunks.map((c) => c.chunkText),
-    chunks.map((c) => c.embedding.map((v) => Math.fround(v))),
+    pageTitle,
+    chunks.map((c) => ({
+      chunk_index: c.chunkIndex,
+      heading_path: c.headingPath,
+      chunk_text: c.chunkText,
+      vector: c.embedding.map((v) => Math.fround(v)),
+    })),
   )
 }
 
 interface ChunkSearchResult {
   chunk_id: string
-  page_id: string
+  page_id?: string
+  page_path?: string
   chunk_index: number
   chunk_text: string
-  heading_path: string
+  heading_path?: string
   score: number
 }
 
@@ -398,7 +405,7 @@ export async function embedPage(
     return
   }
 
-  await vectorUpsertChunks(projectPath, pageId, rows)
+  await vectorUpsertChunks(projectPath, pageId, title, rows)
   const elapsed = Math.round(performance.now() - t0)
   console.log(
     `[Embedding] Indexed "${pageId}": ${rows.length}/${chunks.length} chunks (${failedChunks} skipped) in ${elapsed}ms`,
@@ -505,9 +512,11 @@ export async function searchByEmbedding(
   // a blended per-page score.
   const byPage = new Map<string, ChunkSearchResult[]>()
   for (const c of rawChunks) {
-    const bucket = byPage.get(c.page_id)
+    const pageId = c.page_id ?? c.page_path
+    if (!pageId) continue
+    const bucket = byPage.get(pageId)
     if (bucket) bucket.push(c)
-    else byPage.set(c.page_id, [c])
+    else byPage.set(pageId, [c])
   }
 
   const ranked: PageSearchResult[] = []
@@ -524,7 +533,7 @@ export async function searchByEmbedding(
       score: blended,
       matchedChunks: chunks.slice(0, 3).map((c) => ({
         text: c.chunk_text,
-        headingPath: c.heading_path,
+        headingPath: c.heading_path ?? "",
         score: c.score,
       })),
     })

@@ -122,17 +122,24 @@ export async function openProject(path: string): Promise<WikiProject> {
 
 // ── Vector Store ──────────────────────────────────────────────────────────────
 
+export interface VectorChunkInput {
+  chunk_index: number
+  heading_path: string
+  chunk_text: string
+  vector: number[]
+}
+
 export async function vectorUpsertChunks(
   projectPath: string,
   pagePath: string,
-  chunks: string[],
-  vectors: number[][],
+  pageTitle: string,
+  chunks: VectorChunkInput[],
 ): Promise<number> {
   return post<number>("/vector/upsert-chunks", {
     project_path: projectPath,
     page_path: pagePath,
+    page_title: pageTitle,
     chunks,
-    vectors,
   })
 }
 

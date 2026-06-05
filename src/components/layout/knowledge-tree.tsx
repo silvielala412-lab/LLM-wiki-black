@@ -40,6 +40,16 @@ const DOMAIN_CONFIG: Record<string, { icon: typeof FileText; label: string; colo
   general:    { icon: FileText,          label: "通用知识",   color: "text-muted-foreground", order: 8 },
 }
 
+const CORE_DOMAIN_KEYS = [
+  "product",
+  "customer",
+  "method",
+  "content",
+  "activity",
+  "cases",
+  "compliance",
+]
+
 export function KnowledgeTree() {
   const project = useWikiStore((s) => s.project)
   const selectedFile = useWikiStore((s) => s.selectedFile)
@@ -129,6 +139,9 @@ export function KnowledgeTree() {
   }
 
   const grouped = new Map<string, WikiPageInfo[]>()
+  if (groupMode === "domain") {
+    for (const domain of CORE_DOMAIN_KEYS) grouped.set(domain, [])
+  }
   for (const page of pages) {
     const key = groupMode === "domain" ? page.domain : page.type
     const list = grouped.get(key) ?? []
@@ -367,6 +380,7 @@ function parsePageInfo(path: string, fileName: string, content: string): WikiPag
   let title = fileName.replace(".md", "").replace(/-/g, " ")
   const tags: string[] = []
   let origin: string | undefined
+  const normalizedPath = normalizePath(path)
 
   // Parse YAML frontmatter
   const fmMatch = content.match(/^---\n([\s\S]*?)\n---/)
@@ -393,24 +407,40 @@ function parsePageInfo(path: string, fileName: string, content: string): WikiPag
     if (headingMatch) title = headingMatch[1].trim()
   }
 
-  // Fallback: infer type from path
-  if (type === "other") {
-    if (path.includes("/entities/")) type = "entity"
-    else if (path.includes("/concepts/")) type = "concept"
-    else if (path.includes("/sources/")) type = "source"
-    else if (path.includes("/queries/")) type = "query"
-    else if (path.includes("/comparisons/")) type = "comparison"
-    else if (path.includes("/synthesis/")) type = "synthesis"
-    else if (fileName === "overview.md") type = "overview"
-  }
+  // Path ownership wins over semantic frontmatter type. Entity pages may
+  // carry business types like rule/process, but the tree bucket is Entities.
+  if (normalizedPath.includes("/wiki/entities/")) type = "entity"
+  else if (normalizedPath.includes("/wiki/concepts/")) type = "concept"
+  else if (normalizedPath.includes("/wiki/sources/")) type = "source"
+  else if (normalizedPath.includes("/wiki/queries/")) type = "query"
+  else if (normalizedPath.includes("/wiki/comparisons/")) type = "comparison"
+  else if (normalizedPath.includes("/wiki/synthesis/")) type = "synthesis"
+  else if (fileName === "overview.md") type = "overview"
 
   let domain = "general"
   if (fmMatch) {
-    const domainMatch = fmMatch[1].match(/^knowledge_domain:\s*["']?(.+?)["']?\s*$/m)
-    if (domainMatch) domain = domainMatch[1].trim().toLowerCase()
+    const domainMatch =
+      fmMatch[1].match(/^knowledge_domain:\s*["']?(.+?)["']?\s*$/m) ??
+      fmMatch[1].match(/^domain:\s*["']?(.+?)["']?\s*$/m)
+    if (domainMatch) domain = normalizeDomain(domainMatch[1])
   }
 
   return { path, title, type, domain, tags, origin }
+}
+
+function normalizeDomain(value: string): string {
+  const key = value.trim().toLowerCase()
+  const aliases: Record<string, string> = {
+    "产品域": "product",
+    "客户画像域": "customer",
+    "销售方法域": "method",
+    "销售内容域": "content",
+    "销售活动域": "activity",
+    "案例经验域": "cases",
+    "合规风险域": "compliance",
+    "通用知识": "general",
+  }
+  return aliases[key] ?? (DOMAIN_CONFIG[key] ? key : "general")
 }
 
 function flattenMdFiles(nodes: FileNode[]): FileNode[] {

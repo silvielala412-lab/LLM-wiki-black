@@ -374,7 +374,7 @@ export function ChatPanel() {
           const ragRes = await fetch('/api/rag/retrieve', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ project_path: pp, query: text, top_k: 10 }),
+            body: JSON.stringify({ project_path: pp, query: text, top_k: 6 }),
             signal: AbortSignal.timeout(15000), // 15s timeout
           })
           if (ragRes.ok) {
@@ -630,6 +630,7 @@ export function ChatPanel() {
           },
         },
         controller.signal,
+        { temperature: 0.2, max_tokens: 1600 },
       )
     },
     [llmConfig, addMessage, setStreaming, appendStreamToken, finalizeStream, createConversation, maxHistoryMessages, project],
