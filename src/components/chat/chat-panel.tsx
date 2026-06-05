@@ -359,42 +359,94 @@ export function ChatPanel() {
           readFile(`${pp}/purpose.md`).catch(() => ""),
         ])
 
-        // ── Retrieval: try backend /api/rag/retrieve first ─────
-        // Falls back to legacy frontend searchWiki() if:
-        //   a) backend endpoint not available (7777 old binary), OR
-        //   b) project is small (< 50 files) and vector index not built
-        //
-        // With backend retrieval: chunks are returned directly, no file scanning.
-        // With fallback: full page content read (slow for large projects).
+        // ── Retrieval: try backend /api/rag/retrieve first ─────────
+        // Large projects (>100 wiki files): backend-only, NO frontend fallback.
+        // Small projects (<= 100 files): fallback to legacy searchWiki() if
+        //   the backend is unavailable or returns no chunks.
         let usedBackendRetrieval = false
         let ragChunks: Array<{ page_path: string; page_title: string; chunk_text: string; heading_path: string; score: number; source: string }> = []
         let retrievalMs = 0
+        let backendUnavailable = false
+        let backendReturnedEmpty = false
+
+        // Estimate project size to decide fallback policy
+        let wikiFileCount = 0
+        try {
+          const { listDirectory: ld } = await import("@/commands/fs")
+          const wikiTree = await ld(`${pp}/wiki`)
+          function countMd(nodes: import("@/types/wiki").FileNode[]): number {
+            let n = 0
+            for (const node of nodes) {
+              if (node.is_dir && node.children) n += countMd(node.children)
+              else if (!node.is_dir && node.name.endsWith(".md")) n++
+            }
+            return n
+          }
+          wikiFileCount = countMd(wikiTree)
+        } catch { /* ignore */ }
+        const isLargeProject = wikiFileCount > 100
 
         try {
           const ragRes = await fetch('/api/rag/retrieve', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ project_path: pp, query: text, top_k: 6 }),
-            signal: AbortSignal.timeout(15000), // 15s timeout
+            signal: AbortSignal.timeout(15000),
           })
           if (ragRes.ok) {
             const ragData = await ragRes.json()
+            retrievalMs = ragData.retrieval_ms ?? 0
             if (Array.isArray(ragData.chunks) && ragData.chunks.length > 0) {
               ragChunks = ragData.chunks
-              retrievalMs = ragData.retrieval_ms ?? 0
               usedBackendRetrieval = true
               console.log(`[RAG] backend retrieve: ${ragChunks.length} chunks in ${retrievalMs}ms`)
+            } else {
+              backendReturnedEmpty = true
+              console.warn('[RAG] backend returned 0 chunks')
             }
+          } else {
+            backendUnavailable = true
           }
         } catch (err) {
-          console.warn('[RAG] backend retrieve unavailable, falling back to searchWiki:', err)
+          backendUnavailable = true
+          console.warn('[RAG] backend unavailable:', err)
+        }
+
+        // ── Large project guard: block frontend file scanning ────────
+        // If backend failed and project is large, abort with a clear message
+        // instead of triggering a multi-minute browser file scan.
+        if (isLargeProject && !usedBackendRetrieval) {
+          let reason = "后端检索服务不可用"
+          if (backendReturnedEmpty) {
+            // Try to get index status
+            try {
+              const statusRes = await fetch(`/api/rag/status?project_path=${encodeURIComponent(pp)}`)
+              if (statusRes.ok) {
+                const status = await statusRes.json()
+                if (!status.indexed || status.chunk_count === 0) {
+                  reason = `向量索引为空（0 chunks）。请前往 Settings → Embedding → Re-index All 重建索引`
+                } else if (status.needs_reindex) {
+                  reason = `索引需要重建（${status.reason ?? 'schema mismatch'}）。请前往 Settings → Embedding → Re-index All`
+                } else {
+                  reason = `未检索到相关内容（索引共 ${status.chunk_count} chunks，dim=${status.dim}）`
+                }
+              }
+            } catch { /* /api/rag/status not yet deployed, use generic message */ }
+          }
+          setStreaming(false)
+          addMessage("assistant",
+            `⚠️ **后端检索不可用**（项目共 ${wikiFileCount} 个 wiki 文件，不允许前端全量扫描）\n\n` +
+            `原因：${reason}\n\n` +
+            `请确认后端服务（8081）正常运行并完成索引重建后重试。`
+          )
+          return
         }
 
         let topSearchResults: Awaited<ReturnType<typeof searchWiki>> = []
         const graphExpansions: { title: string; path: string; relevance: number }[] = []
 
         if (!usedBackendRetrieval) {
-          // ── Fallback: legacy frontend token+vector search ────────
+          // ── Small project fallback: legacy frontend token+vector search ──
           const searchResults = await searchWiki(pp, text)
           topSearchResults = searchResults.slice(0, 10)
 

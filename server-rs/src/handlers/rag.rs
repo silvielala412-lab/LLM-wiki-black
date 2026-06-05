@@ -1,5 +1,7 @@
 /*!
- * RAG retrieval handler — POST /api/rag/retrieve
+ * RAG retrieval handler
+ *   POST /api/rag/retrieve   — semantic search, returns ranked chunks
+ *   GET  /api/rag/status     — index health check (dim, count, needs_reindex)
  *
  * Moves the retrieval pipeline off the browser and into the Rust backend.
  * The browser was previously reading all wiki markdown files on every question,
@@ -20,10 +22,10 @@
  *   - Stateless: no caching here; LanceDB handles its own I/O efficiently.
  */
 
-use axum::{extract::State, Json};
+use axum::{extract::{State, Query}, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 use lancedb::{connect, query::{ExecutableQuery, QueryBase}};
 use arrow_array::{Float32Array, Int32Array, StringArray};
 use futures::TryStreamExt;
@@ -239,4 +241,64 @@ pub async fn retrieve(
     };
 
     Ok(Json(serde_json::to_value(response)?))
+}
+
+// ── Status handler ────────────────────────────────────────────────────────────
+
+/// GET /api/rag/status?project_path=...
+///
+/// Returns the health of the vector index for a given project.
+/// Frontend uses this to show a targeted error when chunks are empty,
+/// instead of silently falling back to slow file scanning.
+pub async fn status(
+    Query(params): Query<HashMap<String, String>>,
+) -> Json<Value> {
+    let pp = match params.get("project_path") {
+        Some(p) => p.as_str(),
+        None => return Json(json!({ "error": "project_path required" })),
+    };
+
+    let meta_path = std::path::Path::new(pp).join(".llm-wiki/vector-meta.json");
+    let meta: Option<serde_json::Value> = std::fs::read_to_string(&meta_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok());
+
+    let stored_dim = meta.as_ref().and_then(|m| m["dim"].as_i64()).unwrap_or(0);
+    let stored_model = meta.as_ref()
+        .and_then(|m| m["model"].as_str())
+        .unwrap_or("")
+        .to_string();
+
+    // Count chunks in LanceDB
+    let db_path = format!("{pp}/.llm-wiki/lancedb");
+    let chunk_count: i64 = if let Ok(db) = connect(&db_path).execute().await {
+        if let Ok(tbl) = db.open_table(TABLE).execute().await {
+            tbl.count_rows(None).await.unwrap_or(0) as i64
+        } else {
+            -1  // table not found
+        }
+    } else {
+        -1  // lancedb dir not found
+    };
+
+    let indexed = chunk_count > 0;
+    let (needs_reindex, reason) = if chunk_count < 0 {
+        (true, Some("LanceDB index not found — run Re-index All".to_string()))
+    } else if chunk_count == 0 {
+        (true, Some("Index is empty — run Re-index All".to_string()))
+    } else if stored_dim == 0 {
+        (true, Some("vector-meta.json missing — index may be corrupt".to_string()))
+    } else {
+        (false, None)
+    };
+
+    Json(json!({
+        "indexed":         indexed,
+        "chunk_count":     chunk_count.max(0),
+        "dim":             stored_dim,
+        "embedding_model": stored_model,
+        "schema_version":  2,
+        "needs_reindex":   needs_reindex,
+        "reason":          reason,
+    }))
 }
