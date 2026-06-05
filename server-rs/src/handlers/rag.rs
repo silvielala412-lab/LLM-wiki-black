@@ -51,7 +51,7 @@ pub struct RetrieveRequest {
     pub use_graph: Option<bool>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct RetrievedChunk {
     pub page_path: String,
     pub page_title: String,
@@ -206,6 +206,26 @@ async fn vector_retrieve(
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
+
+pub async fn retrieve_chunks_for_query(
+    state: &AppState,
+    project_path: &str,
+    query: &str,
+    top_k: usize,
+) -> anyhow::Result<(Vec<RetrievedChunk>, u128)> {
+    let t0 = std::time::Instant::now();
+
+    let query_vec = embed_query(state, query).await
+        .map_err(|e| anyhow::anyhow!("Query embedding failed: {e}"))?;
+
+    let mut chunks = vector_retrieve(project_path, query_vec, top_k * 3).await
+        .map_err(|e| anyhow::anyhow!("Vector retrieval failed: {e}"))?;
+
+    chunks.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    chunks.truncate(top_k);
+
+    Ok((chunks, t0.elapsed().as_millis()))
+}
 
 pub async fn retrieve(
     State(state): State<Arc<AppState>>,

@@ -98,6 +98,7 @@ async fn main() -> anyhow::Result<()> {
         // RAG retrieval — backend search pipeline (Phase 1: vector; Phase 2+: BM25+graph)
         .route("/rag/retrieve",          post(handlers::rag::retrieve))
         .route("/rag/status",            get(handlers::rag::status))
+        .route("/chat/stream",           post(handlers::chat::stream_chat))
         // Upload — allow up to 200 MB per request (axum default is 2 MB)
         .route("/upload/file",  post(handlers::upload::upload_file))
         .route("/upload/files", post(handlers::upload::upload_files))
