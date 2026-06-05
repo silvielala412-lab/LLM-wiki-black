@@ -681,7 +681,7 @@ Codex 在 8081 上已经验证：
 
 - `/api/rag/retrieve` 对 `rag` 项目通常 200-300ms 返回 chunks。
 - 8081 完整 RAG + LLM 流式测试可在数秒内返回。
-- KnowledgeTree 的 Entities/七大域显示问题已在 Codex 本机源码修过并部署到 `dist-8081`，但该源码修复尚未提交到 GitHub，Claude 从 GitHub 拉代码时默认看不到这三处本地改动。
+- KnowledgeTree 的 Entities/七大域显示问题已在 Codex 本机源码修过，并已通过 `8dd4f39 fix: align deployed chat and knowledge ui fixes` 提交到 GitHub。
 
 这三处本地改动涉及：
 
@@ -689,4 +689,228 @@ Codex 在 8081 上已经验证：
 - `src/components/chat/chat-panel.tsx`
 - `src/components/chat/chat-message.tsx`
 
-如果 Claude 继续开发，建议先从 GitHub 最新分支拉取，再根据本节内容决定是否由 Claude 复现/合并这些前端修复。
+如果 Claude 继续开发，建议先从 GitHub 最新分支拉取，再基于已合并的前端修复继续做后端 RAG/Chat API 服务化。
+
+---
+
+## Codex Architecture Note（2026-06-05）：为什么当前后端 RAG API 不等同前端对话框，以及建议的后端 Chat API
+
+> 背景：用户用前端对话框提问时答案相对准确，但用脚本直接请求后端 RAG API 时，类似“起保点是多少”这类省略问题会检索/回答不准。结论：这是链路能力不一致导致的，不应简单判定为“同一个 API 搜索坏了”。
+
+### 1. 当前 `/api/rag/retrieve` 与前端对话框不是同一个能力层
+
+当前 `/api/rag/retrieve` 是检索 API，职责是：
+
+```text
+query -> embedding/vector/token retrieval -> chunks
+```
+
+前端对话框实际是问答链路，职责更完整：
+
+```text
+messages/history
+  -> 当前问题 + 多轮上下文
+  -> RAG retrieval
+  -> wiki/index + purpose + retrieved chunks
+  -> ChatPanel system prompt
+  -> /api/llm/stream
+  -> answer + sources
+```
+
+所以直接用脚本打 `/api/rag/retrieve`，不能天然等同于前端对话框。它缺少至少四类信息：
+
+1. 多轮历史上下文。
+2. 省略问题的指代消解。
+3. ChatPanel 的 prompt 约束和引用规则。
+4. 前端组装的 `wiki/index` / `purpose` / page list 等额外上下文。
+
+### 2. 为什么“起保点是多少”在脚本里容易不准
+
+“起保点是多少”是省略问题。它本身没有产品名、险种代码、规则类型。
+
+如果上一轮前端对话是：
+
+```text
+平安智盈倍护（2026）终身护理保险A01的核保规则是什么
+```
+
+那么前端对话框的 LLM 在回答下一句“起保点是多少”时，能从历史消息里推断问题对象仍是：
+
+```text
+平安智盈倍护（2026）终身护理保险A01
+```
+
+但如果脚本只把这一句发给后端检索：
+
+```json
+{ "query": "起保点是多少" }
+```
+
+后端无法知道用户问的是哪个产品。此时检索命中盛世优享、智盈倍护、最低保费、领取年龄等混杂内容是合理现象。
+
+因此，这类问题不是单靠 `/api/rag/retrieve` 能完全解决的。需要在检索前做 query rewrite / contextual retrieval。
+
+### 3. 后端需要的是“对话框等效 API”，不是只增强 retrieval API
+
+如果目标是“后端存在一个 API，效果等同前端对话框”，建议新增：
+
+```http
+POST /api/chat/stream
+```
+
+或：
+
+```http
+POST /api/chat/ask
+```
+
+请求体建议：
+
+```json
+{
+  "project_path": "...",
+  "messages": [
+    { "role": "user", "content": "平安智盈倍护（2026）终身护理保险A01的核保规则是什么" },
+    { "role": "assistant", "content": "..." },
+    { "role": "user", "content": "起保点是多少" }
+  ],
+  "conversation_id": "...",
+  "top_k": 8,
+  "stream": true
+}
+```
+
+后端职责：
+
+1. 从 `messages` 中识别当前问题和历史上下文。
+2. 对省略问题做 query rewrite，例如：
+
+   ```text
+   起保点是多少
+   ->
+   平安智盈倍护（2026）终身护理保险A01 起保点 最低保费 最低保额 投保规则
+   ```
+
+3. 调用内部 hybrid retrieval：
+   - LanceDB vector
+   - SQLite FTS5/BM25 token
+   - RRF fusion
+   - graph cache / relation expansion
+4. 组装与前端 ChatPanel 等价的 system prompt。
+5. 调用 LLM stream。
+6. 返回：
+   - SSE token stream
+   - sources/references
+   - retrieval timings
+   - rewrite query
+   - retrieval diagnostics
+
+### 4. 是否会全量扫描 md 文件？
+
+正确设计下，用户每次提问不应该全量扫描 md 文件。
+
+允许全量扫描的阶段：
+
+- ingest
+- re-index
+- migrate/rebuild index
+- 后台增量索引任务
+
+不应该全量扫描的阶段：
+
+- 用户每次对话提问
+- `/api/chat/stream`
+- `/api/rag/retrieve` 正常路径
+
+推荐最终查询路径：
+
+```text
+vector retrieval -> LanceDB
+token retrieval  -> SQLite FTS5 / BM25
+graph retrieval  -> prebuilt graph cache / relation index
+metadata/status  -> vector-meta / rag status
+```
+
+如果 Step B 的第一版为了快速补能力，临时在 Rust 后端扫描 markdown 做 token fallback，可以接受，但必须视为过渡方案：
+
+- 它比浏览器扫描好，因为避免 IPC/前端卡顿。
+- 但它仍然是 O(N files)。
+- md 文件越多，单次请求仍会变慢。
+- 需要缓存或尽快替换为 SQLite FTS5。
+
+所以 Claude 不应把“后端每次扫描 wiki markdown”当成最终架构。
+
+### 5. 推荐分层
+
+建议保留两个层次：
+
+#### `/api/rag/retrieve`
+
+定位：检索调试和可复用 retrieval service。
+
+输入：
+
+```json
+{
+  "project_path": "...",
+  "query": "...",
+  "top_k": 8,
+  "use_token": true,
+  "use_graph": true
+}
+```
+
+输出：
+
+```json
+{
+  "chunks": [],
+  "sources": [],
+  "timings": {},
+  "warnings": [],
+  "rewrite": null
+}
+```
+
+#### `/api/chat/stream`
+
+定位：前端对话框等效 API。
+
+输入完整 messages，后端完成 query rewrite、retrieval、prompt assembly、LLM streaming。
+
+这才是用户脚本、第三方系统、未来多端调用应该使用的 API。
+
+### 6. Claude 建议评估点
+
+请 Claude 重点评估以下问题：
+
+1. 是否同意新增 `/api/chat/stream` 作为前端对话框等效 API，而不是把所有问答逻辑塞进 `/api/rag/retrieve`。
+2. query rewrite 应该放在后端还是前端：
+   - 后端更适合多端一致。
+   - 前端保留 UI 状态即可。
+3. Step B 的 markdown scan token fallback 是否只作为短期过渡。
+4. SQLite FTS5 的索引构建应该挂在：
+   - ingest 后增量更新
+   - Settings -> Re-index All
+   - 项目打开时懒加载校验
+5. `/api/chat/stream` 是否需要兼容当前 ChatPanel 的 prompt 规则，还是先把 prompt builder 抽成共享模块后迁移到 Rust。
+
+### 7. Codex 当前建议路线
+
+短期：
+
+1. 继续完成 Step B/C：后端 hybrid retrieval，避免 vector-only 精确词召回差。
+2. Step B 初版可以用后端 markdown scan，但必须加缓存/阈值/diagnostics。
+3. 前端对话框继续调用 `/api/rag/retrieve`，但把 `messages` 上下文用于 query rewrite。
+
+中期：
+
+1. 新增 SQLite FTS5 token index。
+2. 新增 graph cache。
+3. 新增 `/api/chat/stream`。
+
+长期：
+
+1. 前端 ChatPanel 从“自己组装完整问答链路”退化为 UI shell。
+2. 所有多端一致的问答能力统一走 `/api/chat/stream`。
+3. 每次用户提问只查预构建索引，不扫描全部 md。
