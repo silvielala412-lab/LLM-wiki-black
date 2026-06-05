@@ -418,3 +418,275 @@ Step 1 和 Step 2 是破坏性 API 变更。如果后端先上线、浏览器还
 - `perl.exe` 可用位置：`C:\Program Files\Git\usr\bin\perl.exe` 或 `C:\llm-wiki\.runtime\strawberry-perl\perl\bin\perl.exe`
 
 若 `cargo check/build` 报 `protoc` 或 `perl` 找不到，不代表代码一定错；应先用带好 PATH/PROTOC 的构建脚本或 shell。建议把 8081 构建/启动脚本也显式设置这些路径，避免不同终端环境行为不一致。
+
+---
+
+## Codex Review（2026-06-05）：搜索 API 当前状态与 Claude 执行清单
+
+> 当前分支：`feature/schema-driven-ingest-compiler`
+> 当前远端业务分支最新提交：`02f2490 fix: align frontend vector upsert protocol`
+> 结论：`/api/rag/retrieve` 已经接入前端对话框主链路，但还不能说与旧前端搜索能力完全等效。
+
+### 1. 当前搜索 API 是否已经有了？
+
+已经有。
+
+- 后端路由：`POST /api/rag/retrieve`
+- 前端调用位置：`src/components/chat/chat-panel.tsx`
+- 当前流程：
+  1. 前端对话框发送问题。
+  2. ChatPanel 优先调用 `/api/rag/retrieve`。
+  3. 后端调用 embedding endpoint 生成 query vector。
+  4. 后端用 LanceDB 搜索 chunks。
+  5. 前端用返回的 chunks 组装 prompt context。
+  6. 再调用 `/api/llm/stream` 生成回答。
+
+这条链路已经避免了每次问题都在浏览器里全量扫描 `wiki/*.md`。
+
+### 2. 是否已经和旧前端对话框搜索完全等效？
+
+还没有。当前只能算“速度主链路已迁移”，不是“能力完全等效”。
+
+旧前端 `searchWiki()` + `buildRetrievalGraph()` 里有 5 层能力：
+
+- token/BM25-like 关键词检索
+- frontmatter schema 字段参与检索
+- governance / confidence 加权
+- vector 语义检索
+- graph relevance 扩展
+
+当前 `/api/rag/retrieve` 后端 Phase 1 只有：
+
+- query embedding
+- LanceDB vector search
+- 返回 top chunks
+
+因此当前 API 与旧前端搜索相比：
+
+| 能力 | 旧前端搜索 | 当前 `/api/rag/retrieve` |
+|---|---:|---:|
+| 向量语义检索 | 有 | 有 |
+| chunk 级返回 | 有 | 有 |
+| score / distance | 有 | 有 |
+| token/BM25-like | 有 | 没有 |
+| schema/governance 加权 | 有 | 没有 |
+| graph 扩展 | 有 | 没有 |
+| 浏览器全量扫文件 | 有，慢 | 主链路没有 |
+
+所以回答用户时要避免说“完全等效”。准确表述是：
+
+> 对话框已经有后端搜索 API，当前能覆盖快速语义检索主链路；但要达到旧前端搜索的完整召回能力，还需要把 token 检索、治理加权、图谱扩展迁入后端。
+
+### 3. 当前仍存在的问题
+
+#### P0：fallback 仍可能回到前端全量扫描
+
+`chat-panel.tsx` 当前逻辑是：
+
+```ts
+try /api/rag/retrieve
+if success and chunks.length > 0:
+  use backend chunks
+else:
+  searchWiki(pp, text)
+  buildRetrievalGraph(pp, dataVersion)
+```
+
+问题：
+
+- 如果向量索引为空、embedding 失败、LanceDB schema mismatch、后端返回空 chunks，就会退回旧前端链路。
+- 对 `rag` 这种大项目，这会重新出现分钟级卡顿。
+
+Claude 执行建议：
+
+- 大项目禁止默认 fallback 到前端全量扫描。
+- 增加项目规模判断，例如 md 文件数或 wiki 总字节数超过阈值时：
+  - 不调用 `searchWiki()`
+  - 返回明确提示：后端索引不可用，请重建索引
+  - 或调用后端 token fallback
+
+#### P1：`/api/rag/retrieve` 只有 vector，没有 token/BM25
+
+问题：
+
+- 对精确词、产品名、条款编号、服务入口等问题，纯 vector 可能不如 token 检索稳定。
+- 旧前端的 tokenRank 和 vectorRank RRF 融合还没迁移。
+
+Claude 执行建议：
+
+- 在后端新增 token retrieval：
+  - 第一版可用 server-side markdown scan + 缓存
+  - 稳定版改 SQLite FTS5
+- 在 `/api/rag/retrieve` 内做 RRF：
+  - vector rank
+  - token rank
+  - 后续 graph rank
+- 响应 chunks 增加：
+  - `source: "vector" | "token" | "hybrid" | "graph"`
+  - `rank`
+  - `scores: { vector?, token?, rrf? }`
+
+#### P1：graph relevance 还没有服务化
+
+问题：
+
+- 旧前端会在 fallback 模式下调用 `buildRetrievalGraph()`，冷启动要读全量 wiki。
+- 当前后端 RAG 没有图谱扩展，相关页面召回能力下降。
+
+Claude 执行建议：
+
+- 不要把 graph build 放回对话框前端主链路。
+- 后端新增 graph index/cache：
+  - 启动或首次请求时构建
+  - 按 `dataVersion` 或文件 mtime 失效
+  - 返回 related chunks/pages
+- `/api/rag/retrieve` 增加 `use_graph` 参数并真正生效。
+
+#### P1：缺少索引状态 API
+
+问题：
+
+- 用户不知道当前项目是否已经 re-index。
+- 也不知道当前 LanceDB 是不是 1152 维、模型是否匹配、chunk count 是否为 0。
+
+Claude 执行建议：
+
+新增或增强：
+
+```http
+GET /api/rag/status?project_path=...
+```
+
+返回：
+
+```json
+{
+  "indexed": true,
+  "chunk_count": 713,
+  "dim": 1152,
+  "embedding_model": "...",
+  "schema_version": 2,
+  "needs_reindex": false,
+  "reason": null
+}
+```
+
+ChatPanel 在 `/api/rag/retrieve` 返回空时应读取 status，并给用户明确错误，而不是静默 fallback。
+
+#### P1：后端 RAG 需要 timings
+
+问题：
+
+当前只返回 `retrieval_ms`。排查慢问题时不够。
+
+Claude 执行建议：
+
+`/api/rag/retrieve` 返回：
+
+```json
+{
+  "timings": {
+    "embed_ms": 180,
+    "vector_ms": 40,
+    "token_ms": 15,
+    "graph_ms": 0,
+    "total_ms": 240
+  }
+}
+```
+
+前端 console 打印：
+
+```ts
+console.log("[RAG]", ragData.timings)
+```
+
+#### P2：把 `handlers/rag.rs` 拆成 retrieval 模块
+
+当前功能集中在 `server-rs/src/handlers/rag.rs`。短期可用，但后续加 token、RRF、graph 后会变大。
+
+Claude 执行建议：
+
+拆成：
+
+```text
+server-rs/src/retrieval/
+  mod.rs
+  vector.rs
+  token.rs
+  rrf.rs
+  graph.rs
+```
+
+`handlers/rag.rs` 只保留 HTTP request/response。
+
+### 4. Claude 推荐执行顺序
+
+#### Step A：先修 fallback 策略
+
+目标：保证大项目不会再回到前端全量扫描。
+
+验收：
+
+- 手动让 `/api/rag/retrieve` 返回空或 500。
+- `rag` 项目对话框不能再卡到分钟级。
+- 前端应提示“后端检索不可用/索引需要重建”，或走后端 token fallback。
+
+#### Step B：实现后端 token fallback
+
+目标：即使 vector index 不可用，也不让浏览器扫文件。
+
+第一版可以简单：
+
+- 后端扫描 wiki markdown
+- 用内存缓存 `project_path + mtime/version`
+- 返回 token top chunks
+
+稳定版：
+
+- SQLite FTS5
+- ingest/re-index 时同步写入
+
+#### Step C：实现 vector + token RRF
+
+目标：让 `/api/rag/retrieve` 质量接近旧前端 `searchWiki()`。
+
+验收：
+
+- 精确产品名、服务名、条款词能稳定命中。
+- 泛语义问题仍能靠 vector 命中。
+- response 中能看出 chunk 来自 vector/token/hybrid。
+
+#### Step D：实现 graph 后端扩展
+
+目标：迁移旧前端 graph relevance 能力。
+
+验收：
+
+- `buildRetrievalGraph()` 不再出现在 ChatPanel 问答主链路。
+- `/api/rag/retrieve` 可以返回直接命中 chunk + related chunks/pages。
+
+#### Step E：补 `/api/rag/status`
+
+目标：把“索引缺失、维度不一致、需要 re-index”变成可见状态。
+
+验收：
+
+- Settings 和 ChatPanel 都能读到 index status。
+- 用户不再看到无意义的空回答或长时间等待。
+
+### 5. 当前 Codex 本机备注
+
+Codex 在 8081 上已经验证：
+
+- `/api/rag/retrieve` 对 `rag` 项目通常 200-300ms 返回 chunks。
+- 8081 完整 RAG + LLM 流式测试可在数秒内返回。
+- KnowledgeTree 的 Entities/七大域显示问题已在 Codex 本机源码修过并部署到 `dist-8081`，但该源码修复尚未提交到 GitHub，Claude 从 GitHub 拉代码时默认看不到这三处本地改动。
+
+这三处本地改动涉及：
+
+- `src/components/layout/knowledge-tree.tsx`
+- `src/components/chat/chat-panel.tsx`
+- `src/components/chat/chat-message.tsx`
+
+如果 Claude 继续开发，建议先从 GitHub 最新分支拉取，再根据本节内容决定是否由 Claude 复现/合并这些前端修复。
