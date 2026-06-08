@@ -1487,7 +1487,10 @@ function buildOcrDetailSection(
 ): string {
   const clipped = sourceContent.length > OCR_DETAIL_CHAR_LIMIT
   const preserved = clipped ? sourceContent.slice(0, OCR_DETAIL_CHAR_LIMIT) : sourceContent
-  const originLabel = sourceOrigin === "ocr-pdf" ? "图片型 PDF OCR" : "图片 OCR"
+  const originLabel =
+    sourceOrigin === "ocr-pdf" ? "图片型 PDF OCR"
+    : sourceOrigin === "ocr-image" ? "图片 OCR"
+    : "文字型文档（直接提取）"
   const rowCount = estimateTableLikeRowCount(sourceContent)
   const codeCount = countUniqueProductLikeCodes(sourceContent)
 
@@ -1495,18 +1498,18 @@ function buildOcrDetailSection(
     "",
     OCR_DETAIL_SECTION_MARKER,
     "",
-    "## 原始OCR明细（自动保留）",
+    "## 原始全文（自动保留）",
     "",
     `来源类型：${originLabel}`,
-    `OCR字符数：${sourceContent.length}`,
+    `原文字符数：${sourceContent.length}`,
     `疑似表格行数：${rowCount}`,
     `识别到的唯一产品/代码数：${codeCount}`,
     "",
-    "> 这部分是系统自动保留的 OCR 原文，用于演示、人工复核、RAG 精确检索和后续结构化抽取。上方知识卡可以摘要化，但这里不应省略长表格明细。",
+    "> 这部分是系统自动保留的原始全文，用于人工复核、RAG 精确检索和后续结构化抽取。上方知识卡片可以摘要化，但这里完整保留所有原文，包括费率表、条款原文、数字明细，不得省略。",
     "",
     preserved.trim(),
     "",
-    clipped ? `[OCR 明细过长，仅保留前 ${OCR_DETAIL_CHAR_LIMIT} 字符；完整内容请查看原始上传文件。]` : "",
+    clipped ? `[原文过长，仅保留前 ${OCR_DETAIL_CHAR_LIMIT} 字符；完整内容请查看原始上传文件。]` : "",
     "",
     OCR_DETAIL_SECTION_END_MARKER,
     "",
@@ -1518,7 +1521,10 @@ async function preserveOcrDetailsInSourcePage(
   sourceContent: string,
   sourceOrigin: IngestSourceOrigin,
 ): Promise<void> {
-  if (sourceOrigin === "raw" && !isTableLikeSource(sourceContent)) return
+  // Preserve the full original text for ALL ingested files — not just OCR or
+  // table-heavy sources. Plain-text PDFs (product terms, fee-rate tables,
+  // underwriting rules, etc.) must also land verbatim in the source page so
+  // that RAG retrieval and human review can access the exact original wording.
   if (!sourceContent.trim()) return
 
   try {
