@@ -88,6 +88,190 @@ function sanitizeJsonValue<T>(value: T): T {
   return value
 }
 
+function isJsonSourcePath(path: string): boolean {
+  return /\.json$/i.test(path)
+}
+
+function asJsonRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null
+}
+
+function stringField(record: Record<string, unknown> | null, keys: string[]): string {
+  if (!record) return ""
+  for (const key of keys) {
+    const value = record[key]
+    if (typeof value === "string" && value.trim()) return value.trim()
+    if (typeof value === "number" && Number.isFinite(value)) return String(value)
+  }
+  return ""
+}
+
+function markdownTableCell(value: unknown): string {
+  const text = typeof value === "string"
+    ? value
+    : value === null || value === undefined
+      ? ""
+      : JSON.stringify(sanitizeJsonValue(value))
+  return String(text ?? "")
+    .replace(/\r?\n/g, "<br>")
+    .replace(/\|/g, "\\|")
+}
+
+function yamlInlineStringList(items: string[]): string {
+  return `[${items.map((item) => yamlScalar(item)).join(", ")}]`
+}
+
+function buildDeterministicJsonSourcePage(
+  sourceSummaryPath: string,
+  fileName: string,
+  sourceContent: string,
+): string {
+  let parsed: unknown = null
+  let parseError = ""
+  try {
+    parsed = JSON.parse(sourceContent)
+  } catch (err) {
+    parseError = err instanceof Error ? err.message : String(err)
+  }
+
+  const record = asJsonRecord(parsed)
+  const clauseName = stringField(record, ["clauseName", "productName", "planName", "title", "name"])
+  const planCode = stringField(record, ["planCode", "actualPlanCode", "productCode", "code"])
+  const salesStatus = stringField(record, ["planSalesStatus", "salesStatus", "status"])
+  const planType = stringField(record, ["planPlanType", "productType", "type"])
+  const salesChannel = stringField(record, ["planSalesChannel", "salesChannel", "channel"])
+  const startDate = stringField(record, ["startDate", "effectiveDate", "date"])
+  const regulatoryCode = stringField(record, ["sccode", "recordCode", "regulatoryCode"])
+  const title = clauseName ? `${clauseName}产品元数据` : `JSON Source: ${fileName}`
+  const summaryParts = [
+    clauseName ? `产品名称：${clauseName}` : "",
+    planCode ? `产品代码：${planCode}` : "",
+    salesStatus ? `销售状态：${salesStatus}` : "",
+    planType ? `产品类型：${planType}` : "",
+  ].filter(Boolean)
+  const summary = summaryParts.length > 0
+    ? summaryParts.join("；")
+    : parseError
+      ? `JSON 文件解析失败：${parseError}`
+      : `JSON 文件 ${fileName} 的确定性源页面。`
+  const fieldEntries = record ? Object.entries(record) : []
+  const factRows = fieldEntries.map(([key, value]) =>
+    `| \`${markdownTableCell(key)}\` | ${markdownTableCell(value)} |`,
+  )
+  const attrs = sanitizeJsonValue({
+    doc_type: clauseName || planCode ? "product_meta" : "json",
+    file_format: "json",
+    field_count: fieldEntries.length,
+    deterministic_extract: true,
+    plan_code: planCode || undefined,
+    clause_name: clauseName || undefined,
+    parse_error: parseError || undefined,
+  })
+
+  return normalizeSchemaFrontmatter([
+    "---",
+    "type: source",
+    "entity_type: source",
+    "knowledge_domain: product",
+    "domain: product",
+    "taxonomy_path: [product, source]",
+    `title: ${yamlScalar(title)}`,
+    `summary: ${yamlScalar(summary)}`,
+    `source_files: ${yamlInlineStringList([fileName])}`,
+    `sources: ${yamlInlineStringList([fileName])}`,
+    `source_type: ${yamlScalar(clauseName || planCode ? "product_meta" : "json")}`,
+    "confidence: 1",
+    "status: candidate",
+    "needs_review: true",
+    `attributes: ${JSON.stringify(attrs)}`,
+    "---",
+    "",
+    `# ${title}`,
+    "",
+    "## 原文事实清单",
+    "",
+    parseError ? `JSON 解析失败：${parseError}` : `以下字段直接来自 \`${fileName}\`，未经过 LLM 改写。`,
+    "",
+    fieldEntries.length > 0 ? "| 字段名 | 原始值 |" : "",
+    fieldEntries.length > 0 ? "|---|---|" : "",
+    ...factRows,
+    "",
+    clauseName || planCode || salesStatus || planType || salesChannel || startDate || regulatoryCode
+      ? "## 产品元数据"
+      : "",
+    clauseName ? `- 产品名称：${clauseName}` : "",
+    planCode ? `- 产品代码：${planCode}` : "",
+    salesStatus ? `- 销售状态：${salesStatus}` : "",
+    planType ? `- 产品类型：${planType}` : "",
+    salesChannel ? `- 销售渠道：${salesChannel}` : "",
+    startDate ? `- 生效日期：${startDate}` : "",
+    regulatoryCode ? `- 备案/监管编号：${regulatoryCode}` : "",
+    "",
+    "## 覆盖审计",
+    "",
+    "- 本页面由 JSON 快速抽取路径生成，字段值来自 JSON 解析结果。",
+    "- 原始 JSON 全文保留在下方自动保留区块，用于人工复核和 RAG 精确检索。",
+    "- 如果同名 JSON 被再次上传，本 source page 会按最新 raw 文件重写。",
+    "",
+    buildOcrDetailSection(sourceContent, "raw").trim(),
+    "",
+  ].filter((line) => line !== "").join("\n"), {
+    relativePath: sourceSummaryPath,
+    sourceFileName: fileName,
+    defaultStatus: "candidate",
+    defaultCreatedBy: _getUploaderUsername(),
+  })
+}
+
+async function fastIngestJsonSource(
+  pp: string,
+  fileName: string,
+  sourceContent: string,
+  sourceOrigin: IngestSourceOrigin,
+  sourceSummaryPath: string,
+  sourceSummaryFullPath: string,
+  activityId: string,
+): Promise<string[]> {
+  const activity = useActivityStore.getState()
+  const preparedSource: PreparedIngestSource = {
+    content: sourceContent,
+    originalChars: sourceContent.length,
+    contextChars: sourceContent.length,
+    chunkCount: 1,
+    processingMode: "direct",
+    qualityConfidence: "high",
+    qualityNotes: ["JSON source was parsed deterministically without LLM generation."],
+  }
+  const writtenPaths = [sourceSummaryPath]
+
+  activity.updateItem(activityId, { detail: "JSON source detected - writing deterministic source page..." })
+  await createDirectory(`${pp}/wiki/sources`).catch(() => {/* existing directory is fine */})
+  await writeFile(
+    sourceSummaryFullPath,
+    cleanupKnowledgeFrontmatter(buildDeterministicJsonSourcePage(sourceSummaryPath, fileName, sourceContent)),
+  )
+
+  const { stampCandidate } = await import("@/lib/knowledge-governance")
+  await stampCandidate(sourceSummaryFullPath).catch(() => {/* non-critical */})
+  await stampIngestQualityMetadata(sourceSummaryFullPath, preparedSource).catch(() => {/* non-critical */})
+  await preserveOcrDetailsInSourcePage(sourceSummaryFullPath, sourceContent, sourceOrigin)
+  await saveIngestCache(pp, fileName, sourceContent, writtenPaths)
+  await embedWrittenIngestPages(pp, writtenPaths)
+
+  activity.updateItem(activityId, {
+    status: "done",
+    detail: "JSON source page written without LLM extraction",
+    filesWritten: writtenPaths,
+    step: undefined,
+    newEntities: 0,
+    mergedEntities: 0,
+  })
+
+  return writtenPaths
+}
+
 interface PreparedIngestSource {
   content: string
   originalChars: number
@@ -1621,6 +1805,29 @@ async function preserveSchemaCandidateAuditInSourcePage(
   }
 }
 
+async function embedWrittenIngestPages(pp: string, writtenPaths: string[]): Promise<void> {
+  const embCfg = useWikiStore.getState().embeddingConfig
+  if (!embCfg.enabled || !embCfg.model || writtenPaths.length === 0) return
+
+  try {
+    const { embedPage } = await import("@/lib/embedding")
+    for (const wpath of writtenPaths) {
+      const pageId = wpath.split("/").pop()?.replace(/\.md$/, "") ?? ""
+      if (!pageId || ["index", "log", "overview"].includes(pageId)) continue
+      try {
+        const content = await readFile(`${pp}/${wpath}`)
+        const titleMatch = content.match(/^---\n[\s\S]*?^title:\s*["']?(.+?)["']?\s*$/m)
+        const title = titleMatch ? titleMatch[1].trim() : pageId
+        await embedPage(pp, pageId, title, content, embCfg)
+      } catch {
+        // non-critical
+      }
+    }
+  } catch {
+    // embedding module not available
+  }
+}
+
 /**
  * Resolve the LLM config that the caption pipeline should use.
  * `null` = captioning is OFF, caller should skip the pipeline
@@ -2329,6 +2536,26 @@ async function autoIngestImpl(
   const sourceSummaryPath = `wiki/sources/${sourceBaseName}.md`
   const sourceSummaryFullPath = `${pp}/${sourceSummaryPath}`
 
+  if (isJsonSourcePath(sp)) {
+    try {
+      return await fastIngestJsonSource(
+        pp,
+        fileName,
+        sourceContent,
+        sourceOrigin,
+        sourceSummaryPath,
+        sourceSummaryFullPath,
+        activityId,
+      )
+    } catch (err) {
+      activity.updateItem(activityId, {
+        status: "error",
+        detail: `JSON ingest failed: ${errorMessage(err)}`,
+      })
+      throw err
+    }
+  }
+
   // ── Cache check: skip re-ingest if source content hasn't changed ──
   //
   // Image cascade still runs on cache hits. Reason: a user may have
@@ -2978,26 +3205,7 @@ async function autoIngestImpl(
   }
 
   // ── Step 6: Generate embeddings (if enabled) ───────────────
-  const embCfg = useWikiStore.getState().embeddingConfig
-  if (embCfg.enabled && embCfg.model && writtenPaths.length > 0) {
-    try {
-      const { embedPage } = await import("@/lib/embedding")
-      for (const wpath of writtenPaths) {
-        const pageId = wpath.split("/").pop()?.replace(/\.md$/, "") ?? ""
-        if (!pageId || ["index", "log", "overview"].includes(pageId)) continue
-        try {
-          const content = await readFile(`${pp}/${wpath}`)
-          const titleMatch = content.match(/^---\n[\s\S]*?^title:\s*["']?(.+?)["']?\s*$/m)
-          const title = titleMatch ? titleMatch[1].trim() : pageId
-          await embedPage(pp, pageId, title, content, embCfg)
-        } catch {
-          // non-critical
-        }
-      }
-    } catch {
-      // embedding module not available
-    }
-  }
+  await embedWrittenIngestPages(pp, writtenPaths)
 
   // ── Step 7: Governance pipeline (conflict detection + LLM judge) ──────────
   // Runs fire-and-forget — never blocks ingest completion.

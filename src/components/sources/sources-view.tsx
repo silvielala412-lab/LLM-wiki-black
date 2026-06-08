@@ -3,7 +3,7 @@ import { Plus, FileText, RefreshCw, BookOpen, Trash2, Folder, ChevronRight, Chev
 import { Button } from "@/components/ui/button"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { useWikiStore } from "@/stores/wiki-store"
-import { copyFile, listDirectory, readFile, writeFile, deleteFile, findRelatedWikiPages, preprocessFile } from "@/commands/fs"
+import { copyFile, listDirectory, readFile, writeFile, deleteFile, findRelatedWikiPages, preprocessFile, fileExists } from "@/commands/fs"
 import type { FileNode } from "@/types/wiki"
 import { enqueueIngest, enqueueBatch } from "@/lib/ingest-queue"
 import { useTranslation } from "react-i18next"
@@ -180,9 +180,10 @@ export function SourcesView() {
   }
 
   async function handleOpenSource(node: FileNode) {
-    setSelectedFile(node.path)
+    const targetPath = project ? await resolveSourcePreviewPath(normalizePath(project.path), node) : node.path
+    setSelectedFile(targetPath)
     try {
-      const content = await readFile(node.path)
+      const content = await readFile(targetPath)
       setFileContent(content)
     } catch (err) {
       console.error("Failed to read source:", err)
@@ -578,6 +579,18 @@ function countFiles(nodes: FileNode[]): number {
     }
   }
   return count
+}
+
+async function resolveSourcePreviewPath(projectPath: string, node: FileNode): Promise<string> {
+  if (node.is_dir) return node.path
+  const sourceBaseName = getFileName(node.path).replace(/\.[^.]+$/, "")
+  const parsedSourcePath = `${projectPath}/wiki/sources/${sourceBaseName}.md`
+  try {
+    if (await fileExists(parsedSourcePath)) return parsedSourcePath
+  } catch {
+    // Fall back to the uploaded raw source.
+  }
+  return node.path
 }
 
 
