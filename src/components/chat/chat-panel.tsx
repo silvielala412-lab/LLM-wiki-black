@@ -3,7 +3,7 @@ import { BookOpen, Plus, Trash2, MessageSquare } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { ChatMessage, StreamingMessage, useSourceFiles } from "./chat-message"
 import { ChatInput } from "./chat-input"
-import { useChatStore, chatMessagesToLLM } from "@/stores/chat-store"
+import { useChatStore, chatMessagesToLLM, type MessageReference } from "@/stores/chat-store"
 import { useWikiStore } from "@/stores/wiki-store"
 import { streamChat, type ChatMessage as LLMMessage } from "@/lib/llm-client"
 import { executeIngestWrites } from "@/lib/ingest"
@@ -20,6 +20,130 @@ import type { FileNode } from "@/types/wiki"
 
 // Store the page mapping from the last query so SourceFilesBar can show which pages were cited
 export let lastQueryPages: { title: string; path: string }[] = []
+
+interface BackendChatSource {
+  title?: string
+  path?: string
+}
+
+interface BackendChatMeta {
+  retrieval_ms?: number
+  sources?: BackendChatSource[]
+}
+
+interface BackendChatCallbacks {
+  onMeta: (meta: BackendChatMeta) => void
+  onToken: (token: string) => void
+  onDone: () => void
+  onError: (error: Error) => void
+}
+
+function parseBackendChatData(data: string): { meta?: BackendChatMeta; token?: string } {
+  if (data === "[DONE]") return {}
+  try {
+    const json = JSON.parse(data)
+    if (json?.type === "chat_meta") return { meta: json as BackendChatMeta }
+    const token = json?.choices?.[0]?.delta?.content
+    return typeof token === "string" ? { token } : {}
+  } catch {
+    return {}
+  }
+}
+
+function backendSourcesToReferences(sources: BackendChatSource[] | undefined): MessageReference[] {
+  return (sources ?? [])
+    .filter((source) => source.path || source.title)
+    .map((source) => ({
+      title: source.title || source.path || "Source",
+      path: source.path || source.title || "",
+    }))
+}
+
+async function streamBackendProjectChat(
+  projectPath: string,
+  messages: LLMMessage[],
+  options: {
+    maxHistoryMessages: number
+    model?: string
+    temperature?: number
+    maxTokens?: number
+    topK?: number
+  },
+  callbacks: BackendChatCallbacks,
+  signal?: AbortSignal,
+): Promise<void> {
+  let response: Response
+  try {
+    response = await fetch("/api/chat/stream", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        project_path: projectPath,
+        messages,
+        stream: true,
+        top_k: options.topK ?? 8,
+        max_history_messages: options.maxHistoryMessages,
+        temperature: options.temperature ?? 0.2,
+        max_tokens: options.maxTokens ?? 1600,
+        model: options.model,
+      }),
+      signal,
+    })
+  } catch (err) {
+    if (signal?.aborted) {
+      callbacks.onDone()
+      return
+    }
+    callbacks.onError(err instanceof Error ? err : new Error(String(err)))
+    return
+  }
+
+  if (!response.ok) {
+    const detail = await response.text().catch(() => response.statusText)
+    callbacks.onError(new Error(`HTTP ${response.status}: ${detail || response.statusText}`))
+    return
+  }
+
+  if (!response.body) {
+    callbacks.onError(new Error("Response body is null"))
+    return
+  }
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ""
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split(/\r?\n/)
+      buffer = lines.pop() ?? ""
+
+      for (const line of lines) {
+        const trimmed = line.trim()
+        if (!trimmed.startsWith("data:")) continue
+        const parsed = parseBackendChatData(trimmed.slice(5).trim())
+        if (parsed.meta) callbacks.onMeta(parsed.meta)
+        if (parsed.token) callbacks.onToken(parsed.token)
+      }
+    }
+
+    if (buffer.trim().startsWith("data:")) {
+      const parsed = parseBackendChatData(buffer.trim().slice(5).trim())
+      if (parsed.meta) callbacks.onMeta(parsed.meta)
+      if (parsed.token) callbacks.onToken(parsed.token)
+    }
+    callbacks.onDone()
+  } catch (err) {
+    if (signal?.aborted) {
+      callbacks.onDone()
+      return
+    }
+    callbacks.onError(err instanceof Error ? err : new Error(String(err)))
+  }
+}
 
 type ChatDeleteItem = { name: string; path: string }
 
@@ -250,7 +374,7 @@ export function ChatPanel() {
       }
     }
     try {
-      const tree = await listDirectory(pp)
+      const tree = await listDirectory(pp) as FileNode[]
       useWikiStore.getState().setFileTree(tree)
       useWikiStore.getState().bumpDataVersion()
       useWikiStore.getState().setSelectedFile(null)
@@ -263,6 +387,37 @@ export function ChatPanel() {
     )
     setPendingChatDeletes([])
   }, [addMessage, pendingChatDeletes, project])
+
+  const handleAssistantActions = useCallback(async (content: string) => {
+    if (!project) return
+    const pp = normalizePath(project.path)
+
+    const deleteTagRe = /<!-- action:delete\s+page="([^"]+)"\s+path="([^"]+)"\s*-->/g
+    const deleteItems: ChatDeleteItem[] = []
+    for (const m of content.matchAll(deleteTagRe)) {
+      deleteItems.push({ name: m[1], path: `${pp}/${m[2]}` })
+    }
+    if (deleteItems.length > 0) {
+      setPendingChatDeletes(deleteItems)
+    }
+
+    const fileBlockMatch = content.match(/---FILE:\s*(.+?)\s*---\n([\s\S]*?)---END FILE---/)
+    if (fileBlockMatch) {
+      const relPath = fileBlockMatch[1].trim()
+      let fileContent = fileBlockMatch[2]
+      if (!fileContent.includes("ingested_by:")) {
+        fileContent = fileContent.replace("---\n\n", `ingested_at: "${new Date().toISOString()}"\ningested_by: "chat"\n---\n\n`)
+      }
+      try {
+        await writeFile(`${pp}/${relPath}`, fileContent)
+        const tree = await listDirectory(pp) as FileNode[]
+        useWikiStore.getState().setFileTree(tree)
+        useWikiStore.getState().bumpDataVersion()
+      } catch (err) {
+        console.error("[ChatPanel] Create page from chat failed:", err)
+      }
+    }
+  }, [project])
 
   // Auto-scroll to bottom when messages change or streaming content updates
   useEffect(() => {
@@ -318,6 +473,57 @@ export function ChatPanel() {
 
       setStreaming(true)
 
+      const greetingOnly = isGreeting(text)
+      if (project && !greetingOnly && mode === "chat") {
+        const pp = normalizePath(project.path)
+        const controller = new AbortController()
+        abortRef.current = controller
+
+        let accumulated = ""
+        let queryRefs: MessageReference[] = []
+        lastQueryPages = []
+
+        const backendMessages = chatMessagesToLLM(
+          useChatStore.getState().getActiveMessages()
+            .filter((m) => m.role === "user" || m.role === "assistant")
+            .slice(-maxHistoryMessages)
+        )
+
+        await streamBackendProjectChat(
+          pp,
+          backendMessages,
+          {
+            maxHistoryMessages,
+            model: llmConfig.model,
+            temperature: 0.2,
+            maxTokens: 1600,
+            topK: 8,
+          },
+          {
+            onMeta: (meta) => {
+              queryRefs = backendSourcesToReferences(meta.sources)
+              lastQueryPages = queryRefs
+              console.log(`[Chat] backend stream retrieval: ${meta.retrieval_ms ?? 0}ms, sources=${queryRefs.length}`)
+            },
+            onToken: (token) => {
+              accumulated += token
+              appendStreamToken(token)
+            },
+            onDone: () => {
+              finalizeStream(accumulated, queryRefs.length > 0 ? queryRefs : undefined)
+              abortRef.current = null
+              void handleAssistantActions(accumulated)
+            },
+            onError: (err) => {
+              finalizeStream(`Error: ${err.message}`, undefined)
+              abortRef.current = null
+            },
+          },
+          controller.signal,
+        )
+        return
+      }
+
       // Build system prompt with wiki context using graph-enhanced retrieval
       const systemMessages: LLMMessage[] = []
       let queryRefs: { title: string; path: string }[] = []
@@ -326,7 +532,6 @@ export function ChatPanel() {
       // retrieval pipeline — it's slow, costs context, and drags in random
       // wiki pages the user clearly didn't ask about. Short-circuit with a
       // minimal system prompt and let the model reply conversationally.
-      const greetingOnly = isGreeting(text)
       if (project && greetingOnly) {
         const outLang = getOutputLanguage(text)
         systemMessages.push({
@@ -366,25 +571,11 @@ export function ChatPanel() {
         let usedBackendRetrieval = false
         let ragChunks: Array<{ page_path: string; page_title: string; chunk_text: string; heading_path: string; score: number; source: string }> = []
         let retrievalMs = 0
-        let backendUnavailable = false
         let backendReturnedEmpty = false
 
-        // Estimate project size to decide fallback policy
-        let wikiFileCount = 0
-        try {
-          const { listDirectory: ld } = await import("@/commands/fs")
-          const wikiTree = await ld(`${pp}/wiki`)
-          function countMd(nodes: import("@/types/wiki").FileNode[]): number {
-            let n = 0
-            for (const node of nodes) {
-              if (node.is_dir && node.children) n += countMd(node.children)
-              else if (!node.is_dir && node.name.endsWith(".md")) n++
-            }
-            return n
-          }
-          wikiFileCount = countMd(wikiTree)
-        } catch { /* ignore */ }
-        const isLargeProject = wikiFileCount > 100
+        // Backend retrieval is mandatory for chat. The legacy browser-side
+        // fallback can scan many markdown files and rebuild graph state.
+        const isLargeProject = true
 
         try {
           const ragRes = await fetch('/api/rag/retrieve', {
@@ -405,10 +596,9 @@ export function ChatPanel() {
               console.warn('[RAG] backend returned 0 chunks')
             }
           } else {
-            backendUnavailable = true
+            console.warn(`[RAG] backend returned HTTP ${ragRes.status}`)
           }
         } catch (err) {
-          backendUnavailable = true
           console.warn('[RAG] backend unavailable:', err)
         }
 
@@ -435,7 +625,7 @@ export function ChatPanel() {
           }
           setStreaming(false)
           addMessage("assistant",
-            `⚠️ **后端检索不可用**（项目共 ${wikiFileCount} 个 wiki 文件，不允许前端全量扫描）\n\n` +
+            `⚠️ **后端检索不可用**（已阻止前端全量扫描）\n\n` +
             `原因：${reason}\n\n` +
             `请确认后端服务（8081）正常运行并完成索引重建后重试。`
           )
@@ -644,37 +834,7 @@ export function ChatPanel() {
           onDone: async () => {
             finalizeStream(accumulated, queryRefs)
             abortRef.current = null
-            // Parse action tags from LLM response
-            if (project) {
-              const pp = normalizePath(project.path)
-              // Handle delete actions — supports multiple tags in one response
-              const deleteTagRe = /<!-- action:delete\s+page="([^"]+)"\s+path="([^"]+)"\s*-->/g
-              const deleteItems: ChatDeleteItem[] = []
-              for (const m of accumulated.matchAll(deleteTagRe)) {
-                deleteItems.push({ name: m[1], path: `${pp}/${m[2]}` })
-              }
-              if (deleteItems.length > 0) {
-                setPendingChatDeletes(deleteItems)
-              }
-              // Handle create action (FILE blocks)
-              const fileBlockMatch = accumulated.match(/---FILE:\s*(.+?)\s*---\n([\s\S]*?)---END FILE---/)
-              if (fileBlockMatch) {
-                const relPath = fileBlockMatch[1].trim()
-                let fileContent = fileBlockMatch[2]
-                // Inject provenance if not present
-                if (!fileContent.includes('ingested_by:')) {
-                  fileContent = fileContent.replace('---\n\n', `ingested_at: "${new Date().toISOString()}"\ningested_by: "chat"\n---\n\n`)
-                }
-                try {
-                  await writeFile(`${pp}/${relPath}`, fileContent)
-                  const tree = await listDirectory(pp)
-                  useWikiStore.getState().setFileTree(tree)
-                  useWikiStore.getState().bumpDataVersion()
-                } catch (err) {
-                  console.error('[ChatPanel] Create page from chat failed:', err)
-                }
-              }
-            }
+            await handleAssistantActions(accumulated)
           },
           onError: (err) => {
             finalizeStream(`Error: ${err.message}`, undefined)
@@ -685,7 +845,7 @@ export function ChatPanel() {
         { temperature: 0.2, max_tokens: 1600 },
       )
     },
-    [llmConfig, addMessage, setStreaming, appendStreamToken, finalizeStream, createConversation, maxHistoryMessages, project],
+    [llmConfig, addMessage, setStreaming, appendStreamToken, finalizeStream, createConversation, maxHistoryMessages, project, mode, handleAssistantActions],
   )
 
   const handleStop = useCallback(() => {
@@ -724,7 +884,7 @@ export function ChatPanel() {
     try {
       await executeIngestWrites(pp, llmConfig, undefined, undefined)
       try {
-        const tree = await listDirectory(pp)
+        const tree = await listDirectory(pp) as FileNode[]
         setFileTree(tree)
       } catch {
         // ignore

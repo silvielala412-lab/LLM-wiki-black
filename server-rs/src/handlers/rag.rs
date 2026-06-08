@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, OnceLock},
     time::UNIX_EPOCH,
 };
@@ -41,6 +41,7 @@ const TABLE: &str = "chunks";
 const RRF_K: f64 = 60.0;
 const TOKEN_RESULT_MULTIPLIER: usize = 8;
 const VECTOR_RESULT_MULTIPLIER: usize = 5;
+const GRAPH_RESULT_MULTIPLIER: usize = 4;
 const MAX_TOKEN_CACHE_PROJECTS: usize = 8;
 
 #[derive(Deserialize)]
@@ -63,6 +64,8 @@ pub struct RetrievedChunk {
     pub distance: f64,
     pub score: f64,
     pub source: String,
+    #[serde(skip_serializing)]
+    pub quality_multiplier: f64,
 }
 
 #[derive(Serialize)]
@@ -78,6 +81,7 @@ pub struct RetrieveResponse {
 struct TokenIndexFingerprint {
     chunk_count: usize,
     meta_mtime_secs: u64,
+    wiki_mtime_secs: u64,
 }
 
 #[derive(Clone)]
@@ -92,6 +96,8 @@ struct IndexChunk {
     title_lower: String,
     heading_lower: String,
     text_lower: String,
+    schema_lower: String,
+    quality_multiplier: f64,
     token_counts: HashMap<String, u32>,
     token_len: usize,
 }
@@ -101,6 +107,9 @@ struct TokenIndex {
     chunks: Vec<IndexChunk>,
     doc_freq: HashMap<String, usize>,
     avg_doc_len: f64,
+    page_chunks: HashMap<String, Vec<usize>>,
+    page_meta: HashMap<String, PageMeta>,
+    in_links: HashMap<String, HashSet<String>>,
 }
 
 struct ScoredChunk {
@@ -108,13 +117,34 @@ struct ScoredChunk {
     raw_score: f64,
 }
 
+#[derive(Clone)]
+struct PageMeta {
+    page_path: String,
+    title: String,
+    page_type: String,
+    schema_text: String,
+    page_path_lower: String,
+    page_stem_lower: String,
+    title_lower: String,
+    full_text: String,
+    full_lower: String,
+    token_counts: HashMap<String, u32>,
+    token_len: usize,
+    sources: Vec<String>,
+    out_links: HashSet<String>,
+    quality_multiplier: f64,
+    excluded: bool,
+}
+
 struct FusedCandidate {
     chunk: RetrievedChunk,
     rrf_score: f64,
     vector_rank: Option<usize>,
     token_rank: Option<usize>,
+    graph_rank: Option<usize>,
     vector_score: f64,
     token_score: f64,
+    graph_score: f64,
 }
 
 static TOKEN_INDEX_CACHE: OnceLock<RwLock<HashMap<String, Arc<TokenIndex>>>> = OnceLock::new();
@@ -260,17 +290,13 @@ fn chunks_from_batches(
                     distance,
                     score: 1.0 - distance,
                     source: source.to_string(),
+                    quality_multiplier: 1.0,
                 });
             }
         }
     }
 
     chunks
-}
-
-async fn token_retrieve(project_path: &str, query: &str, limit: usize) -> anyhow::Result<Vec<ScoredChunk>> {
-    let index = get_token_index(project_path).await?;
-    Ok(score_token_index(&index, query, limit))
 }
 
 async fn get_token_index(project_path: &str) -> anyhow::Result<Arc<TokenIndex>> {
@@ -305,6 +331,7 @@ async fn token_index_fingerprint(project_path: &str) -> anyhow::Result<TokenInde
             return Ok(TokenIndexFingerprint {
                 chunk_count: 0,
                 meta_mtime_secs: vector_meta_mtime(project_path),
+                wiki_mtime_secs: wiki_mtime(project_path),
             })
         }
     };
@@ -316,6 +343,7 @@ async fn token_index_fingerprint(project_path: &str) -> anyhow::Result<TokenInde
     Ok(TokenIndexFingerprint {
         chunk_count,
         meta_mtime_secs: vector_meta_mtime(project_path),
+        wiki_mtime_secs: wiki_mtime(project_path),
     })
 }
 
@@ -330,46 +358,172 @@ fn vector_meta_mtime(project_path: &str) -> u64 {
         .unwrap_or(0)
 }
 
+fn wiki_mtime(project_path: &str) -> u64 {
+    let wiki_root = Path::new(project_path).join("wiki");
+    let mut max_mtime = 0;
+    let mut stack = vec![wiki_root];
+
+    while let Some(path) = stack.pop() {
+        let Ok(metadata) = path.metadata() else {
+            continue;
+        };
+
+        if metadata.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&path) {
+                for entry in entries.flatten() {
+                    stack.push(entry.path());
+                }
+            }
+            continue;
+        }
+
+        let is_markdown = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("md"))
+            .unwrap_or(false);
+        if !is_markdown {
+            continue;
+        }
+
+        if let Some(mtime) = metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+        {
+            max_mtime = max_mtime.max(mtime);
+        }
+    }
+
+    max_mtime
+}
+
+fn wiki_markdown_page_paths(project_path: &str) -> Vec<String> {
+    let project_root = Path::new(project_path);
+    let wiki_root = project_root.join("wiki");
+    let mut pages = Vec::new();
+    let mut stack = vec![wiki_root];
+
+    while let Some(path) = stack.pop() {
+        let Ok(metadata) = path.metadata() else {
+            continue;
+        };
+
+        if metadata.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&path) {
+                for entry in entries.flatten() {
+                    stack.push(entry.path());
+                }
+            }
+            continue;
+        }
+
+        let is_markdown = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("md"))
+            .unwrap_or(false);
+        if !is_markdown {
+            continue;
+        }
+
+        let rel = path.strip_prefix(project_root).unwrap_or(&path);
+        pages.push(rel.to_string_lossy().replace('\\', "/"));
+    }
+
+    pages
+}
+
 async fn load_token_index(
     project_path: &str,
     fingerprint: TokenIndexFingerprint,
 ) -> anyhow::Result<TokenIndex> {
-    if fingerprint.chunk_count == 0 {
-        return Ok(TokenIndex {
-            fingerprint,
-            chunks: vec![],
-            doc_freq: HashMap::new(),
-            avg_doc_len: 0.0,
-        });
+    let raw_chunks = if fingerprint.chunk_count > 0 {
+        let db_path = format!("{project_path}/.llm-wiki/lancedb");
+        let db = connect(&db_path).execute().await?;
+        let tbl = db.open_table(TABLE).execute().await?;
+        let batches: Vec<_> = tbl
+            .query()
+            .select(Select::columns(&[
+                "page_path",
+                "page_title",
+                "chunk_index",
+                "heading_path",
+                "chunk_text",
+            ]))
+            .limit(fingerprint.chunk_count)
+            .execute()
+            .await?
+            .try_collect()
+            .await?;
+        chunks_from_batches(&batches, "token", false)
+    } else {
+        Vec::new()
+    };
+
+    let mut unique_pages = HashSet::new();
+    let mut page_samples: HashMap<String, (String, String)> = HashMap::new();
+    for chunk in &raw_chunks {
+        let id = page_id(&chunk.page_path);
+        unique_pages.insert(id.clone());
+        page_samples
+            .entry(id)
+            .or_insert_with(|| (chunk.page_path.clone(), chunk.page_title.clone()));
     }
 
-    let db_path = format!("{project_path}/.llm-wiki/lancedb");
-    let db = connect(&db_path).execute().await?;
-    let tbl = db.open_table(TABLE).execute().await?;
-    let batches: Vec<_> = tbl
-        .query()
-        .select(Select::columns(&[
-            "page_path",
-            "page_title",
-            "chunk_index",
-            "heading_path",
-            "chunk_text",
-        ]))
-        .limit(fingerprint.chunk_count)
-        .execute()
-        .await?
-        .try_collect()
-        .await?;
+    for page_path in wiki_markdown_page_paths(project_path) {
+        let id = page_id(&page_path);
+        unique_pages.insert(id.clone());
+        let fallback_title = page_stem(&page_path).replace('-', " ");
+        page_samples
+            .entry(id)
+            .or_insert_with(|| (page_path, fallback_title));
+    }
 
-    let raw_chunks = chunks_from_batches(&batches, "token", false);
+    let mut page_meta = HashMap::new();
+    for id in &unique_pages {
+        let (page_path, title) = page_samples
+            .get(id)
+            .map(|(path, title)| (path.as_str(), title.as_str()))
+            .unwrap_or((id.as_str(), id.as_str()));
+        let meta = load_page_meta(project_path, page_path, title, &unique_pages).await;
+        if !meta.excluded {
+            page_meta.insert(id.clone(), meta);
+        }
+    }
+
+    let mut in_links: HashMap<String, HashSet<String>> = HashMap::new();
+    for id in page_meta.keys() {
+        in_links.entry(id.clone()).or_default();
+    }
+    for (from, meta) in &page_meta {
+        for to in &meta.out_links {
+            if page_meta.contains_key(to) && from != to {
+                in_links.entry(to.clone()).or_default().insert(from.clone());
+            }
+        }
+    }
+
     let mut chunks = Vec::with_capacity(raw_chunks.len());
     let mut doc_freq: HashMap<String, usize> = HashMap::new();
+    let mut page_chunks: HashMap<String, Vec<usize>> = HashMap::new();
     let mut total_len = 0usize;
 
     for chunk in raw_chunks {
+        let id = page_id(&chunk.page_path);
+        let meta = match page_meta.get(&id) {
+            Some(meta) => meta,
+            None => continue,
+        };
         let search_text = format!(
-            "{} {} {} {}",
-            chunk.page_path, chunk.page_title, chunk.heading_path, chunk.chunk_text
+            "{} {} {} {} {} {}",
+            chunk.page_path,
+            chunk.page_title,
+            chunk.heading_path,
+            chunk.chunk_text,
+            meta.schema_text,
+            meta.sources.join(" ")
         );
         let token_counts = token_counts(&search_text);
         let token_len: usize = token_counts.values().map(|v| *v as usize).sum();
@@ -381,12 +535,15 @@ async fn load_token_index(
         }
 
         let page_path_lower = chunk.page_path.to_lowercase();
+        let chunk_index = chunks.len();
         chunks.push(IndexChunk {
             page_stem_lower: page_stem(&chunk.page_path).to_lowercase(),
             page_path_lower,
             title_lower: chunk.page_title.to_lowercase(),
             heading_lower: chunk.heading_path.to_lowercase(),
             text_lower: chunk.chunk_text.to_lowercase(),
+            schema_lower: meta.schema_text.to_lowercase(),
+            quality_multiplier: meta.quality_multiplier,
             page_path: chunk.page_path,
             page_title: chunk.page_title,
             chunk_index: chunk.chunk_index,
@@ -395,6 +552,7 @@ async fn load_token_index(
             token_counts,
             token_len,
         });
+        page_chunks.entry(id).or_default().push(chunk_index);
     }
 
     let avg_doc_len = if chunks.is_empty() {
@@ -415,11 +573,288 @@ async fn load_token_index(
         chunks,
         doc_freq,
         avg_doc_len,
+        page_chunks,
+        page_meta,
+        in_links,
     })
 }
 
+async fn load_page_meta(
+    project_path: &str,
+    page_path: &str,
+    fallback_title: &str,
+    page_ids: &HashSet<String>,
+) -> PageMeta {
+    let id = page_id(page_path);
+    let content = match read_page_content(project_path, page_path).await {
+        Some(content) => content,
+        None => {
+            let full_text = fallback_title.to_string();
+            let token_counts = token_counts(&full_text);
+            let token_len = token_counts.values().map(|v| *v as usize).sum();
+            return PageMeta {
+                page_path: page_path.to_string(),
+                title: fallback_title.to_string(),
+                page_type: "other".to_string(),
+                schema_text: fallback_title.to_string(),
+                page_path_lower: page_path.to_lowercase(),
+                page_stem_lower: page_stem(page_path).to_lowercase(),
+                title_lower: fallback_title.to_lowercase(),
+                full_lower: full_text.to_lowercase(),
+                full_text,
+                token_counts,
+                token_len,
+                sources: vec![],
+                out_links: HashSet::new(),
+                quality_multiplier: 1.0,
+                excluded: false,
+            }
+        }
+    };
+
+    let fm = extract_frontmatter(&content);
+    let title = scalar_value(&fm, "title")
+        .or_else(|| first_heading(&content))
+        .unwrap_or_else(|| fallback_title.to_string());
+    let page_type = scalar_value(&fm, "type")
+        .or_else(|| scalar_value(&fm, "entity_type"))
+        .unwrap_or_else(|| "other".to_string())
+        .to_lowercase();
+    let (quality_multiplier, excluded) = governance_multiplier(&fm);
+    let sources = extract_sources(&fm);
+    let raw_links = extract_wikilinks(&content);
+    let out_links = raw_links
+        .into_iter()
+        .filter_map(|link| resolve_link(&link, page_ids))
+        .filter(|target| target != &id)
+        .collect::<HashSet<_>>();
+
+    let source_text = sources.join(" ");
+    let schema_text = [title.as_str(), page_type.as_str(), fm.as_str(), source_text.as_str()].join("\n");
+    let title_lower = title.to_lowercase();
+    let full_text = format!("{page_path}\n{title}\n{schema_text}\n{content}");
+    let token_counts = token_counts(&full_text);
+    let token_len = token_counts.values().map(|v| *v as usize).sum();
+
+    PageMeta {
+        page_path: page_path.to_string(),
+        title,
+        page_type,
+        schema_text,
+        page_path_lower: page_path.to_lowercase(),
+        page_stem_lower: page_stem(page_path).to_lowercase(),
+        title_lower,
+        full_lower: full_text.to_lowercase(),
+        full_text,
+        token_counts,
+        token_len,
+        sources,
+        out_links,
+        quality_multiplier,
+        excluded,
+    }
+}
+
+async fn read_page_content(project_path: &str, page_path: &str) -> Option<String> {
+    for candidate in page_candidates(project_path, page_path) {
+        if let Ok(content) = tokio::fs::read_to_string(candidate).await {
+            return Some(content);
+        }
+    }
+    None
+}
+
+fn page_candidates(project_path: &str, page_path: &str) -> Vec<PathBuf> {
+    let root = Path::new(project_path);
+    let normalized = page_path.replace('\\', "/");
+    let mut candidates = Vec::new();
+
+    let raw = PathBuf::from(&normalized);
+    if raw.is_absolute() {
+        candidates.push(raw);
+    } else {
+        candidates.push(root.join(&normalized));
+        candidates.push(root.join("wiki").join(&normalized));
+        if !normalized.ends_with(".md") {
+            candidates.push(root.join(format!("{normalized}.md")));
+            candidates.push(root.join("wiki").join(format!("{normalized}.md")));
+        }
+    }
+
+    let stem = page_stem(&normalized);
+    let dirs = [
+        "entities",
+        "concepts",
+        "sources",
+        "queries",
+        "synthesis",
+        "comparisons",
+        "audits",
+    ];
+    for dir in dirs {
+        candidates.push(root.join("wiki").join(dir).join(format!("{stem}.md")));
+    }
+    candidates.push(root.join("wiki").join(format!("{stem}.md")));
+    candidates
+}
+
+fn extract_frontmatter(content: &str) -> String {
+    let normalized = content.strip_prefix('\u{feff}').unwrap_or(content);
+    if !normalized.starts_with("---") {
+        return String::new();
+    }
+    let rest = &normalized[3..];
+    let rest = rest.strip_prefix("\r\n").or_else(|| rest.strip_prefix('\n')).unwrap_or(rest);
+    if let Some(idx) = rest.find("\n---") {
+        return rest[..idx].to_string();
+    }
+    String::new()
+}
+
+fn scalar_value(frontmatter: &str, key: &str) -> Option<String> {
+    for line in frontmatter.lines() {
+        let trimmed = line.trim();
+        let Some((k, v)) = trimmed.split_once(':') else {
+            continue;
+        };
+        if k.trim() != key {
+            continue;
+        }
+        let value = v
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .trim();
+        if !value.is_empty() && !value.starts_with('[') && !value.starts_with('{') {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn first_heading(content: &str) -> Option<String> {
+    content.lines().find_map(|line| {
+        let trimmed = line.trim();
+        trimmed
+            .strip_prefix("# ")
+            .map(|title| title.trim().to_string())
+            .filter(|title| !title.is_empty())
+    })
+}
+
+fn governance_multiplier(frontmatter: &str) -> (f64, bool) {
+    let status = scalar_value(frontmatter, "status")
+        .unwrap_or_else(|| "active".to_string())
+        .to_lowercase();
+    let status_multiplier = match status.as_str() {
+        "active" => 1.0,
+        "candidate" => 0.7,
+        "superseded" => 0.35,
+        "rejected" => 0.0,
+        _ => 1.0,
+    };
+    let quality = scalar_value(frontmatter, "ingest_quality_confidence")
+        .unwrap_or_default()
+        .to_lowercase();
+    let quality_multiplier = match quality.as_str() {
+        "high" => 1.0,
+        "medium" => 0.9,
+        "low" => 0.75,
+        _ => 1.0,
+    };
+    let multiplier = status_multiplier * quality_multiplier;
+    (multiplier, status == "rejected" || multiplier <= 0.0)
+}
+
+fn extract_sources(frontmatter: &str) -> Vec<String> {
+    let mut sources = Vec::new();
+    for key in ["sources", "source_files"] {
+        collect_yaml_values(frontmatter, key, &mut sources);
+    }
+    dedupe(sources)
+}
+
+fn collect_yaml_values(frontmatter: &str, key: &str, out: &mut Vec<String>) {
+    let lines = frontmatter.lines().collect::<Vec<_>>();
+    for (idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix(&format!("{key}:")) else {
+            continue;
+        };
+        let rest = rest.trim();
+        if rest.starts_with('[') && rest.ends_with(']') {
+            for item in rest.trim_matches(['[', ']']).split(',') {
+                push_clean_value(out, item);
+            }
+            continue;
+        }
+        if !rest.is_empty() {
+            push_clean_value(out, rest);
+            continue;
+        }
+        for next in lines.iter().skip(idx + 1) {
+            let next_trimmed = next.trim();
+            if next_trimmed.is_empty() {
+                continue;
+            }
+            if !next.starts_with(' ') && !next.starts_with('\t') {
+                break;
+            }
+            if let Some(item) = next_trimmed.strip_prefix('-') {
+                push_clean_value(out, item);
+            }
+        }
+    }
+}
+
+fn push_clean_value(out: &mut Vec<String>, value: &str) {
+    let cleaned = value
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim()
+        .to_string();
+    if !cleaned.is_empty() {
+        out.push(cleaned);
+    }
+}
+
+fn extract_wikilinks(content: &str) -> Vec<String> {
+    let mut links = Vec::new();
+    let mut rest = content;
+    while let Some(start) = rest.find("[[") {
+        let after_start = &rest[start + 2..];
+        let Some(end) = after_start.find("]]") else {
+            break;
+        };
+        let raw = &after_start[..end];
+        let target = raw.split('|').next().unwrap_or(raw).trim();
+        if !target.is_empty() {
+            links.push(target.to_string());
+        }
+        rest = &after_start[end + 2..];
+    }
+    links
+}
+
+fn resolve_link(raw: &str, page_ids: &HashSet<String>) -> Option<String> {
+    let target = page_id(raw);
+    if page_ids.contains(&target) {
+        return Some(target);
+    }
+    let normalized = normalize_link_id(&target);
+    page_ids
+        .iter()
+        .find(|id| normalize_link_id(id) == normalized)
+        .cloned()
+}
+
+fn normalize_link_id(value: &str) -> String {
+    value.to_lowercase().replace(' ', "-").replace('_', "-")
+}
+
 fn score_token_index(index: &TokenIndex, query: &str, limit: usize) -> Vec<ScoredChunk> {
-    if index.chunks.is_empty() || query.trim().is_empty() {
+    if (index.chunks.is_empty() && index.page_meta.is_empty()) || query.trim().is_empty() {
         return vec![];
     }
 
@@ -435,47 +870,15 @@ fn score_token_index(index: &TokenIndex, query: &str, limit: usize) -> Vec<Score
     let mut scored = Vec::new();
 
     for chunk in &index.chunks {
-        let mut score = 0.0;
-
-        if !query_phrase.is_empty() {
-            if chunk.page_stem_lower == query_phrase || chunk.page_path_lower == query_phrase {
-                score += 240.0;
-            }
-            if chunk.title_lower.contains(&query_phrase) {
-                score += 90.0;
-            }
-            if chunk.heading_lower.contains(&query_phrase) {
-                score += 45.0;
-            }
-            let phrase_occ = count_occurrences(&chunk.text_lower, &query_phrase).min(max_phrase_occ);
-            score += phrase_occ as f64 * 22.0;
-        }
-
-        for token in &query_tokens {
-            let tf = *chunk.token_counts.get(token).unwrap_or(&0) as f64;
-            let df = *index.doc_freq.get(token).unwrap_or(&0) as f64;
-            if df <= 0.0 {
-                continue;
-            }
-
-            let idf = (((n_docs - df + 0.5) / (df + 0.5)) + 1.0).ln().max(0.05);
-            if tf > 0.0 {
-                let k1 = 1.2;
-                let b = 0.75;
-                let len_norm = chunk.token_len.max(1) as f64 / avg_doc_len;
-                let bm25 = idf * (tf * (k1 + 1.0)) / (tf + k1 * (1.0 - b + b * len_norm));
-                score += bm25;
-            }
-            if chunk.title_lower.contains(token) {
-                score += idf * 7.0;
-            }
-            if chunk.heading_lower.contains(token) {
-                score += idf * 4.0;
-            }
-            if chunk.page_path_lower.contains(token) {
-                score += idf * 5.0;
-            }
-        }
+        let score = score_index_chunk(
+            chunk,
+            &query_phrase,
+            &query_tokens,
+            &index.doc_freq,
+            n_docs,
+            avg_doc_len,
+            max_phrase_occ,
+        );
 
         if score <= 0.0 {
             continue;
@@ -483,17 +886,231 @@ fn score_token_index(index: &TokenIndex, query: &str, limit: usize) -> Vec<Score
 
         scored.push(ScoredChunk {
             raw_score: score,
-            chunk: RetrievedChunk {
-                page_path: chunk.page_path.clone(),
-                page_title: chunk.page_title.clone(),
-                chunk_index: chunk.chunk_index,
-                heading_path: chunk.heading_path.clone(),
-                chunk_text: chunk.chunk_text.clone(),
-                distance: 1.0,
-                score,
-                source: "token".to_string(),
-            },
+            chunk: retrieved_from_index_chunk(chunk, score, "token"),
         });
+    }
+
+    for (page_id, meta) in &index.page_meta {
+        let score = score_page_meta(meta, &query_phrase, &query_tokens, max_phrase_occ);
+        if score <= 0.0 {
+            continue;
+        }
+        if let Some(candidate) = best_chunk_for_page(index, page_id, query, score, "token", 0.20) {
+            scored.push(candidate);
+        }
+    }
+
+    scored.sort_by(|a, b| {
+        b.raw_score
+            .partial_cmp(&a.raw_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.chunk.page_path.cmp(&b.chunk.page_path))
+            .then_with(|| a.chunk.chunk_index.cmp(&b.chunk.chunk_index))
+    });
+    dedupe_scored_chunks(scored, limit)
+}
+
+fn score_index_chunk(
+    chunk: &IndexChunk,
+    query_phrase: &str,
+    query_tokens: &[String],
+    doc_freq: &HashMap<String, usize>,
+    n_docs: f64,
+    avg_doc_len: f64,
+    max_phrase_occ: usize,
+) -> f64 {
+    let mut score = 0.0;
+
+    if !query_phrase.is_empty() {
+        if chunk.page_stem_lower == query_phrase || chunk.page_path_lower == query_phrase {
+            score += 240.0;
+        }
+        if chunk.title_lower.contains(query_phrase) {
+            score += 90.0;
+        }
+        if chunk.heading_lower.contains(query_phrase) {
+            score += 45.0;
+        }
+        if chunk.schema_lower.contains(query_phrase) {
+            score += 35.0;
+        }
+        let phrase_occ = count_occurrences(&chunk.text_lower, query_phrase).min(max_phrase_occ);
+        score += phrase_occ as f64 * 22.0;
+    }
+
+    for token in query_tokens {
+        let tf = *chunk.token_counts.get(token).unwrap_or(&0) as f64;
+        let df = *doc_freq.get(token).unwrap_or(&0) as f64;
+        if df <= 0.0 {
+            continue;
+        }
+
+        let idf = (((n_docs - df + 0.5) / (df + 0.5)) + 1.0).ln().max(0.05);
+        if tf > 0.0 {
+            let k1 = 1.2;
+            let b = 0.75;
+            let len_norm = chunk.token_len.max(1) as f64 / avg_doc_len;
+            let bm25 = idf * (tf * (k1 + 1.0)) / (tf + k1 * (1.0 - b + b * len_norm));
+            score += bm25;
+        }
+        if chunk.title_lower.contains(token) {
+            score += idf * 7.0;
+        }
+        if chunk.heading_lower.contains(token) {
+            score += idf * 4.0;
+        }
+        if chunk.page_path_lower.contains(token) {
+            score += idf * 5.0;
+        }
+        if chunk.schema_lower.contains(token) {
+            score += idf * 3.0;
+        }
+    }
+
+    score
+}
+
+fn score_page_meta(
+    meta: &PageMeta,
+    query_phrase: &str,
+    query_tokens: &[String],
+    max_phrase_occ: usize,
+) -> f64 {
+    let mut score = 0.0;
+
+    if !query_phrase.is_empty() {
+        if meta.page_stem_lower == query_phrase || meta.page_path_lower == query_phrase {
+            score += 240.0;
+        }
+        if meta.title_lower.contains(query_phrase) {
+            score += 90.0;
+        }
+        if meta.schema_text.to_lowercase().contains(query_phrase) {
+            score += 35.0;
+        }
+        let phrase_occ = count_occurrences(&meta.full_lower, query_phrase).min(max_phrase_occ);
+        score += phrase_occ as f64 * 22.0;
+    }
+
+    for token in query_tokens {
+        let tf = *meta.token_counts.get(token).unwrap_or(&0) as f64;
+        if tf > 0.0 {
+            score += tf.min(12.0);
+        }
+        if meta.title_lower.contains(token) {
+            score += 7.0;
+        }
+        if meta.page_path_lower.contains(token) {
+            score += 5.0;
+        }
+        if meta.schema_text.to_lowercase().contains(token) {
+            score += 3.0;
+        }
+    }
+
+    let length_penalty = (meta.token_len.max(1) as f64 / 1600.0).sqrt().clamp(1.0, 3.0);
+    score / length_penalty
+}
+
+fn dedupe_scored_chunks(scored: Vec<ScoredChunk>, limit: usize) -> Vec<ScoredChunk> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+
+    for item in scored {
+        if !seen.insert(chunk_key(&item.chunk)) {
+            continue;
+        }
+        out.push(item);
+        if out.len() >= limit {
+            break;
+        }
+    }
+
+    out
+}
+
+fn retrieved_from_index_chunk(chunk: &IndexChunk, score: f64, source: &str) -> RetrievedChunk {
+    RetrievedChunk {
+        page_path: chunk.page_path.clone(),
+        page_title: chunk.page_title.clone(),
+        chunk_index: chunk.chunk_index,
+        heading_path: chunk.heading_path.clone(),
+        chunk_text: chunk.chunk_text.clone(),
+        distance: 1.0,
+        score,
+        source: source.to_string(),
+        quality_multiplier: chunk.quality_multiplier,
+    }
+}
+
+fn apply_index_metadata(index: &TokenIndex, chunks: &mut [RetrievedChunk]) {
+    for chunk in chunks {
+        let id = page_id(&chunk.page_path);
+        if let Some(meta) = index.page_meta.get(&id) {
+            chunk.quality_multiplier = meta.quality_multiplier;
+            if chunk.page_title.trim().is_empty() {
+                chunk.page_title = meta.title.clone();
+            }
+        }
+    }
+}
+
+fn graph_expand(
+    index: &TokenIndex,
+    query: &str,
+    vector_chunks: &[RetrievedChunk],
+    token_chunks: &[ScoredChunk],
+    limit: usize,
+) -> Vec<ScoredChunk> {
+    if index.page_meta.is_empty() {
+        return vec![];
+    }
+
+    let mut seed_scores: HashMap<String, f64> = HashMap::new();
+    for (rank0, chunk) in vector_chunks.iter().take(12).enumerate() {
+        let id = page_id(&chunk.page_path);
+        if index.page_meta.contains_key(&id) {
+            let rank = rank0 + 1;
+            *seed_scores.entry(id).or_insert(0.0) += 1.0 / (RRF_K + rank as f64);
+        }
+    }
+    for (rank0, scored) in token_chunks.iter().take(16).enumerate() {
+        let id = page_id(&scored.chunk.page_path);
+        if index.page_meta.contains_key(&id) {
+            let rank = rank0 + 1;
+            *seed_scores.entry(id).or_insert(0.0) += 1.0 / (RRF_K + rank as f64);
+        }
+    }
+    if seed_scores.is_empty() {
+        return vec![];
+    }
+
+    let mut page_scores: HashMap<String, f64> = HashMap::new();
+    for (seed_id, seed_weight) in &seed_scores {
+        let Some(seed_meta) = index.page_meta.get(seed_id) else {
+            continue;
+        };
+        for (target_id, target_meta) in &index.page_meta {
+            if target_id == seed_id {
+                continue;
+            }
+            let relevance = graph_relevance(seed_id, seed_meta, target_id, target_meta, index);
+            if relevance <= 0.0 {
+                continue;
+            }
+            let contribution = relevance * seed_weight;
+            *page_scores.entry(target_id.clone()).or_insert(0.0) += contribution;
+        }
+    }
+
+    let mut scored = Vec::new();
+    for (page_id, graph_score) in page_scores {
+        if graph_score <= 0.0 {
+            continue;
+        }
+        if let Some(chunk) = best_chunk_for_page(index, &page_id, query, graph_score, "graph", 0.15) {
+            scored.push(chunk);
+        }
     }
 
     scored.sort_by(|a, b| {
@@ -507,13 +1124,164 @@ fn score_token_index(index: &TokenIndex, query: &str, limit: usize) -> Vec<Score
     scored
 }
 
+fn best_chunk_for_page(
+    index: &TokenIndex,
+    page_id: &str,
+    query: &str,
+    base_score: f64,
+    source: &str,
+    lexical_weight: f64,
+) -> Option<ScoredChunk> {
+    let meta = index.page_meta.get(page_id)?;
+    let query_phrase = normalize_phrase(query);
+    let query_tokens = tokenize_query(query);
+    let n_docs = index.chunks.len() as f64;
+    let avg_doc_len = index.avg_doc_len.max(1.0);
+
+    let mut best: Option<(&IndexChunk, f64)> = None;
+    if let Some(chunk_indices) = index.page_chunks.get(page_id) {
+        for idx in chunk_indices {
+            let Some(chunk) = index.chunks.get(*idx) else {
+                continue;
+            };
+            let lexical_score = score_index_chunk(
+                chunk,
+                &query_phrase,
+                &query_tokens,
+                &index.doc_freq,
+                n_docs,
+                avg_doc_len,
+                10,
+            );
+            let combined = lexical_score * lexical_weight + base_score;
+            match best {
+                Some((_, best_score)) if best_score >= combined => {}
+                _ => best = Some((chunk, combined)),
+            }
+        }
+    }
+
+    if let Some((chunk, raw_score)) = best {
+        return Some(ScoredChunk {
+            raw_score,
+            chunk: retrieved_from_index_chunk(chunk, raw_score, source),
+        });
+    }
+
+    let chunk_text = page_excerpt(meta, &query_phrase, &query_tokens, 1800);
+    Some(ScoredChunk {
+        raw_score: base_score,
+        chunk: RetrievedChunk {
+            page_path: meta.page_path.clone(),
+            page_title: meta.title.clone(),
+            chunk_index: -1,
+            heading_path: String::new(),
+            chunk_text,
+            distance: 1.0,
+            score: base_score,
+            source: source.to_string(),
+            quality_multiplier: meta.quality_multiplier,
+        },
+    })
+}
+
+fn page_excerpt(
+    meta: &PageMeta,
+    query_phrase: &str,
+    query_tokens: &[String],
+    max_chars: usize,
+) -> String {
+    let anchor = if !query_phrase.is_empty() && meta.full_lower.contains(query_phrase) {
+        Some(query_phrase)
+    } else {
+        query_tokens
+            .iter()
+            .find(|token| meta.full_lower.contains(token.as_str()))
+            .map(|token| token.as_str())
+    };
+
+    let anchor_char = anchor
+        .and_then(|needle| meta.full_lower.find(needle))
+        .map(|byte_idx| meta.full_lower[..byte_idx].chars().count())
+        .unwrap_or(0);
+
+    let chars = meta.full_text.chars().collect::<Vec<_>>();
+    if chars.len() <= max_chars {
+        return meta.full_text.clone();
+    }
+
+    let start = anchor_char.saturating_sub(max_chars / 3);
+    let end = (start + max_chars).min(chars.len());
+    chars[start..end].iter().collect()
+}
+
+fn graph_relevance(
+    seed_id: &str,
+    seed: &PageMeta,
+    target_id: &str,
+    target: &PageMeta,
+    index: &TokenIndex,
+) -> f64 {
+    let mut score = 0.0;
+    if seed.out_links.contains(target_id) {
+        score += 3.0;
+    }
+    if index
+        .in_links
+        .get(seed_id)
+        .map(|links| links.contains(target_id))
+        .unwrap_or(false)
+    {
+        score += 3.0;
+    }
+
+    if !seed.sources.is_empty() && !target.sources.is_empty() {
+        let seed_sources = seed.sources.iter().collect::<HashSet<_>>();
+        let shared = target
+            .sources
+            .iter()
+            .filter(|source| seed_sources.contains(source))
+            .count();
+        score += shared as f64 * 4.0;
+    }
+
+    let seed_neighbors = graph_neighbors(seed_id, seed, index);
+    let target_neighbors = graph_neighbors(target_id, target, index);
+    let common = seed_neighbors
+        .intersection(&target_neighbors)
+        .filter(|neighbor| neighbor.as_str() != seed_id && neighbor.as_str() != target_id)
+        .count();
+    score += common as f64 * 1.5;
+    score += type_affinity(&seed.page_type, &target.page_type);
+    score
+}
+
+fn graph_neighbors(id: &str, meta: &PageMeta, index: &TokenIndex) -> HashSet<String> {
+    let mut out = meta.out_links.clone();
+    if let Some(inbound) = index.in_links.get(id) {
+        out.extend(inbound.iter().cloned());
+    }
+    out
+}
+
+fn type_affinity(a: &str, b: &str) -> f64 {
+    match (a, b) {
+        ("entity", "concept") | ("concept", "entity") => 1.2,
+        ("concept", "synthesis") | ("synthesis", "concept") => 1.2,
+        ("source", "source") | ("query", "query") => 0.5,
+        ("entity", "entity") | ("concept", "concept") | ("synthesis", "synthesis") => 0.8,
+        ("other", _) | (_, "other") => 0.5,
+        _ => 1.0,
+    }
+}
+
 pub async fn retrieve_chunks_for_query(
     state: &AppState,
     project_path: &str,
     query: &str,
     top_k: usize,
 ) -> anyhow::Result<(Vec<RetrievedChunk>, u128)> {
-    retrieve_chunks_for_query_with_options(state, project_path, query, top_k, true).await
+    retrieve_chunks_for_query_with_options(state, project_path, query, top_k, true, true).await
 }
 
 pub async fn retrieve_chunks_for_query_with_options(
@@ -522,12 +1290,14 @@ pub async fn retrieve_chunks_for_query_with_options(
     query: &str,
     top_k: usize,
     use_token: bool,
+    use_graph: bool,
 ) -> anyhow::Result<(Vec<RetrievedChunk>, u128)> {
     let t0 = std::time::Instant::now();
     let vector_limit = (top_k * VECTOR_RESULT_MULTIPLIER).max(top_k);
     let token_limit = (top_k * TOKEN_RESULT_MULTIPLIER).max(top_k);
+    let graph_limit = (top_k * GRAPH_RESULT_MULTIPLIER).max(top_k);
 
-    let vector_chunks = match embed_query(state, query).await {
+    let mut vector_chunks = match embed_query(state, query).await {
         Ok(query_vec) => match vector_retrieve(project_path, query_vec, vector_limit).await {
             Ok(chunks) => chunks,
             Err(e) => {
@@ -541,25 +1311,41 @@ pub async fn retrieve_chunks_for_query_with_options(
         }
     };
 
-    let token_chunks = if use_token {
-        match token_retrieve(project_path, query, token_limit).await {
-            Ok(chunks) => chunks,
+    let index = if use_token {
+        match get_token_index(project_path).await {
+            Ok(index) => Some(index),
             Err(e) => {
-                tracing::warn!("[RAG] token retrieval failed: {e}");
-                vec![]
+                tracing::warn!("[RAG] token index load failed: {e}");
+                None
             }
         }
     } else {
-        vec![]
+        None
     };
 
-    let chunks = fuse_chunks(vector_chunks, token_chunks, top_k, query);
+    if let Some(index) = index.as_deref() {
+        apply_index_metadata(index, &mut vector_chunks);
+    }
+
+    let token_chunks = index
+        .as_deref()
+        .map(|index| score_token_index(index, query, token_limit))
+        .unwrap_or_default();
+
+    let graph_chunks = index
+        .as_deref()
+        .filter(|_| use_graph)
+        .map(|index| graph_expand(index, query, &vector_chunks, &token_chunks, graph_limit))
+        .unwrap_or_default();
+
+    let chunks = fuse_chunks(vector_chunks, token_chunks, graph_chunks, top_k, query);
     Ok((chunks, t0.elapsed().as_millis()))
 }
 
 fn fuse_chunks(
     vector_chunks: Vec<RetrievedChunk>,
     token_chunks: Vec<ScoredChunk>,
+    graph_chunks: Vec<ScoredChunk>,
     top_k: usize,
     query: &str,
 ) -> Vec<RetrievedChunk> {
@@ -578,7 +1364,9 @@ fn fuse_chunks(
             rrf_score: 0.0,
             vector_rank: None,
             token_rank: None,
+            graph_rank: None,
             chunk,
+            graph_score: 0.0,
         });
         entry.vector_rank = Some(rank);
         entry.vector_score = entry.vector_score.max(entry.chunk.score);
@@ -594,13 +1382,37 @@ fn fuse_chunks(
             rrf_score: 0.0,
             vector_rank: None,
             token_rank: None,
+            graph_rank: None,
             chunk: scored.chunk.clone(),
+            graph_score: 0.0,
         });
         entry.token_rank = Some(rank);
         entry.token_score = entry.token_score.max(scored.raw_score);
         entry.rrf_score += 1.0 / (RRF_K + rank as f64);
 
-        if entry.chunk.source == "vector" && scored.raw_score > entry.token_score {
+        if entry.chunk.source == "vector" {
+            entry.chunk = scored.chunk;
+        }
+    }
+
+    for (rank0, scored) in graph_chunks.into_iter().enumerate() {
+        let rank = rank0 + 1;
+        let key = chunk_key(&scored.chunk);
+        let entry = candidates.entry(key).or_insert_with(|| FusedCandidate {
+            vector_score: 0.0,
+            token_score: 0.0,
+            graph_score: 0.0,
+            rrf_score: 0.0,
+            vector_rank: None,
+            token_rank: None,
+            graph_rank: None,
+            chunk: scored.chunk.clone(),
+        });
+        entry.graph_rank = Some(rank);
+        entry.graph_score = entry.graph_score.max(scored.raw_score);
+        entry.rrf_score += 1.0 / (RRF_K + rank as f64);
+
+        if entry.chunk.source == "vector" {
             entry.chunk = scored.chunk;
         }
     }
@@ -624,11 +1436,12 @@ fn fuse_chunks(
             let mut chunk = candidate.chunk;
             chunk.score = score;
             chunk.distance = (1.0 - chunk.score).clamp(0.0, 1.0);
-            chunk.source = match (candidate.vector_rank, candidate.token_rank) {
-                (Some(_), Some(_)) => "hybrid",
-                (Some(_), None) => "vector",
-                (None, Some(_)) => "token",
-                (None, None) => "unknown",
+            chunk.source = match (candidate.vector_rank, candidate.token_rank, candidate.graph_rank) {
+                (Some(_), Some(_), _) | (Some(_), _, Some(_)) | (_, Some(_), Some(_)) => "hybrid",
+                (Some(_), None, None) => "vector",
+                (None, Some(_), None) => "token",
+                (None, None, Some(_)) => "graph",
+                (None, None, None) => "unknown",
             }
             .to_string();
             chunk
@@ -643,7 +1456,8 @@ fn final_fused_score(candidate: &FusedCandidate, top_token_score: f64, query: &s
         0.0
     };
     let vector_norm = candidate.vector_score.clamp(0.0, 1.0);
-    let base = candidate.rrf_score + token_norm * 0.035 + vector_norm * 0.012;
+    let graph_norm = candidate.graph_score.clamp(0.0, 1.0);
+    let base = candidate.rrf_score + token_norm * 0.035 + vector_norm * 0.012 + graph_norm * 0.02;
     base * quality_multiplier(&candidate.chunk, query)
 }
 
@@ -661,11 +1475,12 @@ fn quality_multiplier(chunk: &RetrievedChunk, query: &str) -> f64 {
     let is_audit_page = page.contains("\u{62bd}\u{53d6}\u{8d28}\u{91cf}\u{5ba1}\u{8ba1}")
         || page.contains("\u{8d28}\u{91cf}\u{5ba1}\u{8ba1}")
         || page.contains("audit");
-    if is_audit_page {
+    let page_multiplier = if is_audit_page {
         0.55
     } else {
         1.0
-    }
+    };
+    page_multiplier * chunk.quality_multiplier
 }
 
 fn chunk_key(chunk: &RetrievedChunk) -> String {
@@ -682,6 +1497,10 @@ fn page_stem(page_path: &str) -> String {
         .next()
         .unwrap_or(page_path);
     name.strip_suffix(".md").unwrap_or(name).to_string()
+}
+
+fn page_id(page_path: &str) -> String {
+    page_stem(page_path.trim())
 }
 
 fn normalize_phrase(query: &str) -> String {
@@ -858,9 +1677,7 @@ pub async fn retrieve(
 ) -> Result<Json<Value>> {
     let top_k = body.top_k.unwrap_or(8).clamp(1, 64);
     let use_token = body.use_token.unwrap_or(true);
-    if body.use_graph.unwrap_or(false) {
-        tracing::info!("[RAG] use_graph requested but graph expansion is not implemented in this phase");
-    }
+    let use_graph = body.use_graph.unwrap_or(true);
 
     let (chunks, retrieval_ms) = retrieve_chunks_for_query_with_options(
         &state,
@@ -868,16 +1685,18 @@ pub async fn retrieve(
         &body.query,
         top_k,
         use_token,
+        use_graph,
     )
     .await?;
 
     tracing::info!(
-        "[RAG] query_len={} top_k={} chunks={} retrieval_ms={} token={}",
+        "[RAG] query_len={} top_k={} chunks={} retrieval_ms={} token={} graph={}",
         body.query.len(),
         top_k,
         chunks.len(),
         retrieval_ms,
-        use_token
+        use_token,
+        use_graph
     );
 
     let response = RetrieveResponse {
@@ -939,7 +1758,7 @@ pub async fn status(Query(params): Query<HashMap<String, String>>) -> Json<Value
         "dim": stored_dim,
         "embedding_model": stored_model,
         "schema_version": 2,
-        "retrieval_mode": "hybrid_vector_token_rrf",
+        "retrieval_mode": "hybrid_vector_chunk_page_graph_schema_rrf",
         "token_cache_loaded": token_cache_loaded,
         "needs_reindex": needs_reindex,
         "reason": reason,
