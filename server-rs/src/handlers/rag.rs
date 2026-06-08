@@ -858,8 +858,9 @@ fn score_token_index(index: &TokenIndex, query: &str, limit: usize) -> Vec<Score
         return vec![];
     }
 
+    let expanded_query = expand_insurance_query(query);
     let query_phrase = normalize_phrase(query);
-    let query_tokens = tokenize_query(query);
+    let query_tokens = tokenize_query(&expanded_query);
     if query_phrase.is_empty() && query_tokens.is_empty() {
         return vec![];
     }
@@ -1133,8 +1134,9 @@ fn best_chunk_for_page(
     lexical_weight: f64,
 ) -> Option<ScoredChunk> {
     let meta = index.page_meta.get(page_id)?;
+    let expanded_query = expand_insurance_query(query);
     let query_phrase = normalize_phrase(query);
-    let query_tokens = tokenize_query(query);
+    let query_tokens = tokenize_query(&expanded_query);
     let n_docs = index.chunks.len() as f64;
     let avg_doc_len = index.avg_doc_len.max(1.0);
 
@@ -1161,16 +1163,10 @@ fn best_chunk_for_page(
         }
     }
 
-    if let Some((chunk, raw_score)) = best {
-        return Some(ScoredChunk {
-            raw_score,
-            chunk: retrieved_from_index_chunk(chunk, raw_score, source),
-        });
-    }
-
-    let chunk_text = page_excerpt(meta, &query_phrase, &query_tokens, 1800);
+    let raw_score = best.map(|(_, raw_score)| raw_score).unwrap_or(base_score);
+    let chunk_text = page_excerpt(meta, query, &query_phrase, &query_tokens, 1800);
     Some(ScoredChunk {
-        raw_score: base_score,
+        raw_score,
         chunk: RetrievedChunk {
             page_path: meta.page_path.clone(),
             page_title: meta.title.clone(),
@@ -1187,21 +1183,22 @@ fn best_chunk_for_page(
 
 fn page_excerpt(
     meta: &PageMeta,
+    query: &str,
     query_phrase: &str,
     query_tokens: &[String],
     max_chars: usize,
 ) -> String {
-    let anchor = if !query_phrase.is_empty() && meta.full_lower.contains(query_phrase) {
-        Some(query_phrase)
-    } else {
-        query_tokens
-            .iter()
-            .find(|token| meta.full_lower.contains(token.as_str()))
-            .map(|token| token.as_str())
-    };
+    let anchor_byte = best_evidence_anchor(meta, query, query_phrase, query_tokens).or_else(|| {
+        if !query_phrase.is_empty() && meta.full_lower.contains(query_phrase) {
+            meta.full_lower.find(query_phrase)
+        } else {
+            query_tokens
+                .iter()
+                .find_map(|token| meta.full_lower.find(token.as_str()))
+        }
+    });
 
-    let anchor_char = anchor
-        .and_then(|needle| meta.full_lower.find(needle))
+    let anchor_char = anchor_byte
         .map(|byte_idx| meta.full_lower[..byte_idx].chars().count())
         .unwrap_or(0);
 
@@ -1213,6 +1210,96 @@ fn page_excerpt(
     let start = anchor_char.saturating_sub(max_chars / 3);
     let end = (start + max_chars).min(chars.len());
     chars[start..end].iter().collect()
+}
+
+fn best_evidence_anchor(
+    meta: &PageMeta,
+    query: &str,
+    query_phrase: &str,
+    query_tokens: &[String],
+) -> Option<usize> {
+    let query_lower = query.to_lowercase();
+    let mut best: Option<(usize, f64)> = None;
+    let mut byte_offset = 0usize;
+
+    for line in meta.full_text.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            byte_offset += line.len();
+            continue;
+        }
+
+        let lower = trimmed.to_lowercase();
+        let mut score = insurance_evidence_score(&lower, &query_lower);
+
+        if !query_phrase.is_empty() && lower.contains(query_phrase) {
+            score += 80.0;
+        }
+        for token in query_tokens {
+            if lower.contains(token) {
+                score += if token.chars().count() > 1 { 6.0 } else { 1.0 };
+            }
+        }
+        if trimmed.starts_with('|') {
+            score += 8.0;
+        }
+        if lower.contains("raw:") || trimmed.starts_with("- \"") {
+            score += 6.0;
+        }
+        if lower.contains("claims:") || lower.contains("原文事实清单") || lower.contains("结构化抽取结果") {
+            score += 3.0;
+        }
+
+        if score > 0.0 {
+            match best {
+                Some((_, best_score)) if best_score >= score => {}
+                _ => best = Some((byte_offset, score)),
+            }
+        }
+
+        byte_offset += line.len();
+    }
+
+    best.map(|(offset, _)| offset)
+}
+
+fn insurance_evidence_score(line_lower: &str, query_lower: &str) -> f64 {
+    let mut score = 0.0;
+
+    if query_lower.contains("投保")
+        && query_lower.contains("被保险")
+        && (query_lower.contains("关系") || query_lower.contains("必须"))
+    {
+        if line_lower.contains("投、被保险人") || line_lower.contains("投被保险人") {
+            score += 120.0;
+        }
+        if line_lower.contains("投保人") && line_lower.contains("被保险人") {
+            score += 90.0;
+        }
+        if line_lower.contains("关系") {
+            score += 30.0;
+        }
+    }
+
+    if query_lower.contains("起保点") && line_lower.contains("起保点") {
+        score += 100.0;
+    }
+    if (query_lower.contains("投保年龄") || query_lower.contains("年龄范围"))
+        && (line_lower.contains("投保年龄") || line_lower.contains("年龄"))
+    {
+        score += 80.0;
+    }
+    if query_lower.contains("交费") && line_lower.contains("交费") {
+        score += 60.0;
+    }
+    if query_lower.contains("领取") && line_lower.contains("领取") {
+        score += 60.0;
+    }
+    if query_lower.contains("核保") && line_lower.contains("核保") {
+        score += 60.0;
+    }
+
+    score
 }
 
 fn graph_relevance(
@@ -1525,6 +1612,47 @@ fn normalize_phrase(query: &str) -> String {
                 )
         })
         .to_lowercase()
+}
+
+fn expand_insurance_query(query: &str) -> String {
+    let lower = query.to_lowercase();
+    let mut terms = vec![query.to_string()];
+
+    if lower.contains("投保人") && lower.contains("被保险人") {
+        terms.extend([
+            "投、被保险人关系".to_string(),
+            "投被保险人关系".to_string(),
+            "投保人与被保险人关系".to_string(),
+            "投保人 被保险人 关系".to_string(),
+        ]);
+    }
+    if lower.contains("投被保") {
+        terms.extend([
+            "投、被保险人关系".to_string(),
+            "投保人与被保险人关系".to_string(),
+        ]);
+    }
+    if lower.contains("简称") {
+        terms.extend([
+            "别名".to_string(),
+            "俗称".to_string(),
+            "险种简称".to_string(),
+            "产品简称".to_string(),
+        ]);
+    }
+    if lower.contains("产品代码") || lower.contains("险种代码") {
+        terms.extend(["product_code".to_string(), "险种代码".to_string()]);
+    }
+    if lower.contains("投保时") || lower.contains("投保规则") || lower.contains("必须") {
+        terms.extend([
+            "投保规则".to_string(),
+            "原文事实清单".to_string(),
+            "规则项".to_string(),
+            "具体内容".to_string(),
+        ]);
+    }
+
+    dedupe(terms).join(" ")
 }
 
 fn tokenize_query(query: &str) -> Vec<String> {
