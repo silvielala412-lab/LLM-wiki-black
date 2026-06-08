@@ -3,13 +3,13 @@
 # 用于开发和测试新的 /api/rag/retrieve + 修复后的 vector 协议
 
 $root     = Split-Path -Parent $MyInvocation.MyCommand.Path
-$exe      = Join-Path $root "server-rs\target\release\llm-wiki-server.exe"
+$exe      = Join-Path $root "server-rs\target\release\llm-wiki-server-8081.exe"
 $stdout   = Join-Path $root "server-8081.log"
 $stderr   = Join-Path $root "server-8081.err.log"
 $localEnv = Join-Path $root "server-env.local.ps1"
 
 if (-not (Test-Path $exe)) {
-  throw "Server binary not found: $exe. Run: cargo build --release -p llm-wiki-server"
+  throw "Server binary not found: $exe. Build the enhanced 8081 binary first."
 }
 
 $existing = Get-NetTCPConnection -LocalPort 8081 -State Listen -ErrorAction SilentlyContinue
