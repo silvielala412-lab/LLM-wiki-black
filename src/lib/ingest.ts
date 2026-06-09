@@ -33,6 +33,7 @@ import {
   normalizeEntityBlock,
 } from "@/lib/entity-normalizer"
 import { resolveIncomingKnowledgePage } from "@/lib/knowledge-resolution"
+import { buildServiceItemTitle, findServiceLineVersion } from "@/lib/insurance-schema-registry"
 import type { MultimodalConfig } from "@/stores/wiki-store"
 import type { ChunkingConfig } from "@/types/wiki"
 import { useAuthStore } from "@/stores/auth-store"
@@ -1502,31 +1503,34 @@ function buildSchemaCandidateManifest(candidates: SchemaDrivenCandidate[], plan?
   return lines.join("\n")
 }
 
+// Service item base names (item_name without line/version prefix).
+// In v2, actual entity title = {line_name}-{version_name}-{item_name}
+// The INSURANCE_SERVICE_MANUAL_NODES defines the canonical item_name and detection aliases.
 const INSURANCE_SERVICE_MANUAL_NODES = [
-  { title: "家庭医生服务", kind: "service_benefit", aliases: ["家庭医生"] },
-  { title: "在线问诊", kind: "service_benefit", aliases: ["在线问诊"] },
-  { title: "音视频问诊", kind: "service_benefit", aliases: ["音视频问诊", "音视频随访", "音视频首访"] },
-  { title: "名医大咖", kind: "service_benefit", aliases: ["名医大咖"] },
-  { title: "特色体检", kind: "service_benefit", aliases: ["特色体检", "深度检查", "报告解读"] },
-  { title: "21天社群训练营", kind: "service_benefit", aliases: ["21天社群训练营"] },
-  { title: "用药服务", kind: "service_benefit", aliases: ["用药服务"] },
-  { title: "数字化慢病管理", kind: "service_benefit", aliases: ["数字化管理", "慢病管理"] },
-  { title: "门诊预约协助", kind: "service_benefit", aliases: ["门诊预约协助"] },
-  { title: "就医陪诊", kind: "service_benefit", aliases: ["就医陪诊"] },
-  { title: "重疾专案管理", kind: "service_benefit", aliases: ["重疾专案管理"] },
-  { title: "心理咨询", kind: "service_benefit", aliases: ["心理咨询"] },
-  { title: "检查安排协助", kind: "service_benefit", aliases: ["检查安排协助"] },
-  { title: "专家会诊", kind: "service_benefit", aliases: ["专家会诊"] },
-  { title: "海外远程书面咨询", kind: "service_benefit", aliases: ["海外远程书面咨询"] },
-  { title: "国内住院安排协助", kind: "service_benefit", aliases: ["国内住院安排协助", "住院安排协助"] },
-  { title: "手术安排协助", kind: "service_benefit", aliases: ["手术安排协助"] },
-  { title: "海外重疾住院安排协助", kind: "service_benefit", aliases: ["海外重疾住院安排协助"] },
-  { title: "住院照护", kind: "service_benefit", aliases: ["住院照护"] },
-  { title: "出院安排协助", kind: "service_benefit", aliases: ["出院安排协助"] },
-  { title: "康复门诊协助", kind: "service_benefit", aliases: ["康复门诊协助"] },
-  { title: "康复住院协助", kind: "service_benefit", aliases: ["康复住院协助"] },
-  { title: "上门护理", kind: "service_benefit", aliases: ["上门护理"] },
-  { title: "康复训练管理", kind: "service_benefit", aliases: ["康复训练管理"] },
+  { title: "家庭医生服务", kind: "service_item", aliases: ["家庭医生"] },
+  { title: "在线问诊", kind: "service_item", aliases: ["在线问诊"] },
+  { title: "音视频问诊", kind: "service_item", aliases: ["音视频问诊", "音视频随访", "音视频首访"] },
+  { title: "名医大咖", kind: "service_item", aliases: ["名医大咖"] },
+  { title: "特色体检", kind: "service_item", aliases: ["特色体检", "深度检查", "报告解读"] },
+  { title: "21天社群训练营", kind: "service_item", aliases: ["21天社群训练营"] },
+  { title: "用药服务", kind: "service_item", aliases: ["用药服务"] },
+  { title: "数字化慢病管理", kind: "service_item", aliases: ["数字化管理", "慢病管理"] },
+  { title: "门诊预约协助", kind: "service_item", aliases: ["门诊预约协助"] },
+  { title: "就医陪诊", kind: "service_item", aliases: ["就医陪诊"] },
+  { title: "重疾专案管理", kind: "service_item", aliases: ["重疾专案管理"] },
+  { title: "心理咨询", kind: "service_item", aliases: ["心理咨询"] },
+  { title: "检查安排协助", kind: "service_item", aliases: ["检查安排协助"] },
+  { title: "专家会诊", kind: "service_item", aliases: ["专家会诊"] },
+  { title: "海外远程书面咨询", kind: "service_item", aliases: ["海外远程书面咨询"] },
+  { title: "国内住院安排协助", kind: "service_item", aliases: ["国内住院安排协助", "住院安排协助"] },
+  { title: "手术安排协助", kind: "service_item", aliases: ["手术安排协助"] },
+  { title: "海外重疾住院安排协助", kind: "service_item", aliases: ["海外重疾住院安排协助"] },
+  { title: "住院照护", kind: "service_item", aliases: ["住院照护"] },
+  { title: "出院安排协助", kind: "service_item", aliases: ["出院安排协助"] },
+  { title: "康复门诊协助", kind: "service_item", aliases: ["康复门诊协助"] },
+  { title: "康复住院协助", kind: "service_item", aliases: ["康复住院协助"] },
+  { title: "上门护理", kind: "service_item", aliases: ["上门护理"] },
+  { title: "康复训练管理", kind: "service_item", aliases: ["康复训练管理"] },
   { title: "服务激活流程", kind: "process", aliases: ["激活权益", "绑定家庭医生", "健康测评", "首访", "建档"] },
   { title: "服务中止规则", kind: "rule", aliases: ["服务中止"] },
   { title: "服务终止规则", kind: "rule", aliases: ["服务终止", "服务终止时间/情形"] },
@@ -1543,27 +1547,47 @@ function detectedServiceManualNodes(sourceContent: string): typeof INSURANCE_SER
   )
 }
 
-function buildServiceManualNodeDirective(sourceContent: string): string {
+function buildServiceManualNodeDirective(
+  sourceContent: string,
+  /** v2: if provided, service_item titles will be prefixed with {lineName}-{versionName}- */
+  serviceLineCtx?: { lineName: string; versionName: string },
+): string {
   const nodes = detectedServiceManualNodes(sourceContent)
   if (nodes.length === 0) return ""
-  const serviceNodes = nodes.filter((node) => node.kind === "service_benefit")
-  const ruleNodes = nodes.filter((node) => node.kind !== "service_benefit")
+  const serviceNodes = nodes.filter((node) => node.kind === "service_item")
+  const ruleNodes = nodes.filter((node) => node.kind !== "service_item")
+
+  // v2 naming: prefix service item titles with line-version
+  const makeItemTitle = (itemName: string): string => {
+    if (!serviceLineCtx) return itemName
+    return buildServiceItemTitle(serviceLineCtx.lineName, serviceLineCtx.versionName, itemName)
+  }
+
+  const prefixNote = serviceLineCtx
+    ? `\nNaming convention (v2): each service_item page title MUST follow the pattern "{service_line}-{version}-{item_name}" (e.g., "${makeItemTitle("在线问诊")}"). Do NOT use bare item names like "在线问诊" as the title.`
+    : ""
+
   return [
     "## Service Manual Node Extraction Requirements",
-    "This source appears to be an insurance service manual. Treat service benefits, process rules, and compliance disclaimers as first-class reusable knowledge nodes.",
+    "This source appears to be an insurance service manual. Treat service items, process rules, and compliance disclaimers as first-class reusable knowledge nodes.",
+    prefixNote,
     "",
     `Detected service/rule candidates (${nodes.length}): ${nodes.map((node) => node.title).join("、")}.`,
     "",
     "Required generation policy:",
-    "- Create the main service plan page, but do not stop there.",
-    "- For each independent service benefit, generate a dedicated `wiki/entities/*.md` page with `knowledge_domain: product`, `entity_type: service_benefit`, and `type: entity`.",
+    "- Create the main service_line_version page, but do not stop there.",
+    serviceLineCtx
+      ? `- For each independent service item, generate a dedicated wiki/entities/*.md page with knowledge_domain: service, entity_type: service_item, and title following the v2 naming convention (e.g., "${makeItemTitle("在线问诊")}").`
+      : "- For each independent service item, generate a dedicated wiki/entities/*.md page with knowledge_domain: service, entity_type: service_item.",
     "- For service activation, suspension, termination, waiting-period/non-sharing, and disclaimer content, generate dedicated `process`, `rule`, or `compliance_rule` pages.",
-    "- Each service_benefit page body must include: 服务定义、适用对象、服务次数、服务流程/申请方式、响应/完成时效、覆盖范围、使用限制、合规提醒、来源依据、待补全信息.",
+    "- Each service_item page body must include: 服务定义、适用对象、服务次数、服务流程/申请方式、响应/完成时效、覆盖范围、使用限制、合规提醒、来源依据、待补全信息.",
     "- Each rule/process/compliance page body must include: 规则定义、触发条件、影响范围、业务含义、销售提示、来源依据、待补全信息.",
-    "- Link the main service plan page to every generated service/rule page using `has_part`, `governed_by`, `requires`, or `uses_process` relations.",
+    "- Link the main service_line_version page to every generated service_item/rule page using `has_part`, `governed_by`, `requires`, or `uses_process` relations.",
     "- If output budget prevents generating all pages, generate the top business-critical pages first and emit REVIEW missing-page items for every omitted node.",
     "",
-    serviceNodes.length > 0 ? `Service benefit pages expected: ${serviceNodes.map((node) => node.title).join("、")}.` : "",
+    serviceNodes.length > 0
+      ? `Service item pages expected: ${serviceNodes.map((node) => makeItemTitle(node.title)).join("、")}.`
+      : "",
     ruleNodes.length > 0 ? `Rule/process/compliance pages expected: ${ruleNodes.map((node) => node.title).join("、")}.` : "",
   ].filter(Boolean).join("\n")
 }

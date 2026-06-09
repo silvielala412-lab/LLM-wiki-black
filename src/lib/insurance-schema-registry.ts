@@ -12,7 +12,7 @@ export interface InsuranceFieldSpec {
 export interface InsuranceEntitySchemaSpec {
   schemaKey: string
   label: string
-  domain: "product" | "customer" | "method" | "content" | "activity" | "cases" | "compliance"
+  domain: "product" | "customer" | "method" | "content" | "activity" | "cases" | "compliance" | "service"
   entityType: string
   universalType: "concept" | "entity" | "event" | "process" | "rule" | "data" | "case" | "source"
   purpose: string
@@ -37,6 +37,13 @@ const DEDUP_KEY_FIELDS: Record<string, string[]> = {
   regulatory_doc: ["related_product", "doc_type", "effective_version"],
   service_benefit: ["related_product", "service_name"],
   service_plan: ["plan_name", "plan_version"],
+  // Service hierarchy v2 (feature/schema-v2-service-category)
+  service_series: ["series_name"],
+  service_scenario: ["series_name", "scenario_name"],
+  service_line: ["series_name", "scenario_name", "line_name"],
+  service_line_version: ["line_name", "version_name"],
+  service_item: ["line_name", "version_name", "item_name"],
+  service_item_concept: ["item_name"],
   persona: ["persona_name"],
   life_stage: ["stage_name"],
   customer_signal: ["signal_type", "signal_description"],
@@ -86,6 +93,22 @@ const FIELD_ALIASES: Record<string, Record<string, string[]>> = {
     application_process: ["process", "流程", "申请流程", "服务流程"],
     service_limits: ["limits", "限制", "使用限制", "服务限制"],
     compliance_notes: ["disclaimer", "免责", "合规提示", "合规说明"],
+  },
+  // Service hierarchy v2
+  service_item: {
+    item_name: ["服务项名称", "服务项目", "name", "title"],
+    line_name: ["服务线", "service_line", "所属服务线"],
+    version_name: ["版本", "version", "服务线版本"],
+    scenario_name: ["场景", "scenario", "服务场景"],
+    series_name: ["系列", "series"],
+    service_frequency: ["frequency", "次数", "服务次数", "使用次数"],
+    eligible_customers: ["target_customer", "适用对象", "服务对象", "适用人群"],
+    activation_conditions: ["activation", "激活条件", "启动条件", "服务启动条件"],
+    service_content: ["content", "服务内容"],
+    service_standard: ["standard", "服务标准"],
+    coverage_cities: ["cities", "覆盖城市", "服务覆盖城市"],
+    usage_process: ["process", "使用流程", "服务项目使用流程"],
+    important_notes: ["notes", "重要提示", "注意事项"],
   },
   service_plan: {
     plan_name: ["name", "plan_title", "计划名称", "服务计划名称", "服务包名称"],
@@ -475,8 +498,173 @@ export const INSURANCE_SCHEMA_REGISTRY: InsuranceEntitySchemaSpec[] = [
       "服务权益不能被描述为保险金责任。",
     ],
   },
+
+  // ─── Service Hierarchy v2 ────────────────────────────────────────────────────
+  // 五级层级: 系列 > 场景 > 服务线 > 服务线版本 > 服务项
+  // 命名约定: {service_line}-{version}-{item_name}（如 臻享家医-V1-在线问诊）
+  // 聚合页:  service_item_concept 提供跨版本通用定义
+  //
+  // 来源：《服务权益知识结构.xlsx》- 服务线视角
+  {
+    schemaKey: "insurance.service.ServiceSeries",
+    label: "服务系列",
+    domain: "service",
+    entityType: "service_series",
+    universalType: "concept",
+    purpose: "服务知识体系的顶层分类，如"添平安系列"/"享平安系列"。",
+    fields: [
+      f("series_name", "系列名称", "如：添平安系列、享平安系列。", "critical"),
+      f("series_summary", "系列简介", "本系列的整体定位和覆盖范围。", "high_confidence"),
+      f("build_status", "建设状态", "已建设 / 待后续建设。", "recommended"),
+    ],
+    relationHints: [
+      "service_scenario 子节点用 has_part",
+    ],
+  },
+  {
+    schemaKey: "insurance.service.ServiceScenario",
+    label: "服务场景",
+    domain: "service",
+    entityType: "service_scenario",
+    universalType: "concept",
+    purpose: "服务系列下的业务场景分类，如"医健"/"养老"/"家办"。是服务线的上级节点，用于导航型查询。",
+    fields: [
+      f("scenario_name", "场景名称", "如：医健、养老、家办。", "critical"),
+      f("series_name", "所属系列", "所属的服务系列名称。", "critical"),
+      f("scenario_summary", "场景简介", "本场景覆盖哪类客户需求。", "high_confidence"),
+    ],
+    relationHints: [
+      "service_line 子节点用 has_part",
+      "所属 service_series 用 part_of",
+    ],
+  },
+  {
+    schemaKey: "insurance.service.ServiceLine",
+    label: "服务线",
+    domain: "service",
+    entityType: "service_line",
+    universalType: "entity",
+    purpose: "场景下的具体服务产品线，如"安有医"/"臻享家医"/"居家养老"。一条服务线可有多个版本。",
+    fields: [
+      f("line_name", "服务线名称", "如：安有医、臻享家医、居家养老。", "critical"),
+      f("scenario_name", "所属场景", "医健 / 养老 / 家办。", "critical"),
+      f("series_name", "所属系列", "添平安系列 / 享平安系列。", "critical"),
+      f("line_summary", "服务线简介", "本服务线的整体定位。", "high_confidence"),
+      f("target_customers", "目标客群", "面向的客户类型。", "high_confidence"),
+    ],
+    relationHints: [
+      "service_line_version 子版本用 has_part",
+      "所属 service_scenario 用 part_of",
+    ],
+  },
+  {
+    schemaKey: "insurance.service.ServiceLineVersion",
+    label: "服务线版本",
+    domain: "service",
+    entityType: "service_line_version",
+    universalType: "entity",
+    purpose: "服务线的具体版本，如"臻享家医 V1"/"安有医 颐享版"。用户上传文件的最小归属单元。包含准入规则、服务体系等完整版本内容。",
+    fields: [
+      f("line_name", "服务线名称", "如：臻享家医、安有医、居家养老。", "critical"),
+      f("version_name", "版本名称", "如：V1、颐享版、V2优享。", "critical"),
+      f("scenario_name", "所属场景", "医健 / 养老 / 家办。", "critical"),
+      f("series_name", "所属系列", "添平安系列。", "high_confidence"),
+      // 准入规则
+      f("admission_rules", "准入规则", "哪些客户可以获得本版本服务。", "high_confidence"),
+      f("qualification_threshold", "达标门槛", "如：保费达到X万元。", "high_confidence"),
+      f("designated_products", "指定产品", "绑定哪些保险产品可获本版本服务。", "high_confidence"),
+      f("effective_date_rule", "生效时间", "服务何时生效，如保单生效后30天内激活。", "high_confidence"),
+      f("eligible_persons", "权益人规则", "被保险人/投保人/家属等使用规则。", "high_confidence"),
+      f("service_period", "服务期限", "服务有效期，如保单年度内。", "high_confidence"),
+      // 服务详情
+      f("service_entry", "服务入口", "APP入口、热线、专属链接等。", "high_confidence"),
+      f("service_system", "服务体系", "本版本包含哪些服务线和服务项目总览。", "high_confidence"),
+      f("coverage_scope", "服务覆盖范围", "地区、城市、线上/线下覆盖。", "high_confidence"),
+      f("usage_notes", "注意事项", "使用限制和合规提示。", "high_confidence"),
+      f("service_process", "服务流程", "整体服务流程概述。", "recommended"),
+      f("compliance_notes", "合规说明", "免责条款和合规提示。", "recommended"),
+    ],
+    relationHints: [
+      "service_item 子服务项用 has_part",
+      "所属 service_line 用 part_of",
+      "关联保险产品用 bundled_with",
+    ],
+    lintRules: [
+      "line_name 和 version_name 是 DEDUP_KEY，一旦确定不能随意修改。",
+      "has_part 关系应覆盖该版本下所有 service_item 实体。",
+    ],
+  },
+  {
+    schemaKey: "insurance.service.ServiceItem",
+    label: "服务项",
+    domain: "service",
+    entityType: "service_item",
+    universalType: "entity",
+    purpose: "服务线版本下的具体服务项目，是服务知识的最小业务单元。命名规范：{service_line}-{version}-{item_name}，如"臻享家医-V1-在线问诊"。",
+    fields: [
+      // === DEDUP KEY 三元组（必须 critical）===
+      f("line_name", "服务线名称", "如：臻享家医、安有医、居家养老。是 DEDUP_KEY 的一部分。", "critical"),
+      f("version_name", "服务线版本", "如：V1、颐享版、V2优享。是 DEDUP_KEY 的一部分。", "critical"),
+      f("item_name", "服务项名称", "如：在线问诊、家庭医生服务。是 DEDUP_KEY 的一部分。", "critical"),
+      // === 层级归属字段 ===
+      f("scenario_name", "所属场景", "医健 / 养老 / 家办。", "critical"),
+      f("series_name", "所属系列", "添平安系列 / 享平安系列。", "high_confidence"),
+      // === 服务内容字段（来自 Sheet 2）===
+      f("service_scenario", "服务场景", "此服务项适用的使用场景（用户场景描述）。", "high_confidence"),
+      f("service_stage", "服务阶段", "此服务项所属的服务阶段（如：健康管理/就医协助/康复护理）。", "high_confidence"),
+      f("service_intro", "服务项目介绍", "对本服务项的整体介绍说明。", "high_confidence"),
+      f("service_frequency", "服务次数", "不限次 / 每年N次 / 服务期内N次。", "high_confidence"),
+      f("service_content", "服务内容", "本服务项具体提供的内容明细。", "high_confidence"),
+      f("service_standard", "服务标准", "服务质量标准和承诺。", "high_confidence"),
+      f("activation_conditions", "服务启动条件", "激活/开通本服务项的前提条件。", "high_confidence"),
+      f("eligible_customers", "适用人群", "谁可以使用本服务项。", "high_confidence"),
+      f("coverage_cities", "服务覆盖城市", "服务可用的城市范围。", "high_confidence"),
+      f("usage_process", "服务项目使用流程", "如何申请/使用本服务。", "high_confidence"),
+      f("service_notes", "服务说明", "补充说明、限制条件。", "high_confidence"),
+      f("important_notes", "重要提示", "使用前需注意的关键信息。", "high_confidence"),
+      f("marketing_materials", "触客素材", "关联销售素材、宣传材料路径。", "recommended"),
+      f("faq", "常见Q&A", "客户常见问题与解答。", "recommended"),
+      f("service_features", "服务特色", "按需扩展字段，如特色优势、独特价值。", "recommended"),
+      f("knowledge_gaps", "待补全信息", "材料未提供的缺失字段。", "recommended"),
+    ],
+    relationHints: [
+      "所属 service_line_version 用 part_of",
+      "通用概念页 service_item_concept 用 instance_of",
+      "ComplianceRule 用 governed_by",
+      "Pitch/ObjectionHandling 用 supports",
+    ],
+    lintRules: [
+      "实体标题必须遵循 {line_name}-{version_name}-{item_name} 命名规范。",
+      "line_name / version_name / item_name 三字段缺失时不能进入 active。",
+      "服务项不能被描述为保险金责任或理赔内容。",
+      "service_frequency 和 eligible_customers 至少一项有证据支持。",
+    ],
+  },
+  {
+    schemaKey: "insurance.service.ServiceItemConcept",
+    label: "服务项聚合页",
+    domain: "service",
+    entityType: "service_item_concept",
+    universalType: "concept",
+    purpose: "跨版本的服务项通用概念定义页，提供服务的通用介绍，不含具体版本的次数/限制等参数。通过 has_instance 关系链接到各版本的 service_item 实体。",
+    fields: [
+      f("item_name", "服务项概念名称", "如：在线问诊、家庭医生服务。", "critical"),
+      f("concept_summary", "通用概念简介", "跨版本的通用定义，不写具体次数和限制。", "critical"),
+      f("concept_category", "概念类别", "问诊 / 就医协助 / 康复 / 居家护理 / 健康管理等。", "high_confidence"),
+      f("common_scenarios", "通用使用场景", "这类服务项的通用适用场景。", "recommended"),
+    ],
+    relationHints: [
+      "各版本具体实例 service_item 用 has_instance（反向为 instance_of）",
+    ],
+    lintRules: [
+      "聚合页只写通用定义，不写具体版本的次数/城市/限制。",
+      "has_instance 关系应覆盖所有已知版本实例。",
+    ],
+  },
+
   {
     schemaKey: "insurance.customer.Persona",
+
     label: "客户画像",
     domain: "customer",
     entityType: "persona",
@@ -1369,9 +1557,201 @@ function normalizeBusinessTitle(value: string, entityType: string): string {
     title = title
       .replace(/服务权益名称|服务名称|权益名称|服务项目名称/g, "")
       .replace(/服务权益|权益服务|服务项目|服务说明|流程说明|说明|规则|pdf|文档/g, "")
+  } else if (entityType === "service_item") {
+    // service_item 标题格式为 {line}-{version}-{item}，不做过度归一化，保留分隔符
+    title = title
+      .replace(/服务项名称|服务项目名称|服务项目|服务名称/g, "")
+      .replace(/pdf|文档|说明/g, "")
   } else if (entityType === "persona") {
     title = title.replace(/客户画像|画像|客户|人群/g, "")
   }
 
   return title.length >= 4 ? normalizeDedupPart(title) : ""
+}
+
+// ─── Service Hierarchy Constant ───────────────────────────────────────────────
+// 完整五级层级数据，来源：《服务权益知识结构.xlsx》- 服务线视角
+// 用于前端导航树、ingest 路径解析、候选命名等
+
+export interface ServiceHierarchyVersion {
+  versionName: string
+}
+
+export interface ServiceHierarchyLine {
+  lineName: string
+  versions: ServiceHierarchyVersion[]
+}
+
+export interface ServiceHierarchyScenario {
+  scenarioName: string
+  lines: ServiceHierarchyLine[]
+}
+
+export interface ServiceHierarchySeries {
+  seriesName: string
+  status: "active" | "pending"
+  scenarios: ServiceHierarchyScenario[]
+}
+
+export const SERVICE_HIERARCHY: ServiceHierarchySeries[] = [
+  {
+    seriesName: "添平安系列",
+    status: "active",
+    scenarios: [
+      {
+        scenarioName: "医健",
+        lines: [
+          {
+            lineName: "安有医",
+            versions: [
+              { versionName: "颐享版" },
+              { versionName: "尊享版" },
+              { versionName: "悦享版" },
+              { versionName: "惠享版" },
+              { versionName: "尊享易核版" },
+            ],
+          },
+          {
+            lineName: "安有护",
+            versions: [
+              { versionName: "国际" },
+              { versionName: "国内" },
+            ],
+          },
+          {
+            lineName: "就医通",
+            versions: [
+              { versionName: "就医通" },
+            ],
+          },
+          {
+            lineName: "臻享家医",
+            versions: [
+              { versionName: "V1" },
+              { versionName: "V2" },
+              { versionName: "V3" },
+            ],
+          },
+          {
+            lineName: "御享国医",
+            versions: [
+              { versionName: "御享国医" },
+            ],
+          },
+          {
+            lineName: "私董保健医",
+            versions: [
+              { versionName: "京华版" },
+              { versionName: "繁华版" },
+            ],
+          },
+        ],
+      },
+      {
+        scenarioName: "养老",
+        lines: [
+          {
+            lineName: "居家养老",
+            versions: [
+              { versionName: "V1" },
+              { versionName: "V1优享" },
+              { versionName: "V2" },
+              { versionName: "V2优享" },
+            ],
+          },
+          {
+            lineName: "高端康养",
+            versions: [
+              { versionName: "逸享" },
+              { versionName: "逸享PLUS" },
+              { versionName: "颐享家" },
+              { versionName: "臻享V1" },
+              { versionName: "臻享V2" },
+              { versionName: "臻享V3" },
+            ],
+          },
+        ],
+      },
+      {
+        scenarioName: "家办",
+        lines: [
+          {
+            lineName: "家族办公室",
+            versions: [
+              { versionName: "准会员" },
+              { versionName: "正式会员" },
+              { versionName: "尊享会员" },
+              { versionName: "至尊会员" },
+            ],
+          },
+        ],
+      },
+    ],
+  },
+  {
+    seriesName: "享平安系列",
+    status: "pending",
+    scenarios: [],
+  },
+]
+
+/**
+ * 根据服务线和版本构建服务项实体标题。
+ *
+ * 命名规范：{lineName}-{versionName}-{itemName}
+ * 示例：
+ *   buildServiceItemTitle("臻享家医", "V1", "在线问诊")
+ *   → "臻享家医-V1-在线问诊"
+ *
+ *   buildServiceItemTitle("安有医", "颐享版", "家庭医生服务")
+ *   → "安有医-颐享版-家庭医生服务"
+ */
+export function buildServiceItemTitle(
+  lineName: string,
+  versionName: string,
+  itemName: string,
+): string {
+  return `${lineName.trim()}-${versionName.trim()}-${itemName.trim()}`
+}
+
+/**
+ * 解析服务项实体标题，提取 line / version / item 三元组。
+ * 如果标题不符合三段格式，返回 null。
+ *
+ * 注意：仅做简单分割，不做业务验证。
+ * 对于 "臻享家医-V1-在线问诊" → { lineName: "臻享家医", versionName: "V1", itemName: "在线问诊" }
+ */
+export function parseServiceItemTitle(
+  title: string,
+): { lineName: string; versionName: string; itemName: string } | null {
+  const parts = title.split("-")
+  if (parts.length < 3) return null
+  // item_name 本身可能含连字符，所以 itemName = 剩余所有部分
+  const [lineName, versionName, ...rest] = parts
+  const itemName = rest.join("-")
+  if (!lineName || !versionName || !itemName) return null
+  return { lineName, versionName, itemName }
+}
+
+/**
+ * 在 SERVICE_HIERARCHY 中查找某个服务线版本是否存在。
+ * 用于 ingest 时快速校验上传路径的合法性。
+ */
+export function findServiceLineVersion(
+  lineName: string,
+  versionName: string,
+): { series: string; scenario: string } | null {
+  for (const series of SERVICE_HIERARCHY) {
+    for (const scenario of series.scenarios) {
+      for (const line of scenario.lines) {
+        if (line.lineName === lineName) {
+          const version = line.versions.find(v => v.versionName === versionName)
+          if (version) {
+            return { series: series.seriesName, scenario: scenario.scenarioName }
+          }
+        }
+      }
+    }
+  }
+  return null
 }
