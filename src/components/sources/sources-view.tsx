@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react"
-import { Plus, FileText, RefreshCw, BookOpen, Trash2, Folder, ChevronRight, ChevronDown } from "lucide-react"
+import { Plus, FileText, RefreshCw, BookOpen, Trash2, Folder, ChevronRight, ChevronDown, Layers, Upload, LayoutList } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { useWikiStore } from "@/stores/wiki-store"
@@ -22,6 +22,8 @@ import {
   collectAllFilesIncludingDot,
   decideDeleteClick,
 } from "@/lib/sources-tree-delete"
+import { SERVICE_HIERARCHY } from "@/lib/insurance-schema-registry"
+import type { ServiceHierarchySeries } from "@/lib/insurance-schema-registry"
 
 export function SourcesView() {
   const { t } = useTranslation()
@@ -36,6 +38,8 @@ export function SourcesView() {
   const [importStatus, setImportStatus] = useState<string | null>(null)
   const [importError, setImportError] = useState<string | null>(null)
   const [ingestingPath, setIngestingPath] = useState<string | null>(null)
+  /** "files" = classic flat file tree; "hierarchy" = 5-level service hierarchy upload */
+  const [viewMode, setViewMode] = useState<"files" | "hierarchy">("files")
   /**
    * Path of the source-tree node currently in "click again to
    * confirm delete" state. Lifted up here (rather than living
@@ -75,6 +79,61 @@ export function SourcesView() {
   useEffect(() => {
     loadSources()
   }, [loadSources])
+
+  /**
+   * Upload files into a specific service line version directory.
+   * Destination: raw/sources/{lineName}/{versionName}/
+   * The ingest pipeline will detect the path and inject service line context.
+   */
+  async function handleVersionUpload(lineName: string, versionName: string) {
+    if (!project) return
+    const input = document.createElement("input")
+    input.type = "file"
+    input.multiple = true
+    input.accept = ".pdf,.md,.mdx,.txt,.docx,.xlsx,.png,.jpg,.jpeg"
+    input.onchange = async () => {
+      const files = Array.from(input.files ?? [])
+      if (!files.length) return
+      setImporting(true)
+      setImportError(null)
+      setImportStatus(`正在上传到 ${lineName}-${versionName}...`)
+      const pp = normalizePath(project.path)
+      // Upload destination encodes the service line context in the path
+      const destDir = `${pp}/raw/sources/${lineName}/${versionName}`
+      try {
+        const { uploadFiles } = await import("@/commands/fs")
+        const results = await uploadFiles(files, destDir)
+        const importedPaths: string[] = results
+          .filter((r): r is { path: string; name: string; size: number } => "path" in r)
+          .map((r) => r.path)
+        const errorCount = results.filter((r) => "error" in r).length
+        setImportStatus(
+          errorCount > 0
+            ? `上传完成：${importedPaths.length} 成功，${errorCount} 失败`
+            : `✓ ${lineName}-${versionName}: ${importedPaths.length} 个文件已上传`
+        )
+        await loadSources()
+        const canIngest = !!(llmConfig.apiKey || llmConfig.provider === "ollama" || llmConfig.provider === "custom")
+        if (canIngest && importedPaths.length > 0) {
+          setImportStatus(`正在排队解析 ${importedPaths.length} 个文件 (${lineName}-${versionName})...`)
+          const tasks = importedPaths.map((absPath) => ({
+            sourcePath: absPath.startsWith(pp + "/") ? absPath.slice(pp.length + 1) : absPath,
+            folderContext: `${lineName} > ${versionName}`,
+          }))
+          enqueueBatch(project.id, tasks).catch((err) =>
+            console.error(`Failed to enqueue batch:`, err)
+          )
+        }
+        setTimeout(() => setImportStatus(null), 5000)
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        setImportError(`上传失败: ${msg}`)
+      } finally {
+        setImporting(false)
+      }
+    }
+    input.click()
+  }
 
   async function handleImport() {
     if (!project) return
@@ -444,20 +503,41 @@ export function SourcesView() {
       <div className="flex items-center justify-between border-b px-4 py-3">
         <h2 className="text-sm font-semibold">{t("sources.title")}</h2>
         <div className="flex gap-1">
+          {/* View mode toggle */}
+          <Button
+            variant={viewMode === "files" ? "secondary" : "ghost"}
+            size="icon"
+            title="文件视图"
+            onClick={() => setViewMode("files")}
+          >
+            <LayoutList className="h-4 w-4" />
+          </Button>
+          <Button
+            variant={viewMode === "hierarchy" ? "secondary" : "ghost"}
+            size="icon"
+            title="服务层级上传"
+            onClick={() => setViewMode("hierarchy")}
+          >
+            <Layers className="h-4 w-4" />
+          </Button>
           <Button variant="ghost" size="icon" onClick={loadSources} title="Refresh">
             <RefreshCw className="h-4 w-4" />
           </Button>
-          <Button size="sm" onClick={handleImport} disabled={importing}>
-            {importing ? (
-              <><RefreshCw className="mr-1 h-4 w-4 animate-spin" />上传中...</>
-            ) : (
-              <><Plus className="mr-1 h-4 w-4" />{t("sources.import")}</>
-            )}
-          </Button>
-          <Button size="sm" variant="outline" onClick={handleImportFolder} disabled={importing}>
-            <Folder className="mr-1 h-4 w-4" />
-            Folder
-          </Button>
+          {viewMode === "files" && (
+            <>
+              <Button size="sm" onClick={handleImport} disabled={importing}>
+                {importing ? (
+                  <><RefreshCw className="mr-1 h-4 w-4 animate-spin" />上传中...</>
+                ) : (
+                  <><Plus className="mr-1 h-4 w-4" />{t("sources.import")}</>
+                )}
+              </Button>
+              <Button size="sm" variant="outline" onClick={handleImportFolder} disabled={importing}>
+                <Folder className="mr-1 h-4 w-4" />
+                Folder
+              </Button>
+            </>
+          )}
         </div>
       </div>
 
@@ -473,7 +553,15 @@ export function SourcesView() {
       )}
 
       <ScrollArea className="flex-1">
-        {sources.length === 0 ? (
+        {viewMode === "hierarchy" ? (
+          <ServiceHierarchyPanel
+            sources={sources}
+            onVersionUpload={handleVersionUpload}
+            onOpen={handleOpenSource}
+            onIngest={handleIngest}
+            importing={importing}
+          />
+        ) : sources.length === 0 ? (
           <div className="flex flex-col items-center justify-center gap-3 p-8 text-center text-sm text-muted-foreground">
             <p>{t("sources.noSources")}</p>
             <p>{t("sources.importHint")}</p>
@@ -508,8 +596,6 @@ export function SourcesView() {
       <div className="border-t px-4 py-2 text-xs text-muted-foreground">
         {t("sources.sourceCount", { count: countFiles(sources) })}
       </div>
-
-      {/* Server folder browser modal - REMOVED, using webkitdirectory instead */}
     </div>
   )
 }
@@ -804,4 +890,230 @@ function flattenMdFiles(nodes: FileNode[]): FileNode[] {
     }
   }
   return files
+}
+
+// ─── Service Hierarchy Panel ─────────────────────────────────────────────────
+// Renders the 5-level service knowledge tree (系列 > 场景 > 服务线 > 版本)
+// with per-version upload buttons. Files uploaded here go to:
+//   raw/sources/{lineName}/{versionName}/
+// The ingest pipeline detects this path and injects service line context.
+
+function ServiceHierarchyPanel({
+  sources,
+  onVersionUpload,
+  onOpen,
+  onIngest,
+  importing,
+}: {
+  sources: FileNode[]
+  onVersionUpload: (lineName: string, versionName: string) => void
+  onOpen: (node: FileNode) => void
+  onIngest: (node: FileNode) => void
+  importing: boolean
+}) {
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({})
+
+  const toggle = (key: string) =>
+    setCollapsed((prev) => ({ ...prev, [key]: !prev[key] }))
+
+  // Count files under a specific path in the sources tree
+  function countInPath(pathSuffix: string): number {
+    function walk(nodes: FileNode[], depth = 0): number {
+      let n = 0
+      for (const node of nodes) {
+        if (node.is_dir && node.children) {
+          if (node.path.endsWith(pathSuffix) || node.path.includes(`/${pathSuffix}/`)) {
+            n += countFiles(node.children)
+          } else {
+            n += walk(node.children, depth + 1)
+          }
+        }
+      }
+      return n
+    }
+    return walk(sources)
+  }
+
+  // Find files under a version directory
+  function findVersionFiles(lineName: string, versionName: string): FileNode[] {
+    function walk(nodes: FileNode[]): FileNode[] {
+      for (const node of nodes) {
+        if (node.is_dir && node.children) {
+          // Check if this directory matches lineName/versionName
+          const parts = node.path.replace(/\\/g, "/").split("/")
+          const lastTwo = parts.slice(-2)
+          if (lastTwo[0] === lineName && lastTwo[1] === versionName) {
+            return node.children.filter((c) => !c.is_dir)
+          }
+          const found = walk(node.children)
+          if (found.length > 0) return found
+        }
+      }
+      return []
+    }
+    return walk(sources)
+  }
+
+  return (
+    <div className="p-2 space-y-1">
+      {/* Header hint */}
+      <div className="px-2 py-1.5 text-[11px] text-muted-foreground bg-muted/40 rounded-md mb-2">
+        <span className="font-medium text-foreground/70">服务层级上传</span>
+        　在版本下上传文件，系统自动识别服务线归属，抽取实体命名如
+        <code className="mx-1 text-[10px] bg-muted px-1 rounded">臻享家医-V1-在线问诊</code>
+      </div>
+
+      {SERVICE_HIERARCHY.map((series) => {
+        const seriesKey = `series-${series.seriesName}`
+        const isSeriesCollapsed = collapsed[seriesKey] ?? false
+        return (
+          <div key={seriesKey}>
+            {/* L1: 系列 */}
+            <button
+              onClick={() => toggle(seriesKey)}
+              className="flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-sm font-semibold hover:bg-accent"
+            >
+              {isSeriesCollapsed
+                ? <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                : <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />}
+              <span className="text-xs font-bold tracking-wide text-foreground/80 uppercase">
+                {series.seriesName}
+              </span>
+              {series.status === "pending" && (
+                <span className="ml-1 text-[10px] text-muted-foreground/50 border border-dashed border-muted-foreground/30 rounded px-1">
+                  待建设
+                </span>
+              )}
+            </button>
+
+            {!isSeriesCollapsed && series.scenarios.map((scenario) => {
+              const scenarioKey = `scenario-${series.seriesName}-${scenario.scenarioName}`
+              const isScenarioCollapsed = collapsed[scenarioKey] ?? false
+              return (
+                <div key={scenarioKey} className="ml-4">
+                  {/* L2: 场景 */}
+                  <button
+                    onClick={() => toggle(scenarioKey)}
+                    className="flex w-full items-center gap-1.5 rounded-md px-2 py-1 text-sm hover:bg-accent"
+                  >
+                    {isScenarioCollapsed
+                      ? <ChevronRight className="h-3 w-3 shrink-0 text-muted-foreground" />
+                      : <ChevronDown className="h-3 w-3 shrink-0 text-muted-foreground" />}
+                    <span className="font-medium text-foreground/70">{scenario.scenarioName}</span>
+                    <span className="ml-auto text-[10px] text-muted-foreground/50">
+                      {scenario.lines.length} 条服务线
+                    </span>
+                  </button>
+
+                  {!isScenarioCollapsed && scenario.lines.map((line) => {
+                    const lineKey = `line-${line.lineName}`
+                    const isLineCollapsed = collapsed[lineKey] ?? false
+                    return (
+                      <div key={lineKey} className="ml-4">
+                        {/* L3: 服务线 */}
+                        <button
+                          onClick={() => toggle(lineKey)}
+                          className="flex w-full items-center gap-1.5 rounded-md px-2 py-1 text-sm hover:bg-accent"
+                        >
+                          {isLineCollapsed
+                            ? <ChevronRight className="h-3 w-3 shrink-0 text-amber-500" />
+                            : <ChevronDown className="h-3 w-3 shrink-0 text-amber-500" />}
+                          <Folder className="h-3.5 w-3.5 shrink-0 text-amber-500" />
+                          <span className="font-medium">{line.lineName}</span>
+                          <span className="ml-auto text-[10px] text-muted-foreground/50">
+                            {line.versions.length} 版
+                          </span>
+                        </button>
+
+                        {!isLineCollapsed && line.versions.map((version) => {
+                          const versionKey = `version-${line.lineName}-${version.versionName}`
+                          const isVersionCollapsed = collapsed[versionKey] ?? false
+                          const versionFiles = findVersionFiles(line.lineName, version.versionName)
+                          const fileCount = versionFiles.length
+                          return (
+                            <div key={versionKey} className="ml-4">
+                              {/* L4: 版本 */}
+                              <div className="flex items-center gap-1 group rounded-md px-2 py-1 hover:bg-accent/60">
+                                <button
+                                  onClick={() => toggle(versionKey)}
+                                  className="flex flex-1 items-center gap-1.5 text-sm text-left min-w-0"
+                                >
+                                  {isVersionCollapsed
+                                    ? <ChevronRight className="h-3 w-3 shrink-0 text-muted-foreground" />
+                                    : <ChevronDown className="h-3 w-3 shrink-0 text-muted-foreground" />}
+                                  <span className="text-blue-600 dark:text-blue-400 font-mono text-[11px] shrink-0">
+                                    {version.versionName}
+                                  </span>
+                                  {fileCount > 0 && (
+                                    <span className="ml-1 text-[10px] bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300 rounded px-1">
+                                      {fileCount}
+                                    </span>
+                                  )}
+                                </button>
+                                {/* Upload button */}
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  className="h-6 w-6 shrink-0 opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-foreground"
+                                  title={`上传到 ${line.lineName}-${version.versionName}`}
+                                  disabled={importing}
+                                  onClick={() => onVersionUpload(line.lineName, version.versionName)}
+                                >
+                                  <Upload className="h-3.5 w-3.5" />
+                                </Button>
+                              </div>
+
+                              {/* L5: Files already uploaded to this version */}
+                              {!isVersionCollapsed && versionFiles.length > 0 && (
+                                <div className="ml-6 space-y-0.5">
+                                  {versionFiles.map((file) => (
+                                    <div
+                                      key={file.path}
+                                      className="flex items-center gap-1 rounded px-2 py-0.5 text-[11px] text-muted-foreground hover:bg-accent hover:text-accent-foreground group"
+                                    >
+                                      <FileText className="h-3 w-3 shrink-0" />
+                                      <button
+                                        className="flex-1 truncate text-left"
+                                        onClick={() => onOpen(file)}
+                                      >
+                                        {file.name}
+                                      </button>
+                                      <Button
+                                        variant="ghost"
+                                        size="icon"
+                                        className="h-5 w-5 shrink-0 opacity-0 group-hover:opacity-100"
+                                        title="重新解析"
+                                        onClick={() => onIngest(file)}
+                                      >
+                                        <BookOpen className="h-3 w-3" />
+                                      </Button>
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
+
+                              {/* Empty version prompt */}
+                              {!isVersionCollapsed && versionFiles.length === 0 && (
+                                <div
+                                  className="ml-6 flex items-center gap-1.5 rounded border border-dashed border-muted-foreground/20 px-2 py-1.5 text-[11px] text-muted-foreground/50 cursor-pointer hover:border-muted-foreground/40 hover:text-muted-foreground transition-colors"
+                                  onClick={() => onVersionUpload(line.lineName, version.versionName)}
+                                >
+                                  <Upload className="h-3 w-3" />
+                                  点击上传 {line.lineName}-{version.versionName} 的服务材料
+                                </div>
+                              )}
+                            </div>
+                          )
+                        })}
+                      </div>
+                    )
+                  })}
+                </div>
+              )
+            })}
+          </div>
+        )
+      })}
+    </div>
+  )
 }

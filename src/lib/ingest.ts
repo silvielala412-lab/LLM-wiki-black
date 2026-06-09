@@ -35,6 +35,32 @@ import {
 import { resolveIncomingKnowledgePage } from "@/lib/knowledge-resolution"
 import { buildServiceItemTitle, findServiceLineVersion } from "@/lib/insurance-schema-registry"
 import type { MultimodalConfig } from "@/stores/wiki-store"
+
+/**
+ * Extract service line + version context from a source file path.
+ *
+ * Expected path pattern:
+ *   raw/sources/{lineName}/{versionName}/file.pdf
+ *
+ * Returns null if the path doesn't match a known service line version.
+ *
+ * Example:
+ *   "raw/sources/臻享家医/V1/服务手册.pdf"
+ *   → { lineName: "臻享家医", versionName: "V1" }
+ */
+export function extractServiceLineCtxFromPath(
+  sourcePath: string,
+): { lineName: string; versionName: string; seriesName: string; scenarioName: string } | null {
+  const parts = sourcePath.replace(/\\/g, "/").split("/")
+  // Expected: ["raw", "sources", lineName, versionName, ...filename]
+  if (parts.length < 5) return null
+  if (parts[0] !== "raw" || parts[1] !== "sources") return null
+  const lineName = parts[2]
+  const versionName = parts[3]
+  const ctx = findServiceLineVersion(lineName, versionName)
+  if (!ctx) return null
+  return { lineName, versionName, seriesName: ctx.series, scenarioName: ctx.scenario }
+}
 import type { ChunkingConfig } from "@/types/wiki"
 import { useAuthStore } from "@/stores/auth-store"
 import { chunkMarkdown } from "@/lib/text-chunker"
@@ -2483,6 +2509,10 @@ async function autoIngestImpl(
   const chunking = useWikiStore.getState().project?.chunking
   const activity = useActivityStore.getState()
   const fileName = getFileName(sp)
+  // Detect service hierarchy context from upload path (v2 schema)
+  // e.g. raw/sources/臻享家医/V1/file.pdf → { lineName: "臻享家医", versionName: "V1" }
+  const relativeSourcePath = sp.startsWith(pp + "/") ? sp.slice(pp.length + 1) : sp
+  const serviceLineCtx = extractServiceLineCtxFromPath(relativeSourcePath)
   console.log(`[ingest:diag] autoIngestImpl ENTRY for "${fileName}" (project="${pp}", source="${sp}")`)
   const activityId = activity.addItem({
     type: "ingest",
@@ -2840,6 +2870,14 @@ async function autoIngestImpl(
         "",
         `**File:** ${fileName}`,
         folderContext ? `**Folder context:** ${folderContext}` : "",
+        serviceLineCtx
+          ? [
+              `**Service hierarchy context (v2):** 系列=${serviceLineCtx.seriesName} | 场景=${serviceLineCtx.scenarioName} | 服务线=${serviceLineCtx.lineName} | 版本=${serviceLineCtx.versionName}`,
+              `**Entity naming rule:** All service_item entities extracted from this file MUST be titled "${serviceLineCtx.lineName}-${serviceLineCtx.versionName}-{服务项名称}", e.g. "${buildServiceItemTitle(serviceLineCtx.lineName, serviceLineCtx.versionName, "在线问诊")}"`,
+              `**entity_type for service items:** service_item (NOT service_benefit)`,
+              `**knowledge_domain for service items:** service`,
+            ].join("\n")
+          : "",
         `**Processing mode:** ${preparedSource.processingMode}`,
         factLayerHints,
         schemaCandidateManifest,
@@ -2875,6 +2913,12 @@ async function autoIngestImpl(
       role: "user",
       content: [
         `Source document to process: **${fileName}**`,
+        serviceLineCtx
+          ? [
+              `**Service hierarchy context (v2):** ${serviceLineCtx.lineName}-${serviceLineCtx.versionName}`,
+              `**Entity naming rule:** service_item page titles = "${serviceLineCtx.lineName}-${serviceLineCtx.versionName}-{服务项名称}"`,
+            ].join("\n")
+          : "",
         factLayerHints,
         schemaCandidateManifest,
         "",
