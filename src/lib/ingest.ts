@@ -92,6 +92,21 @@ function isJsonSourcePath(path: string): boolean {
   return /\.json$/i.test(path)
 }
 
+function shouldHashRawSource(path: string): boolean {
+  const ext = path.split(".").pop()?.toLowerCase() ?? ""
+  return ["pdf", "png", "jpg", "jpeg", "webp", "gif", "bmp", "tiff", "tif"].includes(ext)
+}
+
+async function readSourceCacheContent(sourcePath: string, fallbackContent: string): Promise<string> {
+  if (!shouldHashRawSource(sourcePath)) return fallbackContent
+  try {
+    const file = await readFileAsBase64(sourcePath)
+    return file.base64
+  } catch {
+    return fallbackContent
+  }
+}
+
 function asJsonRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown>
@@ -2460,6 +2475,7 @@ async function autoIngestImpl(
     tryReadFile(`${pp}/wiki/index.md`),
     tryReadFile(`${pp}/wiki/overview.md`),
   ])
+  const sourceCacheContent = await readSourceCacheContent(sp, rawSourceContent)
 
   // ── Image-PDF OCR: detect scanned PDFs and run vision-model OCR ──
   let sourceContent = rawSourceContent
@@ -2566,7 +2582,7 @@ async function autoIngestImpl(
   // re-running them costs only the extraction time and converges the
   // source-summary page on the current pipeline's contract regardless
   // of when the file was first ingested.
-  const cachedFiles = await checkIngestCache(pp, fileName, sourceContent)
+  const cachedFiles = await checkIngestCache(pp, fileName, sourceCacheContent)
   console.log(`[ingest:diag] cache check for "${fileName}":`, cachedFiles === null ? "MISS (full pipeline)" : `HIT (${cachedFiles.length} cached files)`)
   if (cachedFiles !== null) {
     try {
@@ -3197,7 +3213,7 @@ async function autoIngestImpl(
   // — they represent deterministic decisions and caching them is
   // safe.
   if (writtenPaths.length > 0 && hardFailures.length === 0) {
-    await saveIngestCache(pp, fileName, sourceContent, writtenPaths)
+    await saveIngestCache(pp, fileName, sourceCacheContent, writtenPaths)
   } else if (hardFailures.length > 0) {
     console.warn(
       `[ingest] Skipping cache save for "${fileName}" — ${hardFailures.length} block(s) failed to write: ${hardFailures.join(", ")}`,

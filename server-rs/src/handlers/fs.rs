@@ -276,6 +276,40 @@ fn pdf_to_images_base64(path: &str, dpi: u32) -> anyhow::Result<Vec<String>> {
     Ok(result)
 }
 
+fn pdf_image_pages_marker(path: &str, dpi: u32, fallback_text: Option<String>) -> anyhow::Result<String> {
+    match pdf_to_images_base64(path, dpi) {
+        Ok(pages) if !pages.is_empty() => {
+            let marker = serde_json::json!({
+                "type": "image_pages",
+                "page_count": pages.len(),
+                "dpi": dpi,
+                "pages": pages,
+            });
+            Ok(format!("__PDF_IMAGE_PAGES__{}", marker))
+        }
+        Ok(_) => Ok(fallback_text.unwrap_or_else(|| "(PDF has no extractable text and no pages could be rendered)".into())),
+        Err(e) => Ok(fallback_text.unwrap_or_else(|| format!(
+            "(PDF has no extractable text — install poppler-utils or configure OCR_ENDPOINT. Error: {e})"
+        ))),
+    }
+}
+
+fn extract_pdf_text_with_pdftotext(path: &str) -> anyhow::Result<String> {
+    use std::process::Command;
+
+    let output = Command::new("pdftotext")
+        .args(["-layout", "-enc", "UTF-8", path, "-"])
+        .output()
+        .map_err(|e| anyhow::anyhow!("pdftotext not found or failed to start: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(anyhow::anyhow!("pdftotext exited with status {}: {}", output.status, stderr));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 /// Read and preprocess a file — returns text content (same behaviour as Tauri read_file).
 fn read_file_sync(path: &str, pdf_dpi: u32) -> anyhow::Result<String> {
     let p = Path::new(path);
@@ -383,7 +417,8 @@ pub async fn read_file(
 /// Async PDF content extraction with three-tier fallback:
 ///   1. Internal OCR API  (if OCR_ENDPOINT configured) — handles all PDFs
 ///   2. pdf-extract       (pure Rust, fast)             — text-layer PDFs only
-///   3. pdftoppm marker   (poppler-utils)               — image-PDF fallback
+///   3. pdftotext         (Poppler fallback)            — text-layer PDFs pdf-extract cannot decode
+///   4. pdftoppm marker   (poppler-utils)               — image-PDF fallback
 async fn extract_pdf_content_async(path: &str, state: &AppState) -> anyhow::Result<String> {
     // ── Tier 1: internal OCR API ──────────────────────────────────────
     if let Some(ocr_endpoint) = &state.llm_config.ocr_endpoint {
@@ -397,6 +432,13 @@ async fn extract_pdf_content_async(path: &str, state: &AppState) -> anyhow::Resu
                 tracing::warn!("PDF OCR: internal API failed ({e}), falling back to pdf-extract");
             }
         }
+    }
+
+    let dpi = state.llm_config.pdf_dpi;
+    if state.llm_config.pdf_ocr_mode == "always" {
+        let path_owned = path.to_string();
+        return tokio::task::spawn_blocking(move || pdf_image_pages_marker(&path_owned, dpi, None))
+            .await?;
     }
 
     // ── Tier 2: pdf-extract (text-layer PDFs) ─────────────────────────
@@ -436,25 +478,40 @@ async fn extract_pdf_content_async(path: &str, state: &AppState) -> anyhow::Resu
         _ => {} // empty text → fall through to Tier 3
     }
 
-    // ── Tier 3: pdftoppm → image pages marker ─────────────────────────
-    let dpi = state.llm_config.pdf_dpi;
-    let path_owned = path.to_string();
-    let marker = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
-        match pdf_to_images_base64(&path_owned, dpi) {
-            Ok(pages) if !pages.is_empty() => {
-                let marker = serde_json::json!({
-                    "type": "image_pages",
-                    "page_count": pages.len(),
-                    "dpi": dpi,
-                    "pages": pages,
-                });
-                Ok(format!("__PDF_IMAGE_PAGES__{}", marker))
+    // ── Tier 3: pdftotext fallback before OCR ────────────────────────
+    let path_for_pdftotext = path.to_string();
+    match tokio::task::spawn_blocking(move || extract_pdf_text_with_pdftotext(&path_for_pdftotext)).await {
+        Ok(Ok(text)) if !text.trim().is_empty() => {
+            let trimmed = text.trim().to_string();
+            let char_count = trimmed.chars().count();
+            if char_count >= 200 {
+                tracing::info!("pdftotext extracted {char_count} chars for {path}");
+                return Ok(trimmed);
             }
-            Ok(_) => Ok(short_text_fallback.unwrap_or_else(|| "(PDF has no extractable text and no pages could be rendered)".into())),
-            Err(e) => Ok(short_text_fallback.unwrap_or_else(|| format!(
-                "(PDF has no extractable text — install poppler-utils or configure OCR_ENDPOINT. Error: {e})"
-            ))),
+            tracing::warn!(
+                "pdftotext returned only {char_count} chars for {path}; trying image fallback"
+            );
+            if short_text_fallback
+                .as_ref()
+                .map(|existing| trimmed.len() > existing.len())
+                .unwrap_or(true)
+            {
+                short_text_fallback = Some(trimmed);
+            }
         }
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            tracing::warn!("pdftotext failed for {path}: {e}, trying image fallback");
+        }
+        Err(e) => {
+            tracing::warn!("pdftotext worker failed for {path}: {e}, trying image fallback");
+        }
+    }
+
+    // ── Tier 4: pdftoppm → image pages marker ─────────────────────────
+    let path_owned = path.to_string();
+    let marker = tokio::task::spawn_blocking(move || {
+        pdf_image_pages_marker(&path_owned, dpi, short_text_fallback)
     }).await??;
 
     Ok(marker)

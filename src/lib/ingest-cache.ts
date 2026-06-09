@@ -9,13 +9,14 @@ import { normalizePath, isAbsolutePath } from "@/lib/path-utils"
 
 interface CacheEntry {
   hash: string
+  sourceFileName?: string
   pipelineVersion?: string
   timestamp: number
   filesWritten: string[]
 }
 
 interface CacheData {
-  entries: Record<string, CacheEntry> // keyed by source filename
+  entries: Record<string, CacheEntry> // keyed by content hash; legacy filename keys are still read
 }
 
 const INGEST_PIPELINE_VERSION = "service-router-dedupe-v7"
@@ -65,6 +66,10 @@ async function saveCache(projectPath: string, cache: CacheData): Promise<void> {
   }
 }
 
+function contentCacheKey(hash: string): string {
+  return `content:${hash}`
+}
+
 /**
  * Check if a source file has already been ingested with the same content.
  * Returns the list of previously written files if cached, or null if ingest
@@ -83,12 +88,17 @@ export async function checkIngestCache(
   sourceContent: string,
 ): Promise<string[] | null> {
   const cache = await loadCache(projectPath)
-  const entry = cache.entries[sourceFileName]
+  const currentHash = await sha256(sourceContent)
+
+  const candidates = [
+    cache.entries[contentCacheKey(currentHash)],
+    cache.entries[sourceFileName],
+  ].filter((entry): entry is CacheEntry => Boolean(entry))
+
+  const entry = candidates.find((candidate) => candidate.hash === currentHash)
   if (!entry) return null
 
-  const currentHash = await sha256(sourceContent)
   if (PIPELINE_VERSION_STRICT && entry.pipelineVersion !== INGEST_PIPELINE_VERSION) return null
-  if (entry.hash !== currentHash) return null
 
   const pp = normalizePath(projectPath)
   for (const filePath of entry.filesWritten) {
@@ -124,12 +134,16 @@ export async function saveIngestCache(
   const cache = await loadCache(projectPath)
   const hash = await sha256(sourceContent)
   const newEntries = { ...cache.entries }
-  newEntries[sourceFileName] = {
+  const entry: CacheEntry = {
     hash,
+    sourceFileName,
     pipelineVersion: INGEST_PIPELINE_VERSION,
     timestamp: Date.now(),
     filesWritten,
   }
+  newEntries[contentCacheKey(hash)] = entry
+  // Keep a filename alias for older cache lookups, but the hash must still match.
+  newEntries[sourceFileName] = entry
   await saveCache(projectPath, { entries: newEntries })
 }
 
@@ -142,6 +156,10 @@ export async function removeFromIngestCache(
 ): Promise<void> {
   const cache = await loadCache(projectPath)
   const newEntries = { ...cache.entries }
-  delete newEntries[sourceFileName]
+  for (const [key, entry] of Object.entries(cache.entries)) {
+    if (key === sourceFileName || entry.sourceFileName === sourceFileName) {
+      delete newEntries[key]
+    }
+  }
   await saveCache(projectPath, { entries: newEntries })
 }

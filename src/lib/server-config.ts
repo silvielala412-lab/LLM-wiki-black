@@ -37,6 +37,7 @@ interface ServerVisionConfig {
 
 interface ServerPdfConfig {
   dpi?: number
+  ocr_mode?: "auto" | "always"
 }
 
 interface ServerSearchConfig {
@@ -146,7 +147,12 @@ export async function applyServerConfig(): Promise<void> {
 
     if (cfg.vision.has_api_key) {
       const mmCfg = store.multimodalConfig
-      if (!mmCfg.enabled || !mmCfg.apiKey) {
+      const shouldApplyServerVision =
+        !mmCfg.enabled ||
+        !mmCfg.apiKey ||
+        mmCfg.apiKey === "__SERVER_MANAGED_VISION__"
+
+      if (shouldApplyServerVision) {
         store.setMultimodalConfig({
           ...mmCfg,
           enabled: true,

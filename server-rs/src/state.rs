@@ -30,6 +30,10 @@ pub struct LlmServerConfig {
     pub vision_api_key: Option<String>,
     pub has_vision_api_key: bool,
     pub pdf_dpi: u32,
+    /// PDF OCR mode:
+    /// - "auto": extract text first, OCR only scanned/weak PDFs.
+    /// - "always": render every PDF page for OCR.
+    pub pdf_ocr_mode: String,
 
     // ── Internal PDF OCR API (custom format) ──────────────────────────
     /// POST endpoint for the intranet PDF OCR service.
@@ -55,9 +59,27 @@ impl LlmServerConfig {
     pub fn from_env() -> Self {
         let api_key = Self::opt_env("LLM_API_KEY");
         let embedding_api_key = Self::opt_env("EMBEDDING_API_KEY");
-        let vision_api_key = Self::opt_env("VISION_API_KEY").or_else(|| Self::opt_env("SEARCH_API_KEY"));
+        let vision_endpoint = Self::opt_env("VISION_ENDPOINT");
+        let vision_uses_dashscope = vision_endpoint
+            .as_deref()
+            .map(|endpoint| endpoint.contains("dashscope.aliyuncs.com"))
+            .unwrap_or(false);
+        let vision_api_key = if vision_uses_dashscope {
+            embedding_api_key
+                .clone()
+                .or_else(|| Self::opt_env("VISION_API_KEY"))
+                .or_else(|| Self::opt_env("SEARCH_API_KEY"))
+        } else {
+            Self::opt_env("VISION_API_KEY")
+                .or_else(|| Self::opt_env("SEARCH_API_KEY"))
+                .or_else(|| embedding_api_key.clone())
+        };
         let ocr_endpoint = Self::opt_env("OCR_ENDPOINT");
         let ocr_api_key = Self::opt_env("OCR_API_KEY");
+        let pdf_ocr_mode = Self::opt_env("PDF_OCR_MODE")
+            .map(|v| v.to_lowercase())
+            .filter(|v| v == "auto" || v == "always")
+            .unwrap_or_else(|| "auto".to_string());
         Self {
             provider: Self::opt_env("LLM_PROVIDER"),
             has_api_key: api_key.is_some(),
@@ -71,13 +93,14 @@ impl LlmServerConfig {
             embedding_model: Self::opt_env("EMBEDDING_MODEL"),
             has_embedding_api_key: embedding_api_key.is_some(),
             embedding_api_key,
-            vision_endpoint: Self::opt_env("VISION_ENDPOINT"),
+            vision_endpoint,
             vision_model: Self::opt_env("VISION_MODEL"),
             has_vision_api_key: vision_api_key.is_some(),
             vision_api_key,
             pdf_dpi: Self::opt_env("PDF_DPI")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(150),
+            pdf_ocr_mode,
             has_ocr_endpoint: ocr_endpoint.is_some(),
             ocr_endpoint,
             ocr_model: Self::opt_env("OCR_MODEL")

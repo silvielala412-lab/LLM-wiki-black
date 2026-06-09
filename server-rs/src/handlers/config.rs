@@ -41,6 +41,7 @@ pub async fn get_config(State(state): State<Arc<AppState>>) -> Result<Json<Value
         // PDF processing
         "pdf": {
             "dpi": cfg.pdf_dpi,
+            "ocr_mode": cfg.pdf_ocr_mode,
         },
         // Web search
         "search": {

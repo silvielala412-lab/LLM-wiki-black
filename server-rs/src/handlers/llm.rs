@@ -216,10 +216,11 @@ pub async fn stream_vision_chat(
         }
     };
 
-    let model = body
-        .model
+    let model = cfg
+        .vision_model
+        .clone()
         .filter(|m| !m.is_empty())
-        .or_else(|| cfg.vision_model.clone())
+        .or_else(|| body.model.filter(|m| !m.is_empty()))
         .unwrap_or_default();
 
     let mut req_body = json!({

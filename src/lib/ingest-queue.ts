@@ -1,4 +1,4 @@
-import { fileExists, readFile, writeFile } from "@/commands/fs"
+import { readFile, writeFile } from "@/commands/fs"
 import { autoIngest } from "./ingest"
 import { useWikiStore } from "@/stores/wiki-store"
 import { normalizePath, isAbsolutePath } from "@/lib/path-utils"
@@ -17,6 +17,7 @@ export interface IngestTask {
   folderContext: string  // e.g. "AI-Research > papers" or ""
   status: "pending" | "processing" | "done" | "failed"
   addedAt: number
+  startedAt?: number
   error: string | null
   retryCount: number
 }
@@ -41,6 +42,7 @@ let processedSinceDrain = false
 // Abort controller for the review-sweep LLM call so switching projects
 // cancels a long-running judgment instead of burning tokens.
 let sweepAbortController: AbortController | null = null
+const PROCESSING_STALE_MS = 30 * 60 * 1000
 
 // ── Persistence ───────────────────────────────────────────────────────────
 
@@ -92,7 +94,8 @@ async function readSourceContentForCache(sourceFullPath: string): Promise<string
   const ext = sourceExtension(sourceFullPath)
   if (["png", "jpg", "jpeg", "webp", "gif", "bmp", "tiff", "tif", "pdf"].includes(ext)) {
     const { readFileAsBase64 } = await import("@/commands/fs")
-    return await readFileAsBase64(sourceFullPath)
+    const file = await readFileAsBase64(sourceFullPath)
+    return file.base64
   }
   return await readFile(sourceFullPath)
 }
@@ -107,16 +110,10 @@ async function taskAlreadyCompleted(projectPath: string, task: IngestTask): Prom
     const cached = await checkIngestCache(pp, sourceFileName(task.sourcePath), sourceContent)
     if (cached !== null) return true
   } catch {
-    // Fall through to source-summary existence check.
-  }
-
-  const summaryName = sourceFileName(task.sourcePath).replace(/\.[^.]+$/, "")
-  const summaryPath = `${pp}/wiki/sources/${summaryName}.md`
-  try {
-    return await fileExists(summaryPath)
-  } catch {
     return false
   }
+
+  return false
 }
 
 function ingestPriority(sourcePath: string): number {
@@ -245,6 +242,7 @@ export async function retryTask(taskId: string): Promise<void> {
   if (task.projectId !== currentProjectId) return
 
   task.status = "pending"
+  task.startedAt = undefined
   task.error = null
   await saveQueue(currentProjectPath)
   processNext(currentProjectId)
@@ -394,6 +392,7 @@ export async function pauseQueue(): Promise<void> {
   for (const task of queue) {
     if (task.status === "processing") {
       task.status = "pending"
+      task.startedAt = undefined
     }
   }
 
@@ -447,6 +446,7 @@ export async function restoreQueue(
   for (const task of mine) {
     if (task.status === "processing") {
       task.status = "pending"
+      task.startedAt = undefined
       restored++
     }
   }
@@ -480,6 +480,31 @@ const MAX_RETRIES = 3
 function retryDelayMs(message: string, retryCount: number): number {
   if (!/(503|Service Unavailable|service is too busy|rate limit|429)/i.test(message)) return 0
   return Math.min(60_000, 5_000 * 2 ** Math.max(0, retryCount - 1))
+}
+
+function startProcessingWatchdog(projectId: string, taskId: string, startedAt: number, projectPath: string): void {
+  globalThis.setTimeout(() => {
+    if (currentProjectId !== projectId || !processing) return
+    const task = queue.find((t) => t.id === taskId)
+    if (!task || task.status !== "processing" || task.startedAt !== startedAt) return
+
+    const ageMs = Date.now() - startedAt
+    if (ageMs < PROCESSING_STALE_MS) return
+
+    if (currentAbortController) {
+      currentAbortController.abort()
+      currentAbortController = null
+    }
+
+    task.status = "pending"
+    task.error = `Processing timed out after ${Math.round(PROCESSING_STALE_MS / 60000)} minutes; requeued automatically`
+    processing = false
+    lastWrittenFiles = []
+
+    saveQueue(projectPath)
+      .catch(() => {})
+      .finally(() => processNext(projectId))
+  }, PROCESSING_STALE_MS + 1000)
 }
 
 async function onQueueDrained(projectId: string, projectPath: string): Promise<void> {
@@ -539,7 +564,9 @@ async function processNext(projectId: string): Promise<void> {
 
   processing = true
   next.status = "processing"
+  next.startedAt = Date.now()
   await saveQueue(pp)
+  startProcessingWatchdog(projectId, next.id, next.startedAt, pp)
   if (currentProjectId !== projectId) return
 
   const llmConfig = useWikiStore.getState().llmConfig
@@ -598,9 +625,11 @@ async function processNext(projectId: string): Promise<void> {
 
     if (next.retryCount >= MAX_RETRIES) {
       next.status = "failed"
+      next.startedAt = undefined
       console.log(`[Ingest Queue] Failed (${next.retryCount}x): ${next.sourcePath} — ${message}`)
     } else {
       next.status = "pending" // will retry
+      next.startedAt = undefined
       delayBeforeNextMs = retryDelayMs(message, next.retryCount)
       console.log(`[Ingest Queue] Error (retry ${next.retryCount}/${MAX_RETRIES}): ${next.sourcePath} — ${message}`)
     }
