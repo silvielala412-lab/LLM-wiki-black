@@ -1501,7 +1501,11 @@ function candidateExcerpt(sourceContent: string, candidate: SchemaDrivenCandidat
   return snippets.join("\n\n---\n\n").slice(0, maxChars)
 }
 
-function buildSchemaCandidateManifest(candidates: SchemaDrivenCandidate[], plan?: SmartIngestPlan): string {
+function buildSchemaCandidateManifest(
+  candidates: SchemaDrivenCandidate[],
+  plan?: SmartIngestPlan,
+  serviceLineCtx?: { lineName: string; versionName: string } | null,
+): string {
   if (candidates.length === 0 && !plan) return ""
   const required = candidates.filter((candidate) => candidate.required)
   const lines = [
@@ -1512,7 +1516,12 @@ function buildSchemaCandidateManifest(candidates: SchemaDrivenCandidate[], plan?
     "The system pre-scanned the source and found reusable knowledge candidates. Treat this manifest as a coverage contract, not as optional suggestions.",
     "For every REQUIRED candidate, either generate a dedicated page or create a REVIEW missing-page item explaining why the source evidence is insufficient.",
     "Do not collapse many required service/rule/process candidates into one generic page.",
-    "Domain routing: service_benefit -> product; rule/process for service eligibility/activation/limits -> product; compliance_rule -> compliance; pitch/objection_handling/QA sales explanation -> method; customer/service case narratives -> cases.",
+    serviceLineCtx
+      ? `Domain routing (v2 service hierarchy): service_item → service domain (NOT product); rule/process → product; compliance_rule → compliance; pitch/objection_handling → method; cases → cases.`
+      : `Domain routing: service_benefit → product; rule/process for service eligibility/activation/limits → product; compliance_rule → compliance; pitch/objection_handling/QA sales explanation → method; customer/service case narratives → cases.`,
+    serviceLineCtx
+      ? `\u2757 Service item naming (v2): ALL service_item entity titles MUST follow "${serviceLineCtx.lineName}-${serviceLineCtx.versionName}-{\u670d\u52a1\u9879\u540d\u79f0}". NEVER use bare item names as titles.`
+      : "",
     "Field values such as service frequency, time limits, and yes/no flags are attributes of their parent service/rule, not independent pages.",
     "",
     `Candidate count: ${candidates.length}. Required count: ${required.length}.`,
@@ -1520,9 +1529,19 @@ function buildSchemaCandidateManifest(candidates: SchemaDrivenCandidate[], plan?
   ].filter(Boolean)
 
   for (const candidate of candidates.slice(0, 60)) {
+    // In v2 service line context, prefix service_item candidate titles with line-version
+    const displayTitle = (serviceLineCtx && (candidate.entityType === "service_item" || candidate.entityType === "service_benefit"))
+      ? `${serviceLineCtx.lineName}-${serviceLineCtx.versionName}-${candidate.title}`
+      : candidate.title
+    const displayDomain = (serviceLineCtx && (candidate.entityType === "service_item" || candidate.entityType === "service_benefit"))
+      ? "service"
+      : candidate.knowledgeDomain
+    const displayType = (serviceLineCtx && candidate.entityType === "service_benefit")
+      ? "service_item"
+      : candidate.entityType
     const evidence = candidate.sourceLines[0] ? ` | evidence=${candidate.sourceLines[0].slice(0, 180)}` : ""
     lines.push(
-      `- ${candidate.required ? "REQUIRED" : "OPTIONAL"} | ${candidate.title} | domain=${candidate.knowledgeDomain} | entity_type=${candidate.entityType} | type=${candidate.universalType} | confidence=${candidate.confidence.toFixed(2)} | ${candidate.reason}${evidence}`,
+      `- ${candidate.required ? "REQUIRED" : "OPTIONAL"} | ${displayTitle} | domain=${displayDomain} | entity_type=${displayType} | type=${candidate.universalType} | confidence=${candidate.confidence.toFixed(2)} | ${candidate.reason}${evidence}`,
     )
   }
   if (candidates.length > 60) lines.push(`- ... ${candidates.length - 60} additional candidates omitted from prompt display.`)
@@ -2842,7 +2861,7 @@ async function autoIngestImpl(
   const sourceForPrompts = preparedSource.content
   const smartIngestPlan = buildSmartIngestPlan(enrichedSourceContent)
   const schemaCandidates = extractSchemaDrivenCandidates(enrichedSourceContent, smartIngestPlan)
-  const schemaCandidateManifest = buildSchemaCandidateManifest(schemaCandidates, smartIngestPlan)
+  const schemaCandidateManifest = buildSchemaCandidateManifest(schemaCandidates, smartIngestPlan, serviceLineCtx)
   await persistSmartCompileArtifacts(pp, fileName, smartIngestPlan, schemaCandidates)
   if (schemaCandidates.length > 0) {
     activity.updateItem(activityId, {
@@ -2862,7 +2881,7 @@ async function autoIngestImpl(
   let analysis = ""
   const factLayerHints = buildFactLayerHints(enrichedSourceContent, sourceOrigin)
   const analysisMessages: Parameters<typeof streamChat>[1] = [
-    { role: "system", content: buildAnalysisPrompt(purpose, index, sourceForPrompts, chunking, schemaGuidance(schema)) },
+    { role: "system", content: buildAnalysisPrompt(purpose, index, sourceForPrompts, chunking, schemaGuidance(schema), serviceLineCtx) },
     {
       role: "user",
       content: [
@@ -2908,7 +2927,7 @@ async function autoIngestImpl(
 
   let generation = ""
   const generationMessages: Parameters<typeof streamChat>[1] = [
-    { role: "system", content: buildGenerationPrompt(schema, purpose, index, fileName, overview, sourceForPrompts, chunking, _getUploaderUsername(), preparedSource) },
+    { role: "system", content: buildGenerationPrompt(schema, purpose, index, fileName, overview, sourceForPrompts, chunking, _getUploaderUsername(), preparedSource, serviceLineCtx) },
     {
       role: "user",
       content: [
@@ -4086,7 +4105,14 @@ function flattenMarkdownNodes(nodes: { name: string; path: string; is_dir: boole
  * Step 1 prompt: AI reads the source and produces a structured analysis.
  * This is the "discussion" step — the AI reasons about the source before writing wiki pages.
  */
-export function buildAnalysisPrompt(purpose: string, index: string, sourceContent: string = "", chunking?: ChunkingConfig, schema: string = ""): string {
+export function buildAnalysisPrompt(
+  purpose: string,
+  index: string,
+  sourceContent: string = "",
+  chunking?: ChunkingConfig,
+  schema: string = "",
+  serviceLineCtx?: { lineName: string; versionName: string } | null,
+): string {
   return [
     "You are an expert research analyst. Read the source document and produce a structured analysis.",
     "",
@@ -4096,7 +4122,7 @@ export function buildAnalysisPrompt(purpose: string, index: string, sourceConten
     "",
     buildInsuranceExtractionChecklist(sourceContent),
     "",
-    buildServiceManualNodeDirective(sourceContent),
+    buildServiceManualNodeDirective(sourceContent, serviceLineCtx ?? undefined),
     "",
     "Your analysis should cover:",
     "",
@@ -4187,7 +4213,18 @@ function buildChunkingDirective(cfg?: ChunkingConfig): string {
 /**
  * Step 2 prompt: AI takes its own analysis and generates wiki files + review items.
  */
-export function buildGenerationPrompt(schema: string, purpose: string, index: string, sourceFileName: string, overview?: string, sourceContent: string = "", chunking?: ChunkingConfig, uploaderUsername = "unknown", preparedSource?: PreparedIngestSource): string {
+export function buildGenerationPrompt(
+  schema: string,
+  purpose: string,
+  index: string,
+  sourceFileName: string,
+  overview?: string,
+  sourceContent: string = "",
+  chunking?: ChunkingConfig,
+  uploaderUsername = "unknown",
+  preparedSource?: PreparedIngestSource,
+  serviceLineCtx?: { lineName: string; versionName: string } | null,
+): string {
   // Use original filename (without extension) as the source summary page name
   const sourceBaseName = sourceFileName.replace(/\.[^.]+$/, "")
 
@@ -4200,7 +4237,7 @@ export function buildGenerationPrompt(schema: string, purpose: string, index: st
     "",
     buildInsuranceExtractionChecklist(sourceContent),
     "",
-    buildServiceManualNodeDirective(sourceContent),
+    buildServiceManualNodeDirective(sourceContent, serviceLineCtx ?? undefined),
     "",
     `## IMPORTANT: Source File`,
     `The original source file is: **${sourceFileName}**`,
@@ -4217,10 +4254,21 @@ export function buildGenerationPrompt(schema: string, purpose: string, index: st
     "",
     "## Page Naming Requirements",
     "",
-    "Use these naming rules for generated page titles and filenames:",
-    "- Service project pages: [服务名称]_[产品简称]. Example: 绿通住院_安有医尊享版",
-    "- General concepts: use the concept name directly. Example: 家庭医生服务流程",
-    "- Version comparison pages: [服务名称]_版本对比. Example: 专家会诊_版本对比",
+    serviceLineCtx
+      ? [
+          "**Service hierarchy v2 naming (REQUIRED for this file):**",
+          `- service_item entities: MUST follow \`${serviceLineCtx.lineName}-${serviceLineCtx.versionName}-{服务项名称}\``,
+          `  Example: \`${serviceLineCtx.lineName}-${serviceLineCtx.versionName}-在线问诊\`, \`${serviceLineCtx.lineName}-${serviceLineCtx.versionName}-家庭医生服务\``,
+          `- service_line_version entity (main page): \`${serviceLineCtx.lineName}-${serviceLineCtx.versionName}\``,
+          "- Rule/process/compliance pages: use descriptive names, no prefix needed",
+          "- NEVER use bare item names like \"在线问诊\" alone as a service_item title",
+        ].join("\n")
+      : [
+          "Use these naming rules for generated page titles and filenames:",
+          "- Service project pages: [服务名称]_[产品简称]. Example: 绿通住院_安有医尊享版",
+          "- General concepts: use the concept name directly. Example: 家庭医生服务流程",
+          "- Version comparison pages: [服务名称]_版本对比. Example: 专家会诊_版本对比",
+        ].join("\n"),
     "",
     "The frontmatter `title` should use the exact human-readable page name above.",
     "For Chinese titles, use the Chinese title directly as the filename under the correct wiki directory. Example: wiki/entities/安心家庭守护重疾险.md",
@@ -4308,16 +4356,25 @@ export function buildGenerationPrompt(schema: string, purpose: string, index: st
     "- Service manual minimum node rule: if the source contains identifiable service items, generate dedicated pages for the service items and rules named in `Service Manual Node Extraction Requirements`. A service manual output with only the main service-plan page is incomplete.",
     "- Concept resolution rule: do not create isolated near-duplicate pages. Exact duplicates should update the existing page; near variants such as 康复门诊协助 / 康复住院协助 should remain separate child service pages linked through a shared parent concept such as 康复服务.",
     "- When generating a child service page that belongs to a service family, include `parent` and `related` frontmatter when the parent or sibling service is known. Do not assume the system will automatically merge variants; only exact `dedup_key` duplicates are auto-merged.",
-    "- LATERAL RELATION EXTRACTION (REQUIRED for service_benefit and product entities): For each service_benefit or product entity page, you MUST identify and declare structured lateral (sibling) relations in the `relations` frontmatter. Do NOT rely only on generic `related_to`. Use specific types:",
+    "- LATERAL RELATION EXTRACTION (REQUIRED for service_item / service_benefit and product entities): For each service_item or product entity page, you MUST identify and declare structured lateral (sibling) relations in the `relations` frontmatter. Do NOT rely only on generic `related_to`. Use specific types:",
     "  * `complements: <title>` — services that enhance each other when used together (e.g. 在线问诊 + 就医陪诊)",
     "  * `next_step: <title>` — the natural next service in the customer journey (e.g. 门诊预约协助 → 就医陪诊)",
     "  * `same_stage: <title>` — services at the same stage of care (e.g. 国内住院安排协助 + 住院照护)",
     "  * `bundled_with: <title>` — services that are always offered together",
     "  * `governed_by: <title>` — a rule, waiting period, or compliance page that governs this service",
+    "  * `part_of: <title>` — the parent service_line_version this item belongs to",
+    "  * `instance_of: <title>` — the service_item_concept (concept page) this item is an instance of",
     "  For each lateral relation, also add a structured entry in `attributes.relation_candidates` as a JSON array:",
     "  `relation_candidates: [{target: \"就医陪诊\", type: \"complements\", confidence: 0.85, evidence: \"原文中二者出现在同一就诊流程描述中，先在线问诊再陪诊\", source: \"explicit_ingest\"}]`",
-    "  This structured output is critical for the knowledge graph's horizontal connectivity. A service_benefit page with no lateral relations and no relation_candidates is considered incomplete.",
-    "- Service benefit pages should use `wiki/entities/[服务项目名].md`, `entity_type: service_benefit`, `knowledge_domain: product`, `business_phase: service`, and should link back to the main service plan.",
+    "  This structured output is critical for the knowledge graph's horizontal connectivity. A service_item page with no lateral relations and no relation_candidates is considered incomplete.",
+    serviceLineCtx
+      ? [
+          `- Service item pages (v2): use \`wiki/entities/${serviceLineCtx.lineName}-${serviceLineCtx.versionName}-{\u670d\u52a1\u9879\u540d\u79f0}.md\`. Example: \`wiki/entities/${serviceLineCtx.lineName}-${serviceLineCtx.versionName}-\u5728\u7ebf\u95ee\u8bca.md\``,
+          `  Frontmatter: \`entity_type: service_item\`, \`knowledge_domain: service\`, \`business_phase: service\``,
+          `  MUST include: line_name: "${serviceLineCtx.lineName}", version_name: "${serviceLineCtx.versionName}", item_name: "{服\u52a1\u9879\u540d\u79f0}"`,
+          "  Link back to the main service_line_version page using `part_of` relation.",
+        ].join("\n")
+      : "- Service benefit pages should use `wiki/entities/[\u670d\u52a1\u9879\u76ee\u540d].md`, `entity_type: service_benefit`, `knowledge_domain: product`, `business_phase: service`, and should link back to the main service plan.",
     "- Service process pages should use `type: process`; service limitation/waiting-period/non-sharing pages should use `type: rule`; disclaimer pages should use `knowledge_domain: compliance` and `entity_type: compliance_rule`.",
     "- For product terms, do not collapse responsibilities/exclusions/rules into a single summary. Extract age range, waiting period, payment period, coverage period, claim trigger, responsibility amounts, exclusions, underwriting basics, service packages, and official caveats separately.",
     "- For sales/customer/method content, extract target personas, lifecycle triggers, customer signals, scenario, business phase, pitch, objection handling, content assets, and compliance-sensitive wording separately.",
