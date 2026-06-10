@@ -55,11 +55,19 @@ export function CreateProjectDialog({ open: isOpen, onOpenChange, onCreated }: C
       setOutputLanguage(lang)
       await saveOutputLanguage(lang)
 
-      await onCreated(project)
-      onOpenChange(false)
+      // Close dialog FIRST, then fire onCreated in background.
+      // handleProjectOpened is async (listDirectory, loadReviewItems, etc.)
+      // and must NOT block the dialog — it would keep "创建中..." forever.
+      setCreating(false)
       setName("")
       setSelectedTemplate("general")
       setLanguage("")
+      onOpenChange(false)
+      // Fire & forget — errors are handled inside handleProjectOpened itself
+      void Promise.resolve(onCreated(project)).catch((err) => {
+        console.error("[create-project] onCreated callback failed:", err)
+      })
+      return
     } catch (err) {
       setError(String(err))
     } finally {
