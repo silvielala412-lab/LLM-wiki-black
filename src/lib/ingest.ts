@@ -1,4 +1,4 @@
-import { createDirectory, readFile, writeFile, listDirectory, readFileAsBase64 } from "@/commands/fs"
+﻿import { createDirectory, readFile, writeFile, listDirectory, readFileAsBase64 } from "@/commands/fs"
 import { getLogger } from "@/lib/logger"
 
 // Module-level namespaced loggers — no coupling to console or UI
@@ -529,6 +529,15 @@ const COMPLIANCE_LIKE_KEYWORDS = [
   "\u7981\u6b62",
   "\u98ce\u9669\u63d0\u793a",
   "\u6cd5\u5f8b\u8d23\u4efb",
+  // Service definition/rule terms — must fire BEFORE pitch detection
+  "\u5b9a\u4e49\u8bf4\u660e",   // 定义说明
+  "\u91cd\u75be\u5b9a\u4e49",   // 重疾定义
+  "\u91cd\u75be\u76ee\u5f55",   // 重疾目录
+  "\u670d\u52a1\u5b9a\u4e49",   // 服务定义
+  "\u975e\u5171\u4eab",         // 非共享
+  "\u4e2d\u6b62\u89c4\u5219",   // 中止规则
+  "\u7ec8\u6b62\u89c4\u5219",   // 终止规则
+  "\u7b49\u5f85\u671f",         // 等待期
 ]
 
 const GENERIC_CANDIDATE_TITLES = new Set([
@@ -1625,7 +1634,30 @@ const SERVICE_ITEM_PAGE_BODY_SPEC = `
 ## 重要提示               【可选】特别风险提示、合规免责声明
 `.trim()
 
-// Service item base names (item_name without line/version prefix).
+// ─── Business body spec for rule/definition/compliance pages ───────────
+/**
+ * Body spec for RULE / DEFINITION / COMPLIANCE pages
+ * (e.g., 安有医-惠享版-重疾定义说明.md, 服务中止规则.md).
+ * Even definition/rule pages MUST include 触客素材 and 常见Q&A.
+ */
+const SERVICE_RULE_PAGE_BODY_SPEC = `
+## 定义与范围              【必须】该规则/定义的精确描述，包括适用范围和查询方式
+
+## 触发条件                【必须】哪些服务在申请时需要满足此规则
+
+## 对服务的影响              【必须】该规则如何影响具体服务的可用性和资格确认
+
+## 客户查询方式              【必须】客户如何查询该定义/规则的详细信息（APP路径/客服电话）
+
+## 触客素材                【必须】销售人员如何将此规则/定义弱化客户顾虑的话术
+
+## 常见Q&A                【必须】客户最常问的问题（≥3条）
+
+---（以下按需拓展）---
+## 重要提示               【可选】销售时必须告知客户的注意事项
+## 实贻示例               【可选】该规则在实际服务中的应用示例
+`.trim()
+
 // In v2, actual entity title = {line_name}-{version_name}-{item_name}
 // The INSURANCE_SERVICE_MANUAL_NODES defines the canonical item_name and detection aliases.
 const INSURANCE_SERVICE_MANUAL_NODES = [
@@ -3845,7 +3877,7 @@ function buildCandidateBackfillPrompt(
     "Required behavior:",
     "- Create one page per candidate unless the evidence is clearly insufficient.",
     "- Do not merge multiple service benefits, process rules, or compliance rules into a single generic page.",
-    "- Respect candidate domain routing exactly: service benefits stay in product; customer-facing explanation/QA/pitch/objection handling goes to method; customer/service case narratives and customer voice go to cases; disclaimers/prohibited promises/compliance warnings go to compliance.",
+    "- Respect candidate domain routing exactly: see ENTITY_TYPE ROUTING RULES below.",
     "- Do not create standalone pages for field values such as 家庭不限次、首年每人 1 次、T+2 个工作日. Put these values under attributes on the related service/rule page.",
     "- If `deterministic_source_facts` or manifest evidence includes service scene/stage/name/frequency, those fields are already known facts. Put them into `attributes` and visible body sections; do not list them as knowledge gaps.",
     "- Fill universal frontmatter plus entity-specific attributes. Put missing extension fields into attributes.knowledge_gaps and a visible knowledge-gap section.",
@@ -3856,10 +3888,10 @@ function buildCandidateBackfillPrompt(
     "Minimal frontmatter contract:",
     "schema_version: \"2.1\"",
     "industry: insurance",
-    "knowledge_domain: product | customer | method | content | activity | cases | compliance | general",
+    "knowledge_domain: product | customer | method | content | activity | cases | compliance | service | general",
     "domain: same as knowledge_domain",
     "type: entity | concept | process | rule | data | case",
-    "entity_type: service_benefit | process | rule | compliance_rule | coverage_rule | product | persona | pitch | objection_handling | success_case | customer_voice | sales_path",
+    "entity_type: service_item | service_benefit | process | rule | compliance_rule | coverage_rule | product | pitch | objection_handling | success_case | customer_voice",
     "business_phase: service | conversion | signing | general",
     "dedup_key: stable key",
     "title: human-readable title",
@@ -3878,8 +3910,17 @@ function buildCandidateBackfillPrompt(
     "Body sections for each service_item page MUST follow this exact structure:",
     SERVICE_ITEM_PAGE_BODY_SPEC,
     "",
-    "Body sections for process/rule/compliance pages should include: \u89c4\u5219\u5b9a\u4e49\u3001\u89e6\u53d1\u6761\u4ef6\u3001\u5f71\u54cd\u8303\u56f4\u3001\u4e1a\u52a1\u542b\u4e49\u3001\u9500\u552e\u63d0\u793a\u3001\u6765\u6e90\u4f9d\u636e\u3001\u5f85\u8865\u5168\u4fe1\u606f.",
-    "CRITICAL: Output bodies in Chinese. Use exact section headings from the spec (## \u670d\u52a1\u7b80\u4ecb, ### \u8fbe\u6807\u95e8\u69db, ## \u670d\u52a1\u6b21\u6570, etc.) — do NOT translate or rename them.",
+    "Body sections for process/rule/compliance pages should include: \u89c4\u5219\u5b9a\u4e49\u3001\u89e6\u53d1\u6761\u4ef6.",
+    "=== ENTITY_TYPE ROUTING RULES (CRITICAL) ===",
+    "entity_type = compliance_rule | rule for: \u91cd\u75be\u5b9a\u4e49\u8bf4\u660e\u3001\u7b49\u5f85\u671f\u8bf4\u660e\u3001\u975e\u5171\u4eab\u89c4\u5219\u3001\u670d\u52a1\u4e2d\u6b62/\u7ec8\u6b62\u89c4\u5219 (knowledge_domain=compliance).",
+    "entity_type = service_item for: named health service items like \u5728\u7ebf\u95ee\u8bca\u3001\u540d\u533b\u5927\u548c (knowledge_domain=service).",
+    "entity_type = process for: activation/application flow steps (knowledge_domain=product).",
+    "entity_type = pitch ONLY for: pure sales talking-point scripts. NOT definitions or rules.",
+    "",
+    "For rule/definition/compliance pages (\u91cd\u75be\u5b9a\u4e49\u8bf4\u660e\u3001\u7b49\u5f85\u671f\u3001\u975e\u5171\u4eab\u89c4\u5219 etc.):",
+    SERVICE_RULE_PAGE_BODY_SPEC,
+    "",
+    "CRITICAL: Output ALL page bodies in Chinese with exact headings from the specs above.
     "",
     `Source file: ${sourceFileName}`,
     `Ingest mode: ${preparedSource.processingMode}; source chars: ${preparedSource.originalChars}; context chars: ${preparedSource.contextChars}.`,
