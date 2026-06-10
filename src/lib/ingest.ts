@@ -1,4 +1,11 @@
 import { createDirectory, readFile, writeFile, listDirectory, readFileAsBase64 } from "@/commands/fs"
+import { getLogger } from "@/lib/logger"
+
+// Module-level namespaced loggers — no coupling to console or UI
+const log      = getLogger("ingest")
+const logOCR   = getLogger("ingest:ocr")
+const logDiag  = getLogger("ingest:diag")
+const logQueue = getLogger("ingest:queue")
 import { streamChat } from "@/lib/llm-client"
 import type { LlmConfig, EmbeddingConfig } from "@/stores/wiki-store"
 import { useWikiStore } from "@/stores/wiki-store"
@@ -2546,7 +2553,7 @@ async function autoIngestImpl(
   // e.g. raw/sources/臻享家医/V1/file.pdf → { lineName: "臻享家医", versionName: "V1" }
   const relativeSourcePath = sp.startsWith(pp + "/") ? sp.slice(pp.length + 1) : sp
   const serviceLineCtx = extractServiceLineCtxFromPath(relativeSourcePath)
-  console.log(`[ingest:diag] autoIngestImpl ENTRY for "${fileName}" (project="${pp}", source="${sp}")`)
+  logDiag.debug("autoIngestImpl ENTRY", { file: fileName, project: pp, source: sp })
   const activityId = activity.addItem({
     type: "ingest",
     title: fileName,
@@ -2575,7 +2582,7 @@ async function autoIngestImpl(
       sourceContent = cached.content
       sourceOrigin = cached.origin
       activity.updateItem(activityId, { detail: "Reusing cached PDF OCR text..." })
-      console.log(`[ingest:pdf-ocr] cache hit for "${fileName}": ${sourceContent.length} chars`)
+      logOCR.debug("pdf-ocr cache hit", { file: fileName, chars: sourceContent.length })
     } else {
       activity.updateItem(activityId, { detail: "Scanned PDF detected — running OCR..." })
       const visionCfg = buildVisionLlmConfig()
@@ -2591,9 +2598,9 @@ async function autoIngestImpl(
         })
         sourceOrigin = "ocr-pdf"
         ocrSourceContentCache.set(rawCacheKey, { content: sourceContent, origin: sourceOrigin })
-        console.log(`[ingest:pdf-ocr] OCR complete for "${fileName}": ${sourceContent.length} chars`)
+        logOCR.info("pdf-ocr complete", { file: fileName, chars: sourceContent.length })
       } catch (err) {
-        console.warn(`[ingest:pdf-ocr] OCR failed for "${fileName}":`, err)
+        logOCR.warn("pdf-ocr failed", { file: fileName, error: err instanceof Error ? err.message : String(err) })
         activity.updateItem(activityId, {
           status: "error",
           detail: `PDF OCR failed: ${err instanceof Error ? err.message : err}. Configure VISION_ENDPOINT in server settings.`,
@@ -2605,7 +2612,7 @@ async function autoIngestImpl(
       } else {
       // Vision model not configured → friendly message in the wiki
       sourceContent = `(图片型 PDF — 服务器未配置视觉模型 VISION_ENDPOINT，无法 OCR。文件: ${fileName})`
-      console.warn(`[ingest:pdf-ocr] No vision config for "${fileName}" — VISION_ENDPOINT not set`)
+      logOCR.warn("pdf-ocr skipped: no vision config", { file: fileName })
       }
     }
   } else if (isImageSourcePath(sp)) {
@@ -2619,7 +2626,7 @@ async function autoIngestImpl(
           sourceContent = cached.content
           sourceOrigin = cached.origin
           activity.updateItem(activityId, { detail: "Reusing cached image OCR text..." })
-          console.log(`[ingest:image-ocr] cache hit for "${fileName}": ${sourceContent.length} chars`)
+          logOCR.debug("image-ocr cache hit", { file: fileName, chars: sourceContent.length })
         } else {
           activity.updateItem(activityId, { detail: "Image file detected - running OCR..." })
           const ocrText = await ocrImageBytes(image.base64, image.mimeType, visionCfg, signal)

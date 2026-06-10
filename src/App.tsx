@@ -15,6 +15,8 @@ import { CreateProjectDialog } from "@/components/project/create-project-dialog"
 import { AuthPage } from "@/components/auth/auth-page"
 import type { WikiProject } from "@/types/wiki"
 import { applyServerConfig } from "@/lib/server-config"
+import { initLogger } from "@/lib/logger"
+import { writeFile, readFile } from "@/commands/fs"
 
 function App() {
   const project = useWikiStore((s) => s.project)
@@ -279,6 +281,16 @@ function App() {
         console.error("Failed to restore ingest queue:", err)
       )
     })
+
+    // Initialise the decoupled logger with a file sink for this project.
+    // All ingest/queue/ocr logs will be persisted to system-logs/ingest.ndjson.
+    initLogger({
+      level: import.meta.env.DEV ? "debug" : "info",
+      fileWriter: writeFile,
+      fileReader: readFile,
+      logFilePath: `${proj.path}/system-logs/ingest.ndjson`,
+    })
+
     // Clip server not used in web mode — skip.
     try {
       const tree = await listDirectory(proj.path)
