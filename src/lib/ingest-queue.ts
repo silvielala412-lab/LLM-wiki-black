@@ -1,4 +1,8 @@
 import { readFile, writeFile } from "@/commands/fs"
+import { getLogger } from "@/lib/logger"
+
+const log = getLogger("queue")
+
 import { autoIngest } from "./ingest"
 import { useWikiStore } from "@/stores/wiki-store"
 import { normalizePath, isAbsolutePath } from "@/lib/path-utils"
@@ -225,7 +229,7 @@ export async function enqueueBatch(
   }
 
   await saveQueue(currentProjectPath)
-  console.log(`[Ingest Queue] Enqueued ${files.length} files`)
+  log.info("enqueued", { count: files.length, project: projectId })
   processNext(currentProjectId)
 
   return ids
@@ -268,14 +272,14 @@ export async function cancelTask(taskId: string): Promise<void> {
     writtenFilesByTask.delete(taskId)
     if (taskFiles.length > 0) {
       await cleanupWrittenFiles(currentProjectPath, taskFiles)
-      console.log(`[Ingest Queue] Cleaned up ${taskFiles.length} files from cancelled task`)
+      log.info("cancel: cleaned up written files", { file: task.sourcePath, files: taskFiles.length })
     }
     activeCount = Math.max(0, activeCount - 1)
   }
 
   queue = queue.filter((t) => t.id !== taskId)
   await saveQueue(currentProjectPath)
-  console.log(`[Ingest Queue] Cancelled: ${task.sourcePath}`)
+  log.info("cancelled", { file: task.sourcePath })
 
   processNext(currentProjectId)
 }
@@ -317,7 +321,7 @@ export async function cancelAllTasks(): Promise<number> {
   const removed = before - queue.length
 
   await saveQueue(currentProjectPath)
-  console.log(`[Ingest Queue] Cancelled all: ${removed} tasks removed`)
+  log.info("cancel-all", { removed })
   return removed
 }
 
@@ -443,9 +447,7 @@ export async function restoreQueue(
   // but defends against a corrupt queue file).
   const mine = saved.filter((t) => t.projectId === projectId)
   if (mine.length !== saved.length) {
-    console.warn(
-      `[Ingest Queue] Dropped ${saved.length - mine.length} cross-project tasks during restore`,
-    )
+    log.warn("restore: dropped cross-project tasks", { dropped: saved.length - mine.length })
   }
 
   // Reset any "processing" tasks back to "pending" (interrupted by app close)
@@ -475,7 +477,7 @@ export async function restoreQueue(
   const failed = queue.filter((t) => t.status === "failed").length
 
   if (pending > 0 || restored > 0) {
-    console.log(`[Ingest Queue] Restored: ${pending} pending, ${failed} failed, ${restored} resumed from interrupted, ${completed} already completed`)
+    log.info("restored", { pending, failed, restored, completed })
     processNext(projectId)
   }
 }
@@ -530,15 +532,15 @@ async function onQueueDrained(projectId: string, projectPath: string): Promise<v
     const llmConfig = useWikiStore.getState().llmConfig
     const canLlm = !!(llmConfig.apiKey || llmConfig.provider === "ollama" || llmConfig.provider === "custom")
     if (canLlm) {
-      console.log(`[Ingest Queue] Drain: running deferred relation pass for ${titlesForPass.size} entities...`)
+      log.info("drain: relation pass", { entities: titlesForPass.size })
       sweepAbortController = new AbortController()
       const signal = sweepAbortController.signal
       try {
         const { runGlobalRelationPass } = await import("@/lib/knowledge-global-relation")
         const grpResult = await runGlobalRelationPass(projectPath, llmConfig, signal, { newEntityTitles: titlesForPass })
-        console.log(`[Ingest Queue] Drain relation pass: catalog=${grpResult.catalogSize} pairs=${grpResult.candidatePairs} written=${grpResult.written}`)
+        log.info("drain: relation pass done", { catalog: grpResult.catalogSize, pairs: grpResult.candidatePairs, written: grpResult.written })
       } catch (err) {
-        console.warn("[Ingest Queue] Deferred relation pass failed:", err)
+        log.warn("drain: relation pass failed", { error: err instanceof Error ? err.message : String(err) })
       } finally {
         if (sweepAbortController?.signal === signal) sweepAbortController = null
       }
@@ -552,7 +554,7 @@ async function onQueueDrained(projectId: string, projectPath: string): Promise<v
     const { sweepResolvedReviews } = await import("@/lib/sweep-reviews")
     await sweepResolvedReviews(projectPath, signal)
   } catch (err) {
-    console.error("[Ingest Queue] Failed to load sweep-reviews:", err)
+    log.error("drain: sweep-reviews failed", { error: err instanceof Error ? err.message : String(err) })
   } finally {
     if (sweepAbortController && sweepAbortController.signal === signal) {
       sweepAbortController = null
@@ -571,7 +573,7 @@ async function processNext(projectId: string): Promise<void> {
     if (activeCount === 0) {
       const pathAtDrain = currentProjectPath
       onQueueDrained(projectId, pathAtDrain).catch((err) =>
-        console.error("[Ingest Queue] sweep failed:", err)
+        log.error("drain: sweep failed", { error: err instanceof Error ? err.message : String(err) })
       )
     }
     return
@@ -615,7 +617,7 @@ async function processNext(projectId: string): Promise<void> {
     ? normalizePath(next.sourcePath)
     : `${pp}/${next.sourcePath}`
 
-  console.log(`[Ingest Queue] Starting (${activeCount}/${MAX_PARALLEL}): ${next.sourcePath}`)
+  log.info("start", { file: next.sourcePath, active: activeCount, max: MAX_PARALLEL, folder: next.folderContext || undefined })
 
   const abortController = new AbortController()
   abortControllers.set(taskId, abortController)
@@ -659,7 +661,8 @@ async function processNext(projectId: string): Promise<void> {
       queue = queue.filter((t) => t.id !== taskId)
       processedSinceDrain = true
       await saveQueue(pp)
-      console.log(`[Ingest Queue] Done: ${next.sourcePath} (${activeCount - 1} still running)`)
+      const durationMs = Date.now() - (next.startedAt ?? Date.now())
+      log.info("done", { file: next.sourcePath, written: writtenFiles.length, durationMs, active: activeCount - 1 })
     } catch (err) {
       if (currentProjectId !== projectId) return
       abortControllers.delete(taskId)
@@ -671,19 +674,19 @@ async function processNext(projectId: string): Promise<void> {
       if (next.retryCount >= MAX_RETRIES) {
         next.status = "failed"
         next.startedAt = undefined
-        console.log(`[Ingest Queue] Failed (${next.retryCount}x): ${next.sourcePath} — ${message}`)
+        log.error("failed", { file: next.sourcePath, error: message, retries: next.retryCount })
       } else {
         next.status = "pending"
         next.startedAt = undefined
         delayBeforeNextMs = retryDelayMs(message, next.retryCount)
-        console.log(`[Ingest Queue] Error (retry ${next.retryCount}/${MAX_RETRIES}): ${next.sourcePath} — ${message}`)
+        log.warn("retry", { file: next.sourcePath, error: message, retry: next.retryCount, max: MAX_RETRIES, delayMs: retryDelayMs(message, next.retryCount) })
       }
 
       await saveQueue(pp)
     } finally {
       activeCount = Math.max(0, activeCount - 1)
       if (delayBeforeNextMs > 0) {
-        console.log(`[Ingest Queue] Waiting ${Math.round(delayBeforeNextMs / 1000)}s before retrying...`)
+        log.debug("retry: waiting", { delayMs: delayBeforeNextMs })
         setTimeout(() => processNext(projectId), delayBeforeNextMs)
       } else {
         processNext(projectId)

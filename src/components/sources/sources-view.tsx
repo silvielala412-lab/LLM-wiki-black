@@ -25,6 +25,10 @@ import {
 } from "@/lib/sources-tree-delete"
 import { SERVICE_HIERARCHY } from "@/lib/insurance-schema-registry"
 import type { ServiceHierarchySeries } from "@/lib/insurance-schema-registry"
+import { getLogger } from "@/lib/logger"
+
+const log = getLogger("upload")
+const logDel = getLogger("delete")
 
 export function SourcesView() {
   const { t } = useTranslation()
@@ -118,12 +122,14 @@ export function SourcesView() {
       // Upload destination encodes the service line context in the path
       const destDir = `${pp}/raw/sources/${lineName}/${versionName}`
       try {
+        log.info("upload start", { dest: `${lineName}/${versionName}`, files: files.length })
         const { uploadFiles } = await import("@/commands/fs")
         const results = await uploadFiles(files, destDir)
         const importedPaths: string[] = results
           .filter((r): r is { path: string; name: string; size: number } => "path" in r)
           .map((r) => r.path)
         const errorCount = results.filter((r) => "error" in r).length
+        log.info("upload done", { dest: `${lineName}/${versionName}`, success: importedPaths.length, errors: errorCount })
         setImportStatus(
           errorCount > 0
             ? `上传完成：${importedPaths.length} 成功，${errorCount} 失败`
@@ -137,12 +143,14 @@ export function SourcesView() {
             sourcePath: absPath.startsWith(pp + "/") ? absPath.slice(pp.length + 1) : absPath,
             folderContext: `${lineName} > ${versionName}`,
           }))
+          log.info("enqueue batch", { project: project.id, count: tasks.length, context: `${lineName}>${versionName}` })
           enqueueBatch(project.id, tasks).catch((err) =>
-            console.error(`Failed to enqueue batch:`, err)
+            log.error("enqueue batch failed", { error: err instanceof Error ? err.message : String(err) })
           )
         }
         setTimeout(() => setImportStatus(null), 5000)
       } catch (err) {
+        log.error("upload failed", { dest: destDir, error: extractErrMsg(err) })
         setImportError(`上传失败: ${extractErrMsg(err)}`)
         console.error("[handleVersionUpload] upload error:", err)
       } finally {
@@ -167,12 +175,14 @@ export function SourcesView() {
       const pp = normalizePath(project.path)
       const destDir = `${pp}/raw/sources`
       try {
+        log.info("upload start", { dest: "raw/sources", files: files.length })
         const { uploadFiles } = await import("@/commands/fs")
         const results = await uploadFiles(files, destDir)
         const importedPaths: string[] = results
           .filter((r): r is { path: string; name: string; size: number } => "path" in r)
           .map((r) => r.path)
         const errorCount = results.filter((r) => "error" in r).length
+        log.info("upload done", { dest: "raw/sources", success: importedPaths.length, errors: errorCount })
         setImportStatus(
           errorCount > 0
             ? `上传完成：${importedPaths.length} 成功，${errorCount} 失败`
@@ -188,12 +198,14 @@ export function SourcesView() {
             sourcePath: absPath.startsWith(pp + "/") ? absPath.slice(pp.length + 1) : absPath,
             folderContext: "",
           }))
+          log.info("enqueue batch", { project: project.id, count: tasks.length })
           enqueueBatch(project.id, tasks).catch((err) =>
-            console.error(`Failed to enqueue batch:`, err)
+            log.error("enqueue batch failed", { error: err instanceof Error ? err.message : String(err) })
           )
         }
         setTimeout(() => setImportStatus(null), 4000)
       } catch (err) {
+        log.error("upload failed", { dest: destDir, error: extractErrMsg(err) })
         setImportError(`上传失败: ${extractErrMsg(err)}`)
         console.error("[handleImport] upload error:", err)
       } finally {
@@ -331,6 +343,7 @@ export function SourcesView() {
             } else failCount++
           }
         } catch (err) {
+          log.error("upload failed", { dest: `${grp.lineName}/${grp.versionName}`, error: extractErrMsg(err) })
           console.error(`Upload to ${grp.lineName}/${grp.versionName} failed:`, err)
           failCount += grp.files.length
         }
@@ -354,6 +367,7 @@ export function SourcesView() {
               } else failCount++
             }
           } catch (err) {
+            log.error("upload failed", { dest: `${grp.lineName}/${versionName}`, error: extractErrMsg(err) })
             console.error(`Upload line-only to ${grp.lineName}/${versionName} failed:`, err)
             failCount += grp.files.length
           }
@@ -378,6 +392,7 @@ export function SourcesView() {
       }
 
       const lineOnlyCount = [...lineOnlyGroups.values()].reduce((s, g) => s + g.files.length, 0)
+      log.info("folder upload done", { success: successCount, errors: failCount, exactGroups: groups.size, lineOnly: lineOnlyGroups.size, unclassified: unclassified.length })
       setImportStatus(failCount > 0
         ? `上传完成：${successCount} 成功，${failCount} 失败。${groups.size} 个精确版本，${lineOnlyGroups.size} 个通用手册（已分发至全版本），${unclassified.length} 个未分类`
         : `✓ 上传成功：${successCount} 个任务。精确版本 ${groups.size} 个，通用手册 ${lineOnlyCount} 个文件×${lineOnlyGroups.size} 条服务线，未分类 ${unclassified.length} 个`)
@@ -386,10 +401,12 @@ export function SourcesView() {
       const canIngest = !!(llmConfig.apiKey || llmConfig.provider === "ollama" || llmConfig.provider === "custom")
       if (canIngest && allImportedTasks.length > 0) {
         setImportStatus(`正在排队解析 ${allImportedTasks.length} 个文件...`)
+        log.info("enqueue batch", { project: project.id, count: allImportedTasks.length })
         enqueueBatch(project.id, allImportedTasks).catch(err => console.error("enqueueBatch failed:", err))
       }
       setTimeout(() => setImportStatus(null), 6000)
     } catch (err) {
+      log.error("folder upload failed", { error: extractErrMsg(err) })
       setImportError(`文件夹上传失败: ${extractErrMsg(err)}`)
       console.error("[handleImportFolder] unexpected error:", err)
     } finally {
@@ -419,6 +436,7 @@ export function SourcesView() {
     // delete). Reaching this handler means the user has already
     // confirmed via the inline UI, so we proceed unconditionally.
     try {
+      logDel.info("cascade delete start", { file: node.path })
       const result = await deleteSourceWithCascade(pp, node)
       // Step 8: Refresh everything (UI side — must run with parent
       // context, hence kept here rather than inside the helper).
@@ -432,7 +450,9 @@ export function SourcesView() {
       ) {
         setSelectedFile(null)
       }
+      logDel.info("cascade delete done", { file: node.path, wikiPagesRemoved: result.deletedWikiPaths.length })
     } catch (err) {
+      logDel.error("delete failed", { file: node.path, error: err instanceof Error ? err.message : String(err) })
       console.error("Failed to delete source:", err)
       window.alert(`Failed to delete: ${err}`)
     }
@@ -457,12 +477,14 @@ export function SourcesView() {
     const pp = normalizePath(project.path)
     try {
       const allFiles = collectAllFilesIncludingDot(folder)
+      logDel.info("folder delete start", { folder: folder.path, fileCount: allFiles.length })
       const allDeletedWikiPaths: string[] = []
       for (const file of allFiles) {
         try {
           const r = await deleteSourceWithCascade(pp, file)
           allDeletedWikiPaths.push(...r.deletedWikiPaths)
         } catch (err) {
+          logDel.warn("file delete error (skipped)", { file: file.path, error: err instanceof Error ? err.message : String(err) })
           console.warn(`Failed to delete ${file.path} during folder delete:`, err)
         }
       }
@@ -470,8 +492,10 @@ export function SourcesView() {
       // cache dirs) in one shot. Files we just deleted above are
       // gone; this call mostly tears down empty directories.
       try {
+        logDel.info("folder remove", { folder: folder.path })
         await deleteFile(folder.path)
       } catch (err) {
+        logDel.warn("folder remove error", { folder: folder.path, error: err instanceof Error ? err.message : String(err) })
         console.warn(`Failed to remove folder ${folder.path}:`, err)
       }
       await loadSources()
@@ -485,6 +509,7 @@ export function SourcesView() {
         setSelectedFile(null)
       }
     } catch (err) {
+      logDel.error("folder delete failed", { folder: folder.path, error: err instanceof Error ? err.message : String(err) })
       console.error("Failed to delete folder:", err)
       window.alert(`Failed to delete folder: ${err}`)
     }
