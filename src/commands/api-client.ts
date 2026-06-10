@@ -13,26 +13,51 @@ const API_BASE = "/api"
 
 // ── Generic fetch helpers ─────────────────────────────────────────────────────
 
-async function post<T>(path: string, body: unknown): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  })
-  if (!res.ok) {
-    const text = await res.text().catch(() => res.statusText)
-    throw new Error(text)
+const API_TIMEOUT_MS = 30_000   // 30 s — prevents indefinite hangs
+
+async function post<T>(path: string, body: unknown, timeoutMs = API_TIMEOUT_MS): Promise<T> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const res = await fetch(`${API_BASE}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    })
+    if (!res.ok) {
+      const text = await res.text().catch(() => res.statusText)
+      throw new Error(text)
+    }
+    // 204 No Content or empty body
+    const ct = res.headers.get("content-type") ?? ""
+    if (res.status === 204 || !ct.includes("application/json")) return undefined as T
+    return res.json() as Promise<T>
+  } catch (err) {
+    if (err instanceof DOMException && err.name === "AbortError") {
+      throw new Error(`请求超时（>${timeoutMs / 1000}s）：${path}`)
+    }
+    throw err
+  } finally {
+    clearTimeout(timer)
   }
-  // 204 No Content or empty body
-  const ct = res.headers.get("content-type") ?? ""
-  if (res.status === 204 || !ct.includes("application/json")) return undefined as T
-  return res.json() as Promise<T>
 }
 
-async function get<T>(path: string): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`)
-  if (!res.ok) throw new Error(await res.text().catch(() => res.statusText))
-  return res.json() as Promise<T>
+async function get<T>(path: string, timeoutMs = API_TIMEOUT_MS): Promise<T> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const res = await fetch(`${API_BASE}${path}`, { signal: controller.signal })
+    if (!res.ok) throw new Error(await res.text().catch(() => res.statusText))
+    return res.json() as Promise<T>
+  } catch (err) {
+    if (err instanceof DOMException && err.name === "AbortError") {
+      throw new Error(`请求超时（>${timeoutMs / 1000}s）：${path}`)
+    }
+    throw err
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 // ── File System ───────────────────────────────────────────────────────────────

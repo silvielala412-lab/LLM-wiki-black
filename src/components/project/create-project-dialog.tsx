@@ -1,4 +1,4 @@
-﻿import { useState } from "react"
+import { useState } from "react"
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter,
 } from "@/components/ui/dialog"
@@ -17,7 +17,7 @@ import { saveOutputLanguage } from "@/lib/project-store"
 interface CreateProjectDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
-  onCreated: (project: WikiProject) => void
+  onCreated: (project: WikiProject) => void | Promise<void>
 }
 
 export function CreateProjectDialog({ open: isOpen, onOpenChange, onCreated }: CreateProjectDialogProps) {
@@ -55,7 +55,7 @@ export function CreateProjectDialog({ open: isOpen, onOpenChange, onCreated }: C
       setOutputLanguage(lang)
       await saveOutputLanguage(lang)
 
-      onCreated(project)
+      await onCreated(project)
       onOpenChange(false)
       setName("")
       setSelectedTemplate("general")
@@ -107,7 +107,11 @@ export function CreateProjectDialog({ open: isOpen, onOpenChange, onCreated }: C
               ))}
             </select>
           </div>
-          {error && <p className="text-sm text-destructive">{error}</p>}
+          {error && (
+            <div className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive border border-destructive/30">
+              ⚠️ {error}
+            </div>
+          )}
         </div>
         <DialogFooter>
           <Button variant="outline" onClick={() => onOpenChange(false)}>取消</Button>
