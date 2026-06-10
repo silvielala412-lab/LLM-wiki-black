@@ -19,8 +19,8 @@ interface CacheData {
   entries: Record<string, CacheEntry> // keyed by content hash; legacy filename keys are still read
 }
 
-const INGEST_PIPELINE_VERSION = "service-router-dedupe-v7"
-const PIPELINE_VERSION_STRICT = false
+const INGEST_PIPELINE_VERSION = "service-body-spec-v8"
+const PIPELINE_VERSION_STRICT = true
 
 async function sha256(content: string): Promise<string> {
   if (!globalThis.crypto?.subtle) {
