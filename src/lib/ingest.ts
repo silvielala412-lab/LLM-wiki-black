@@ -3920,7 +3920,7 @@ function buildCandidateBackfillPrompt(
     "For rule/definition/compliance pages (\u91cd\u75be\u5b9a\u4e49\u8bf4\u660e\u3001\u7b49\u5f85\u671f\u3001\u975e\u5171\u4eab\u89c4\u5219 etc.):",
     SERVICE_RULE_PAGE_BODY_SPEC,
     "",
-    "CRITICAL: Output ALL page bodies in Chinese with exact headings from the specs above.
+    "CRITICAL: Output ALL page bodies in Chinese with exact headings from the specs above.",
     "",
     `Source file: ${sourceFileName}`,
     `Ingest mode: ${preparedSource.processingMode}; source chars: ${preparedSource.originalChars}; context chars: ${preparedSource.contextChars}.`,
