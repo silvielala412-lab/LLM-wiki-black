@@ -199,43 +199,74 @@ export async function vectorDropLegacy(projectPath: string): Promise<void> {
 
 // ── File Upload (new — replaces dialog.open) ──────────────────────────────────
 
+/** 5-minute upload timeout — large PDF files need time, but shouldn't hang forever */
+const UPLOAD_TIMEOUT_MS = 5 * 60 * 1000
+
 export async function uploadFile(
   file: File,
   destinationDir: string,
+  timeoutMs = UPLOAD_TIMEOUT_MS,
 ): Promise<{ path: string; name: string; size: number }> {
-  const fd = new FormData()
-  fd.append("file", file)
-  fd.append("destination_dir", destinationDir)
-  const res = await fetch(`${API_BASE}/upload/file`, { method: "POST", body: fd })
-  if (!res.ok) throw new Error(await res.text())
-  return res.json()
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const fd = new FormData()
+    fd.append("file", file)
+    fd.append("destination_dir", destinationDir)
+    const res = await fetch(`${API_BASE}/upload/file`, {
+      method: "POST",
+      body: fd,
+      signal: controller.signal,
+    })
+    if (!res.ok) throw new Error(await res.text())
+    return res.json()
+  } catch (err) {
+    if (err instanceof DOMException && err.name === "AbortError") {
+      throw new Error(`上传超时（>${Math.round(timeoutMs / 60000)} 分钟）：${file.name}`)
+    }
+    throw err
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 export async function uploadFiles(
   files: File[],
   destinationDir: string,
+  timeoutMs = UPLOAD_TIMEOUT_MS,
 ): Promise<Array<{ path: string; name: string; size: number } | { error: string; name: string }>> {
-  const fd = new FormData()
-  for (const f of files) fd.append("files", f)
-  // Also include in body as fallback for servers that read multipart fields
-  fd.append("destination_dir", destinationDir)
-  // Pass as query param so the backend always gets it before reading the body
-  const url = `${API_BASE}/upload/files?dest=${encodeURIComponent(destinationDir)}`
-  const res = await fetch(url, { method: "POST", body: fd })
-  if (!res.ok) {
-    const text = await res.text().catch(() => "")
-    let msg = `HTTP ${res.status}: ${res.statusText}`
-    if (text) {
-      try {
-        const json = JSON.parse(text)
-        msg = json.error ?? json.message ?? text
-      } catch {
-        msg = text
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const fd = new FormData()
+    for (const f of files) fd.append("files", f)
+    // Also include in body as fallback for servers that read multipart fields
+    fd.append("destination_dir", destinationDir)
+    // Pass as query param so the backend always gets it before reading the body
+    const url = `${API_BASE}/upload/files?dest=${encodeURIComponent(destinationDir)}`
+    const res = await fetch(url, { method: "POST", body: fd, signal: controller.signal })
+    if (!res.ok) {
+      const text = await res.text().catch(() => "")
+      let msg = `HTTP ${res.status}: ${res.statusText}`
+      if (text) {
+        try {
+          const json = JSON.parse(text)
+          msg = json.error ?? json.message ?? text
+        } catch {
+          msg = text
+        }
       }
+      throw new Error(msg)
     }
-    throw new Error(msg)
+    return res.json()
+  } catch (err) {
+    if (err instanceof DOMException && err.name === "AbortError") {
+      throw new Error(`上传超时（>${Math.round(timeoutMs / 60000)} 分钟）：${files.length} 个文件，请检查服务器状态`)
+    }
+    throw err
+  } finally {
+    clearTimeout(timer)
   }
-  return res.json()
 }
 
 // ── Media URL helper (replaces Tauri convertFileSrc) ─────────────────────────
