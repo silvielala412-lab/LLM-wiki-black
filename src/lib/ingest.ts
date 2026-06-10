@@ -1557,6 +1557,74 @@ function buildSchemaCandidateManifest(
   return lines.join("\n")
 }
 
+// ─── Business-driven extraction body specs ───────────────────────────────
+//
+// These define the EXACT required section structure for each page type.
+// ALL fields listed as "必须" must appear in every generated page body.
+// Optional fields marked 「可选」 should be added only when evidence exists.
+//
+// IMPORTANT: Do NOT rename, merge, or omit required sections.
+// Field names are used verbatim for downstream RAG retrieval and front-end rendering.
+
+/**
+ * Body spec for the MAIN SERVICE VERSION page
+ * (e.g., 安有医-颐享版.md — one page per service line + version combination).
+ */
+const SERVICE_VERSION_PAGE_BODY_SPEC = `
+## 服务简介                【必须】对该服务版本的整体说明
+
+## 准入规则                【必须】
+### 达标门槛               【必须】持有什么产品/保额/费率才能享受
+### 指定产品               【必须】关联的保险产品代码/名称清单
+### 生效时间               【必须】服务权益何时生效
+### 权益人规则              【必须】主被保险人/家属共享规则
+
+## 服务期限                【必须】服务有效期、续期规则
+
+## 服务详情                【必须】
+### 服务入口               【必须】如何触达/激活服务（电话/APP/小程序）
+### 服务体系               【必须】含所有服务项目目录及核心内容（列表或表格）
+### 服务覆盖范围             【必须】适用地区/医院/人群范围
+### 注意事项               【必须】限制条件、免责、合规提示
+### 服务流程               【必须】激活→使用→结束的完整步骤
+
+## 触客素材                【必须】销售人员可直接使用的话术/海报/简介
+
+## 常见Q&A                【必须】客户最常问的问题及标准答复（≥5条）
+`.trim()
+
+/**
+ * Body spec for each INDIVIDUAL SERVICE ITEM page
+ * (e.g., 安有医-颐享版-在线问诊.md — one page per service item within a version).
+ */
+const SERVICE_ITEM_PAGE_BODY_SPEC = `
+## 服务项目                【必须】该服务项目名称，说明其在服务体系中的位置
+### 服务场景               【必须】该服务项目适用的典型场景（就医前/中/后/日常健康）
+### 服务阶段               【必须】所属阶段（预防/急性期/康复/慢病等）
+### 服务项目介绍             【必须】完整的服务项目内容描述
+
+## 服务次数                【必须】年度/保单期可用次数及有效期
+
+## 服务内容                【必须】具体提供的内容列表（分项细化）
+
+## 服务标准                【必须】质量标准、时效要求、响应承诺
+
+## 服务启动条件              【必须】触发条件/申请要求/证明材料
+
+## 触客素材                【必须】该服务项的专属销售话术、卖点提炼
+
+## 常见Q&A                【必须】该服务项专属常见问题（≥3条）
+
+---（以下字段按需拓展，有证据才写）---
+
+## 服务特色               【可选】区别于同类产品的差异化优势
+## 服务覆盖城市             【可选】若有城市限制，详细列出
+## 服务说明               【可选】额外补充说明
+## 适用人群               【可选】特定人群限制（年龄/病种/会员等级）
+## 服务项目使用流程          【可选】该项目独立的使用步骤（与主版本页流程不同时填写）
+## 重要提示               【可选】特别风险提示、合规免责声明
+`.trim()
+
 // Service item base names (item_name without line/version prefix).
 // In v2, actual entity title = {line_name}-{version_name}-{item_name}
 // The INSURANCE_SERVICE_MANUAL_NODES defines the canonical item_name and detection aliases.
@@ -1629,15 +1697,22 @@ function buildServiceManualNodeDirective(
     `Detected service/rule candidates (${nodes.length}): ${nodes.map((node) => node.title).join("、")}.`,
     "",
     "Required generation policy:",
-    "- Create the main service_line_version page, but do not stop there.",
+    "- Create the main service_line_version page (one per line+version), but do not stop there.",
     serviceLineCtx
       ? `- For each independent service item, generate a dedicated wiki/entities/${serviceLineCtx.lineName}/${serviceLineCtx.versionName}/*.md page with knowledge_domain: service, entity_type: service_item, and title following the v2 naming convention (e.g., "${makeItemTitle("在线问诊")}").`
       : "- For each independent service item, generate a dedicated wiki/entities/*.md page with knowledge_domain: service, entity_type: service_item.",
     "- For service activation, suspension, termination, waiting-period/non-sharing, and disclaimer content, generate dedicated `process`, `rule`, or `compliance_rule` pages.",
-    "- Each service_item page body must include: 服务定义、适用对象、服务次数、服务流程/申请方式、响应/完成时效、覆盖范围、使用限制、合规提醒、来源依据、待补全信息.",
+    "",
+    "=== MAIN SERVICE VERSION PAGE (安有医-颐享版.md style) body spec — ALL sections REQUIRED ===",
+    SERVICE_VERSION_PAGE_BODY_SPEC,
+    "",
+    "=== EACH SERVICE ITEM PAGE body spec — sections marked [必须] are REQUIRED; [可选] only when evidence exists ===",
+    SERVICE_ITEM_PAGE_BODY_SPEC,
+    "",
     "- Each rule/process/compliance page body must include: 规则定义、触发条件、影响范围、业务含义、销售提示、来源依据、待补全信息.",
     "- Link the main service_line_version page to every generated service_item/rule page using `has_part`, `governed_by`, `requires`, or `uses_process` relations.",
     "- If output budget prevents generating all pages, generate the top business-critical pages first and emit REVIEW missing-page items for every omitted node.",
+    "- CRITICAL: Output all page bodies in Chinese. Use the EXACT section headings from the spec above (## 服务简介, ### 达标门槛, ## 服务次数, etc.) — do NOT translate, shorten, or rename them.",
     "",
     serviceNodes.length > 0
       ? `Service item pages expected: ${serviceNodes.map((node) => makeItemTitle(node.title)).join("、")}.`
@@ -3797,8 +3872,14 @@ function buildCandidateBackfillPrompt(
     "attributes: one-line JSON object",
     "claims: compact evidence strings",
     "",
-    "Body sections for service_benefit pages should include: service definition, eligibility/target users, frequency/limits, process, time limits, exclusions, customer value, compliance reminders, source evidence, and knowledge gaps.",
-    "Body sections for process/rule/compliance pages should include: rule definition, trigger conditions, impact scope, sales meaning, risk reminder, source evidence, and knowledge gaps.",
+    "Body sections for the main service_version page (\u5b89\u6709\u533b-\u9890\u4eab\u7248.md style) MUST follow this exact structure:",
+    SERVICE_VERSION_PAGE_BODY_SPEC,
+    "",
+    "Body sections for each service_item page MUST follow this exact structure:",
+    SERVICE_ITEM_PAGE_BODY_SPEC,
+    "",
+    "Body sections for process/rule/compliance pages should include: \u89c4\u5219\u5b9a\u4e49\u3001\u89e6\u53d1\u6761\u4ef6\u3001\u5f71\u54cd\u8303\u56f4\u3001\u4e1a\u52a1\u542b\u4e49\u3001\u9500\u552e\u63d0\u793a\u3001\u6765\u6e90\u4f9d\u636e\u3001\u5f85\u8865\u5168\u4fe1\u606f.",
+    "CRITICAL: Output bodies in Chinese. Use exact section headings from the spec (## \u670d\u52a1\u7b80\u4ecb, ### \u8fbe\u6807\u95e8\u69db, ## \u670d\u52a1\u6b21\u6570, etc.) — do NOT translate or rename them.",
     "",
     `Source file: ${sourceFileName}`,
     `Ingest mode: ${preparedSource.processingMode}; source chars: ${preparedSource.originalChars}; context chars: ${preparedSource.contextChars}.`,
