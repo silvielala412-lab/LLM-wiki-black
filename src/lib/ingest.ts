@@ -33,7 +33,7 @@ import {
   normalizeEntityBlock,
 } from "@/lib/entity-normalizer"
 import { resolveIncomingKnowledgePage } from "@/lib/knowledge-resolution"
-import { buildServiceItemTitle, findServiceLineVersion } from "@/lib/insurance-schema-registry"
+import { buildServiceItemTitle, findServiceLineVersion, SERVICE_HIERARCHY } from "@/lib/insurance-schema-registry"
 import type { MultimodalConfig } from "@/stores/wiki-store"
 
 /**
@@ -59,8 +59,10 @@ export function extractServiceLineCtxFromPath(
   const versionName = parts[3]
   const ctx = findServiceLineVersion(lineName, versionName)
   if (!ctx) return null
-  return { lineName, versionName, seriesName: ctx.series, scenarioName: ctx.scenario }
+  // Use canonical version name (resolves aliases like 易核版→尊享易核版)
+  return { lineName, versionName: ctx.canonicalVersionName, seriesName: ctx.series, scenarioName: ctx.scenario }
 }
+
 import type { ChunkingConfig } from "@/types/wiki"
 import { useAuthStore } from "@/stores/auth-store"
 import { chunkMarkdown } from "@/lib/text-chunker"
@@ -1622,7 +1624,7 @@ function buildServiceManualNodeDirective(
     "Required generation policy:",
     "- Create the main service_line_version page, but do not stop there.",
     serviceLineCtx
-      ? `- For each independent service item, generate a dedicated wiki/entities/*.md page with knowledge_domain: service, entity_type: service_item, and title following the v2 naming convention (e.g., "${makeItemTitle("在线问诊")}").`
+      ? `- For each independent service item, generate a dedicated wiki/entities/${serviceLineCtx.lineName}/${serviceLineCtx.versionName}/*.md page with knowledge_domain: service, entity_type: service_item, and title following the v2 naming convention (e.g., "${makeItemTitle("在线问诊")}").`
       : "- For each independent service item, generate a dedicated wiki/entities/*.md page with knowledge_domain: service, entity_type: service_item.",
     "- For service activation, suspension, termination, waiting-period/non-sharing, and disclaimer content, generate dedicated `process`, `rule`, or `compliance_rule` pages.",
     "- Each service_item page body must include: 服务定义、适用对象、服务次数、服务流程/申请方式、响应/完成时效、覆盖范围、使用限制、合规提醒、来源依据、待补全信息.",
@@ -2503,15 +2505,26 @@ async function prepareSourceForIngest(
  * "updated" index based on the same pre-state and overwrite each
  * other's additions.
  */
+/** Options for autoIngest / autoIngestImpl */
+export interface IngestOptions {
+  /**
+   * When true, skip per-file Identity Pass and Global Relation Pass.
+   * Use this for batch ingestion: run relation passes once after queue drains.
+   * Dramatically increases throughput when ingesting many files at once.
+   */
+  skipRelationPass?: boolean
+}
+
 export async function autoIngest(
   projectPath: string,
   sourcePath: string,
   llmConfig: LlmConfig,
   signal?: AbortSignal,
   folderContext?: string,
+  options?: IngestOptions,
 ): Promise<string[]> {
   return withProjectLock(normalizePath(projectPath), () =>
-    autoIngestImpl(projectPath, sourcePath, llmConfig, signal, folderContext),
+    autoIngestImpl(projectPath, sourcePath, llmConfig, signal, folderContext, options),
   )
 }
 
@@ -2521,6 +2534,7 @@ async function autoIngestImpl(
   llmConfig: LlmConfig,
   signal?: AbortSignal,
   folderContext?: string,
+  options?: IngestOptions,
 ): Promise<string[]> {
   const pp = normalizePath(projectPath)
   const sp = normalizePath(sourcePath)
@@ -3015,6 +3029,7 @@ async function autoIngestImpl(
     activityId,
     preparedSource,
     signal,
+    serviceLineCtx,
   )
   if (schemaBackfill.writtenPaths.length > 0) {
     writtenPaths.push(...schemaBackfill.writtenPaths)
@@ -3023,7 +3038,12 @@ async function autoIngestImpl(
     console.warn("[ingest] Schema backfill warnings:", schemaBackfill.warnings)
   }
 
-  const enrichedServiceBenefitPaths = !signal?.aborted
+  // Skip the legacy service_benefit enrichment when a service-hierarchy
+  // context is present — the main generation pass already creates correctly
+  // named service_item entities in wiki/entities/service/{line}/{version}/.
+  // Running the old enrichment would produce stale flat service_benefit
+  // pages (e.g. "26项服务权益.md") that conflict with the v2 naming.
+  const enrichedServiceBenefitPaths = !signal?.aborted && !serviceLineCtx
     ? await enrichServiceBenefitPagesFromText(pp, sourceContent, fileName).catch((err) => {
         console.warn("[ingest] Service benefit enrichment failed:", err)
         return [] as string[]
@@ -3096,18 +3116,10 @@ async function autoIngestImpl(
       console.warn("[ingest] Post-process failed (non-critical):", err)
     }
 
-    // ── Step 3.4c: Identity Pass (cross-document entity identity resolution) ──
-    // Runs AFTER postprocess and BEFORE Global Relation Pass.
-    // Resolves same_entity / alias_of / sibling_of / parent_child relationships
-    // so the graph is built on clean, deduplicated entities.
-    //
-    // Conservative by design: same_entity requires confidence >= 0.90 (hard-coded
-    // in the LLM prompt). Below that, falls back to alias_of (non-destructive).
-    // No entity pages are deleted — merge suggestions are written as frontmatter
-    // comments for human review.
-    if (!signal?.aborted) {
+    // ── Step 3.4c: Identity Pass ──────────────────────────────────────────────
+    // Skipped when skipRelationPass=true (deferred to post-queue batch pass).
+    if (!signal?.aborted && !options?.skipRelationPass) {
       try {
-        // Derive titles of entity pages written during this ingest
         const newEntityTitles = new Set<string>()
         for (const rel of writtenPaths) {
           if (rel.startsWith("wiki/entities/") || rel.startsWith("wiki/concepts/")) {
@@ -3129,18 +3141,16 @@ async function autoIngestImpl(
       } catch (err) {
         console.warn("[ingest] Identity pass failed (non-critical):", err)
       }
+    } else if (options?.skipRelationPass) {
+      console.log(`[ingest] Identity pass deferred (skipRelationPass=true): ${fileName}`)
     }
 
-    // ── Step 3.4d: Global Relation Pass (cross-document semantic relation inference) ──
-    // Runs AFTER postprocess (D+C relation edges already on disk) and BEFORE audit
-    // (so audit scores reflect cross-document relations written here).
-    //
+    // ── Step 3.4d: Global Relation Pass ───────────────────────────────────────
+    // Skipped when skipRelationPass=true (deferred to post-queue batch pass).
     // IMPORTANT: we pass newEntityTitles so the pass only evaluates pairs that include
-    // at least one entity written during THIS ingest. Without this gate, the pass would
-    // re-evaluate all N² entity pairs on every subsequent ingest, producing duplicate edges.
-    if (!signal?.aborted) {
+    // at least one entity written during THIS ingest.
+    if (!signal?.aborted && !options?.skipRelationPass) {
       try {
-        // Derive titles of entity pages written during this ingest
         const newEntityTitles = new Set<string>()
         for (const rel of writtenPaths) {
           if (rel.startsWith("wiki/entities/") || rel.startsWith("wiki/concepts/")) {
@@ -3158,6 +3168,8 @@ async function autoIngestImpl(
       } catch (err) {
         console.warn("[ingest] Global relation pass failed (non-critical):", err)
       }
+    } else if (options?.skipRelationPass) {
+      console.log(`[ingest] Global relation pass deferred (skipRelationPass=true): ${fileName}`)
     }
 
     // ── Step 3.4a: Extraction quality audit ──────────────────────────────────
@@ -3496,6 +3508,71 @@ export function shouldSkipUnsafeKnowledgeWrite(
   return null
 }
 
+/**
+ * Post-process entity FILE block paths: if the LLM emitted a flat
+ * wiki/entities/XXX.md path but the entity has line_name + version_name
+ * in its frontmatter, redirect to wiki/entities/{line}/{version}/{title}.md.
+ * Also strips wrong prefixes like "service_安有医_颐享版_" or "安有医_颐享版_"
+ * that the LLM adds when encoding hierarchy in the filename.
+ */
+function rerouteServiceEntityPath(relativePath: string, content: string): string {
+  if (!relativePath.startsWith("wiki/entities/")) return relativePath
+  const segs = relativePath.split("/")
+  // Already in a subdirectory (wiki/entities/line/version/file.md = 5 parts)
+  if (segs.length >= 5) return relativePath
+
+  // Parse frontmatter
+  const fmMatch = content.match(/^---\n([\s\S]*?)\n---/)
+  if (!fmMatch) return relativePath
+  const fm = fmMatch[1]
+
+  const lineMatch = fm.match(/^line_name:\s*["']?([^"'\n]+?)["']?\s*$/m)
+  const versionMatch = fm.match(/^version_name:\s*["']?([^"'\n]+?)["']?\s*$/m)
+  // Also check attributes JSON blob
+  const attrLine = content.match(/"line_name"\s*:\s*"([^"]+)"/)  
+  const attrVersion = content.match(/"version_name"\s*:\s*"([^"]+)"/)  
+
+  let lineName = lineMatch?.[1]?.trim() ?? attrLine?.[1]
+  let versionName = versionMatch?.[1]?.trim() ?? attrVersion?.[1]
+
+  // Fallback: derive from title (handles old entities where line_name/version_name are absent)
+  if (!lineName || !versionName) {
+    const titleMatch2 = fm.match(/^title:\s*["']?([^"'\n]+?)["']?\s*$/m)
+    const candidateTitle = titleMatch2?.[1]?.trim() ?? ""
+    const fileName2 = segs[segs.length - 1]
+    outer: for (const ser of SERVICE_HIERARCHY) {
+      for (const sc of ser.scenarios) {
+        for (const ln of sc.lines) {
+          for (const vn of ln.versions) {
+            const patterns = [
+              `${ln.lineName}-${vn.versionName}-`, `${ln.lineName}_${vn.versionName}_`,
+              `service_${ln.lineName}_${vn.versionName}_`,
+            ]
+            if (patterns.some(p => candidateTitle.startsWith(p) || fileName2.startsWith(p))) {
+              lineName = ln.lineName; versionName = vn.versionName; break outer
+            }
+          }
+        }
+      }
+    }
+  }
+  if (!lineName || !versionName) return relativePath
+
+  // Determine clean file name: prefer the frontmatter title
+  const titleMatch = fm.match(/^title:\s*["']?([^"'\n]+?)["']?\s*$/m)
+  let fileName = segs[segs.length - 1] // last segment, e.g. service_安有医_颐享版_xxx.md
+  if (titleMatch) {
+    const cleanTitle = titleMatch[1].trim().replace(/[\/\\:*?"<>|]/g, "").trim()
+    if (cleanTitle) fileName = `${cleanTitle}.md`
+  } else {
+    // Strip common wrong prefixes: "service_{line}_{version}_" or "{line}_{version}_"
+    for (const prefix of [`service_${lineName}_${versionName}_`, `${lineName}_${versionName}_`]) {
+      if (fileName.startsWith(prefix)) { fileName = fileName.slice(prefix.length); break }
+    }
+  }
+  return `wiki/entities/${lineName}/${versionName}/${fileName}`
+}
+
 async function writeFileBlocks(
   projectPath: string,
   text: string,
@@ -3527,7 +3604,8 @@ async function writeFileBlocks(
       existingEntities,
       projectPath,
     )
-    const relativePath = normalised.path
+    // Correct flat entity paths to the hierarchy directory based on frontmatter
+    const relativePath = rerouteServiceEntityPath(normalised.path, normalised.content)
     let content = shouldNormalizeKnowledgePage(relativePath)
       ? cleanupKnowledgeFrontmatter(normalizeSchemaFrontmatter(normalised.content, {
           relativePath,
@@ -3665,12 +3743,21 @@ function batchCandidates<T>(items: T[], size: number): T[][] {
   return batches
 }
 
-function buildCandidateBackfillPrompt(sourceFileName: string, preparedSource: PreparedIngestSource): string {
+function buildCandidateBackfillPrompt(
+  sourceFileName: string,
+  preparedSource: PreparedIngestSource,
+  serviceLineCtx?: { lineName: string; versionName: string } | null,
+): string {
+  const serviceItemPathExample = serviceLineCtx
+    ? `wiki/entities/${serviceLineCtx.lineName}/${serviceLineCtx.versionName}/${serviceLineCtx.lineName}-${serviceLineCtx.versionName}-服务项名称.md`
+    : "wiki/entities/Page Title.md"
   return [
     "You are a schema-driven insurance knowledge compiler.",
     "",
     "The main generation pass missed required knowledge candidates. Generate dedicated wiki pages for the candidate batch provided by the user.",
-    "This is a backfill pass: do not create index, log, overview, or source pages. Emit only FILE blocks under wiki/entities/ or wiki/concepts/.",
+    serviceLineCtx
+      ? `This is a v2 service hierarchy backfill. ALL service_item pages MUST be placed under wiki/entities/${serviceLineCtx.lineName}/${serviceLineCtx.versionName}/ (mirroring the source upload path) with title prefix ${serviceLineCtx.lineName}-${serviceLineCtx.versionName}-. Do NOT write service items to flat wiki/entities/ or any other subdirectory.`
+      : "This is a backfill pass: do not create index, log, overview, or source pages. Emit only FILE blocks under wiki/entities/ or wiki/concepts/.",
     "Use the same language as the source. For Chinese insurance documents, write polished Chinese business-facing Markdown bodies.",
     "",
     "Required behavior:",
@@ -3710,7 +3797,7 @@ function buildCandidateBackfillPrompt(sourceFileName: string, preparedSource: Pr
     `Ingest mode: ${preparedSource.processingMode}; source chars: ${preparedSource.originalChars}; context chars: ${preparedSource.contextChars}.`,
     "",
     "Output format only:",
-    "---FILE: wiki/entities/Page Title.md---",
+    `---FILE: ${serviceItemPathExample}---`,
     "(complete markdown file)",
     "---END FILE---",
   ].join("\n")
@@ -3756,11 +3843,12 @@ async function backfillMissingSchemaCandidatePages(
   activityId: string,
   preparedSource: PreparedIngestSource,
   signal?: AbortSignal,
+  serviceLineCtx?: { lineName: string; versionName: string; seriesName: string; scenarioName: string } | null,
 ): Promise<{ writtenPaths: string[]; missingAfterBackfill: SchemaDrivenCandidate[]; warnings: string[] }> {
   const required = candidates.filter((candidate) => candidate.required && candidate.entityType !== "source_inventory")
   if (required.length === 0 || signal?.aborted) return { writtenPaths: [], missingAfterBackfill: [], warnings: [] }
 
-  let knownTitles = await collectWikiPageTitles(projectPath)
+  const knownTitles = await collectWikiPageTitles(projectPath)
   const missingBefore = required.filter((candidate) => !candidatePageCovered(candidate, knownTitles))
   if (missingBefore.length === 0) return { writtenPaths: [], missingAfterBackfill: [], warnings: [] }
 
@@ -3769,19 +3857,20 @@ async function backfillMissingSchemaCandidatePages(
   const allWarnings: string[] = []
   const batches = batchCandidates(missingBefore.slice(0, 48), 6)
 
-  for (let i = 0; i < batches.length; i++) {
-    if (signal?.aborted) break
-    const batch = batches[i]
-    activity.updateItem(activityId, {
-      detail: `Schema backfill: generating missing candidate pages ${i + 1}/${batches.length} (${batch.length} items)...`,
-    })
+  // ── Phase 1: Launch ALL batch LLM calls in parallel ─────────────────────
+  // Batches are pre-divided non-overlapping slices of missingBefore, so there
+  // is no risk of the same candidate being generated twice.
+  activity.updateItem(activityId, {
+    detail: `Schema backfill: launching ${batches.length} batches in parallel (${missingBefore.length} items)...`,
+  })
 
-    let generation = ""
-    try {
-      generation = await streamTextWithCompileFallback(
+  const generationResults = await Promise.allSettled(
+    batches.map((batch, i) => {
+      if (signal?.aborted) return Promise.reject(new Error("aborted"))
+      return streamTextWithCompileFallback(
         llmConfig,
         [
-          { role: "system", content: buildCandidateBackfillPrompt(sourceFileName, preparedSource) },
+          { role: "system", content: buildCandidateBackfillPrompt(sourceFileName, preparedSource, serviceLineCtx) },
           { role: "user", content: buildCandidateBackfillUserContent(sourceFileName, sourceContent, batch) },
         ],
         signal,
@@ -3789,19 +3878,31 @@ async function backfillMissingSchemaCandidatePages(
         activityId,
         `Schema backfill batch ${i + 1}/${batches.length}`,
       )
-    } catch (err) {
-      const msg = `Schema backfill batch ${i + 1} failed: ${errorMessage(err)}`
+    })
+  )
+
+  // ── Phase 2: Write results sequentially ──────────────────────────────────
+  // writeFileBlocks modifies shared files (wiki/index.md, etc.) so we keep
+  // the write step serial to avoid race conditions.
+  const { stampCandidate } = await import("@/lib/knowledge-governance")
+  for (let i = 0; i < generationResults.length; i++) {
+    if (signal?.aborted) break
+    const result = generationResults[i]
+    if (result.status === "rejected") {
+      const msg = `Schema backfill batch ${i + 1} failed: ${errorMessage(result.reason)}`
       console.warn(`[ingest] ${msg}`)
       allWarnings.push(msg)
       continue
     }
 
-    const { writtenPaths, warnings } = await writeFileBlocks(projectPath, generation, sourceFileName)
+    activity.updateItem(activityId, {
+      detail: `Schema backfill: writing batch ${i + 1}/${batches.length}...`,
+    })
+
+    const { writtenPaths, warnings } = await writeFileBlocks(projectPath, result.value, sourceFileName)
     allWritten.push(...writtenPaths)
     allWarnings.push(...warnings)
-    knownTitles = await collectWikiPageTitles(projectPath)
 
-    const { stampCandidate } = await import("@/lib/knowledge-governance")
     for (const rel of writtenPaths) {
       if (!rel.startsWith("wiki/")) continue
       const base = rel.split("/").pop() ?? ""
@@ -3812,10 +3913,11 @@ async function backfillMissingSchemaCandidatePages(
     }
   }
 
-  knownTitles = await collectWikiPageTitles(projectPath)
-  const missingAfterBackfill = missingBefore.filter((candidate) => !candidatePageCovered(candidate, knownTitles))
+  const finalTitles = await collectWikiPageTitles(projectPath)
+  const missingAfterBackfill = missingBefore.filter((candidate) => !candidatePageCovered(candidate, finalTitles))
   return { writtenPaths: allWritten, missingAfterBackfill, warnings: allWarnings }
 }
+
 
 function yamlScalar(value: string | number): string {
   if (typeof value === "number") return String(value)
@@ -4369,7 +4471,9 @@ export function buildGenerationPrompt(
     "  This structured output is critical for the knowledge graph's horizontal connectivity. A service_item page with no lateral relations and no relation_candidates is considered incomplete.",
     serviceLineCtx
       ? [
-          `- Service item pages (v2): use \`wiki/entities/${serviceLineCtx.lineName}-${serviceLineCtx.versionName}-{\u670d\u52a1\u9879\u540d\u79f0}.md\`. Example: \`wiki/entities/${serviceLineCtx.lineName}-${serviceLineCtx.versionName}-\u5728\u7ebf\u95ee\u8bca.md\``,
+          `- Service item pages (v2): MUST use path \`wiki/entities/${serviceLineCtx.lineName}/${serviceLineCtx.versionName}/${serviceLineCtx.lineName}-${serviceLineCtx.versionName}-{\u670d\u52a1\u9879\u540d\u79f0}.md\` — mirroring the source upload directory.`,
+          `  Example: \`wiki/entities/${serviceLineCtx.lineName}/${serviceLineCtx.versionName}/${serviceLineCtx.lineName}-${serviceLineCtx.versionName}-\u5728\u7ebf\u95ee\u8bca.md\``,
+          `  The \`wiki/entities/${serviceLineCtx.lineName}/${serviceLineCtx.versionName}/\` directory prefix is MANDATORY. Do NOT write to flat \`wiki/entities/\` or any other subdirectory.`,
           `  Frontmatter: \`entity_type: service_item\`, \`knowledge_domain: service\`, \`business_phase: service\``,
           `  MUST include: line_name: "${serviceLineCtx.lineName}", version_name: "${serviceLineCtx.versionName}", item_name: "{服\u52a1\u9879\u540d\u79f0}"`,
           "  Link back to the main service_line_version page using `part_of` relation.",

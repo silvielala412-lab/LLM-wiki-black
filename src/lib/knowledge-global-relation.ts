@@ -132,26 +132,37 @@ const BATCH_SIZE = 20           // candidate pairs per LLM call
 
 export async function buildEntityCatalog(projectPath: string): Promise<EntityEntry[]> {
   const catalog: EntityEntry[] = []
+
   const dirs = [
     `${projectPath}/wiki/entities`,
     `${projectPath}/wiki/concepts`,
   ]
 
-  for (const dir of dirs) {
-    let files: { name: string; is_dir?: boolean }[] = []
-    try { files = await listDirectory(dir) } catch { continue }
+  /** Recursively collect all .md files (supports hierarchy subdirectories). */
+  async function scanDir(dir: string): Promise<void> {
+    let files: { name: string; path?: string; is_dir?: boolean }[] = []
+    try { files = await listDirectory(dir) } catch { return }
 
     for (const file of files) {
-      if (file.is_dir || !file.name.endsWith(".md") || file.name.endsWith(".md.md")) continue
-      const filePath = `${dir}/${file.name}`
-      try {
-        const content = await readFile(filePath)
-        const entry = parseEntityEntry(content, filePath)
-        if (entry) catalog.push(entry)
-      } catch {
-        // skip unreadable files
+      if (file.is_dir) {
+        // Recurse into line/version subdirectories
+        const subPath = file.path ?? `${dir}/${file.name}`
+        await scanDir(subPath)
+      } else if (file.name.endsWith(".md") && !file.name.endsWith(".md.md")) {
+        const filePath = file.path ?? `${dir}/${file.name}`
+        try {
+          const content = await readFile(filePath)
+          const entry = parseEntityEntry(content, filePath)
+          if (entry) catalog.push(entry)
+        } catch {
+          // skip unreadable files
+        }
       }
     }
+  }
+
+  for (const dir of dirs) {
+    await scanDir(dir)
   }
 
   return catalog
@@ -237,10 +248,12 @@ export function generateCandidatePairs(
   newEntityTitles?: ReadonlySet<string>,
 ): CandidatePair[] {
   // Only consider entity types that have lateral relations
+  // Added service_item to the list (new hierarchical entity type)
   const candidates = catalog.filter(e =>
-    ["service_benefit", "product", "persona", "pitch", "process"].includes(e.entityType) ||
+    ["service_benefit", "service_item", "product", "persona", "pitch", "process"].includes(e.entityType) ||
     e.entityType === ""
   )
+
 
   const seen = new Set<string>()
   const pairs: CandidatePair[] = []

@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react"
-import { Plus, FileText, RefreshCw, BookOpen, Trash2, Folder, ChevronRight, ChevronDown, Layers, Upload, LayoutList } from "lucide-react"
+import { Plus, FileText, RefreshCw, BookOpen, Trash2, Folder, ChevronRight, ChevronDown, Layers, Upload, GitMerge, LayoutList } from "lucide-react"
+
 import { Button } from "@/components/ui/button"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { useWikiStore } from "@/stores/wiki-store"
@@ -62,6 +63,22 @@ export function SourcesView() {
     const t = setTimeout(() => setPendingDeletePath(null), 5000)
     return () => clearTimeout(t)
   }, [pendingDeletePath])
+
+  /** Auto-clear upload error after 8 s so it doesn't linger forever */
+  useEffect(() => {
+    if (!importError) return
+    const t = setTimeout(() => setImportError(null), 8000)
+    return () => clearTimeout(t)
+  }, [importError])
+
+  /** Extract a human-readable message from any caught value */
+  function extractErrMsg(err: unknown): string {
+    if (err instanceof Error) {
+      return err.message.trim() || `未知错误 (${err.name})`
+    }
+    const s = String(err)
+    return s === "[object Object]" || !s ? "上传失败，请检查服务器连接" : s
+  }
 
   const loadSources = useCallback(async () => {
     if (!project) return
@@ -126,8 +143,8 @@ export function SourcesView() {
         }
         setTimeout(() => setImportStatus(null), 5000)
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err)
-        setImportError(`上传失败: ${msg}`)
+        setImportError(`上传失败: ${extractErrMsg(err)}`)
+        console.error("[handleVersionUpload] upload error:", err)
       } finally {
         setImporting(false)
       }
@@ -177,9 +194,8 @@ export function SourcesView() {
         }
         setTimeout(() => setImportStatus(null), 4000)
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err)
-        setImportError(`上传失败: ${msg}`)
-        console.error("Upload failed:", err)
+        setImportError(`上传失败: ${extractErrMsg(err)}`)
+        console.error("[handleImport] upload error:", err)
       } finally {
         setImporting(false)
       }
@@ -189,7 +205,6 @@ export function SourcesView() {
 
   async function handleImportFolder() {
     if (!project) return
-    // webkitdirectory: browser picks a local folder, hands us all files inside.
     const input = document.createElement("input")
     input.type = "file"
     // @ts-expect-error — webkitdirectory is not in TS types but works in all modern browsers
@@ -200,43 +215,190 @@ export function SourcesView() {
       if (!files.length) return
       setImporting(true)
       setImportError(null)
-      setImportStatus(`正在上传文件夹 (${files.length} 个文件)...`)
+      setImportStatus(`正在分析文件夹结构 (${files.length} 个文件)...`)
       const pp = normalizePath(project.path)
-      const destDir = `${pp}/raw/sources`
       try {
-        const { uploadFiles } = await import("@/commands/fs")
-        // Pass files with their webkitRelativePath so the backend preserves
-        // the folder hierarchy (e.g. myfolder/sub/file.pdf → sources/myfolder/sub/file.pdf)
-        const results = await uploadFiles(files, destDir)
-        const importedPaths: string[] = results
-          .filter((r): r is { path: string; name: string; size: number } => "path" in r)
-          .map((r) => r.path)
-        const errorCount = results.filter((r) => "error" in r).length
-        setImportStatus(
-          errorCount > 0
-            ? `上传完成：${importedPaths.length} 成功，${errorCount} 失败`
-            : `上传成功：${importedPaths.length} 个文件`
-        )
-        await loadSources()
-        const canIngest = !!(llmConfig.apiKey || llmConfig.provider === "ollama" || llmConfig.provider === "custom")
-        if (canIngest && importedPaths.length > 0) {
-          setImportStatus(`正在排队解析 ${importedPaths.length} 个文件...`)
-          const tasks = importedPaths.map((absPath) => ({
-            sourcePath: absPath.startsWith(pp + "/") ? absPath.slice(pp.length + 1) : absPath,
-            folderContext: "",
-          }))
-          enqueueBatch(project.id, tasks).catch((err) => console.error("enqueueBatch failed:", err))
+      const { uploadFiles } = await import("@/commands/fs")
+      const { SERVICE_HIERARCHY, resolveCanonicalVersionName } = await import("@/lib/insurance-schema-registry")
+
+      /** Try to match a filename or relative path against known service lines/versions */
+      function detectLineVersion(file: File): { lineName: string; versionName: string } | null {
+        const relPath = (file as File & { webkitRelativePath?: string }).webkitRelativePath ?? ""
+        const parts = relPath.split("/").filter(Boolean)
+        const name = file.name
+
+        for (const ser of SERVICE_HIERARCHY) {
+          for (const sc of ser.scenarios) {
+            for (const ln of sc.lines) {
+              for (const vn of ln.versions) {
+                // 1. Exact path segment match
+                if (parts.some(p => p === ln.lineName) && parts.some(p => p === vn.versionName)) {
+                  return { lineName: ln.lineName, versionName: vn.versionName }
+                }
+                // 2. Filename contains both line and version (exact)
+                if (name.includes(ln.lineName) && name.includes(vn.versionName)) {
+                  return { lineName: ln.lineName, versionName: vn.versionName }
+                }
+              }
+
+              // 3. Check path/name for version aliases (e.g. 易核版 → 尊享易核版)
+              for (const vn of ln.versions) {
+                // Try alias variants in path segments
+                const aliasMatch = parts.find(p => {
+                  const resolved = resolveCanonicalVersionName(ln.lineName, p)
+                  return resolved === vn.versionName && resolved !== p
+                })
+                if (parts.some(p => p === ln.lineName) && aliasMatch) {
+                  return { lineName: ln.lineName, versionName: vn.versionName }
+                }
+                // Try alias in filename parentheses: （易核版）
+                const bracketMatch = name.match(/[（(]([^）)]+)[）)]/g)?.some(m => {
+                  const inner = m.replace(/[（(）)]/g, "").trim()
+                  return resolveCanonicalVersionName(ln.lineName, inner) === vn.versionName
+                })
+                if (name.includes(ln.lineName) && bracketMatch) {
+                  return { lineName: ln.lineName, versionName: vn.versionName }
+                }
+              }
+            }
+          }
         }
-        setTimeout(() => setImportStatus(null), 4000)
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err)
-        setImportError(`上传失败: ${msg}`)
-      } finally {
-        setImporting(false)
+        return null
       }
+
+      /** Detect line-only match (no specific version identified) */
+      function detectLineOnly(file: File): string | null {
+        const name = file.name
+        const parts = ((file as File & { webkitRelativePath?: string }).webkitRelativePath ?? "").split("/").filter(Boolean)
+        for (const ser of SERVICE_HIERARCHY) {
+          for (const sc of ser.scenarios) {
+            for (const ln of sc.lines) {
+              if (parts.some(p => p === ln.lineName) || name.includes(ln.lineName)) {
+                return ln.lineName
+              }
+            }
+          }
+        }
+        return null
+      }
+
+      // Group files by detected destination
+      const groups = new Map<string, { files: File[]; lineName: string; versionName: string }>()
+      // Line-only files: service line identified but no specific version
+      const lineOnlyGroups = new Map<string, { files: File[]; lineName: string; allVersions: string[] }>()
+      const unclassified: File[] = []
+      for (const f of files) {
+        const detected = detectLineVersion(f)
+        if (detected) {
+          const key = `${detected.lineName}/${detected.versionName}`
+          if (!groups.has(key)) groups.set(key, { files: [], ...detected })
+          groups.get(key)!.files.push(f)
+        } else {
+          // Try line-only detection
+          const { findServiceLine } = await import("@/lib/insurance-schema-registry")
+          const line = detectLineOnly(f)
+          if (line) {
+            const lineInfo = findServiceLine(line)
+            if (lineInfo) {
+              if (!lineOnlyGroups.has(line)) lineOnlyGroups.set(line, { files: [], lineName: line, allVersions: lineInfo.versions })
+              lineOnlyGroups.get(line)!.files.push(f)
+            } else {
+              unclassified.push(f)
+            }
+          } else {
+            unclassified.push(f)
+          }
+        }
+      }
+
+
+      const allImportedTasks: Array<{ sourcePath: string; folderContext: string }> = []
+      let successCount = 0, failCount = 0
+
+      // Upload each group to its hierarchy destination
+      for (const [, grp] of groups) {
+        const destDir = `${pp}/raw/sources/${grp.lineName}/${grp.versionName}`
+        setImportStatus(`正在上传到 ${grp.lineName}-${grp.versionName} (${grp.files.length} 个文件)...`)
+        try {
+          const results = await uploadFiles(grp.files, destDir)
+          for (const r of results) {
+            if ("path" in r) {
+              successCount++
+              allImportedTasks.push({
+                sourcePath: r.path.startsWith(pp + "/") ? r.path.slice(pp.length + 1) : r.path,
+                folderContext: `${grp.lineName} > ${grp.versionName}`,
+              })
+            } else failCount++
+          }
+        } catch (err) {
+          console.error(`Upload to ${grp.lineName}/${grp.versionName} failed:`, err)
+          failCount += grp.files.length
+        }
+      }
+
+      // Upload cross-version (line-only) files to EACH version of that line
+      // e.g. 平安臻享家医服务手册.pdf → raw/sources/臻享家医/V1/, V2/, V3/
+      for (const [, grp] of lineOnlyGroups) {
+        for (const versionName of grp.allVersions) {
+          const destDir = `${pp}/raw/sources/${grp.lineName}/${versionName}`
+          setImportStatus(`正在上传通用手册到 ${grp.lineName}-${versionName} (${grp.files.length} 个文件)...`)
+          try {
+            const results = await uploadFiles(grp.files, destDir)
+            for (const r of results) {
+              if ("path" in r) {
+                successCount++
+                allImportedTasks.push({
+                  sourcePath: r.path.startsWith(pp + "/") ? r.path.slice(pp.length + 1) : r.path,
+                  folderContext: `${grp.lineName} > ${versionName}`,
+                })
+              } else failCount++
+            }
+          } catch (err) {
+            console.error(`Upload line-only to ${grp.lineName}/${versionName} failed:`, err)
+            failCount += grp.files.length
+          }
+        }
+      }
+
+      // Upload unclassified files to flat raw/sources/
+      if (unclassified.length > 0) {
+        setImportStatus(`正在上传 ${unclassified.length} 个未识别文件...`)
+        try {
+          const results = await uploadFiles(unclassified, `${pp}/raw/sources`)
+          for (const r of results) {
+            if ("path" in r) {
+              successCount++
+              allImportedTasks.push({
+                sourcePath: r.path.startsWith(pp + "/") ? r.path.slice(pp.length + 1) : r.path,
+                folderContext: "",
+              })
+            } else failCount++
+          }
+        } catch (err) { failCount += unclassified.length; console.error("[handleImportFolder] unclassified upload error:", err) }
+      }
+
+      const lineOnlyCount = [...lineOnlyGroups.values()].reduce((s, g) => s + g.files.length, 0)
+      setImportStatus(failCount > 0
+        ? `上传完成：${successCount} 成功，${failCount} 失败。${groups.size} 个精确版本，${lineOnlyGroups.size} 个通用手册（已分发至全版本），${unclassified.length} 个未分类`
+        : `✓ 上传成功：${successCount} 个任务。精确版本 ${groups.size} 个，通用手册 ${lineOnlyCount} 个文件×${lineOnlyGroups.size} 条服务线，未分类 ${unclassified.length} 个`)
+
+      await loadSources()
+      const canIngest = !!(llmConfig.apiKey || llmConfig.provider === "ollama" || llmConfig.provider === "custom")
+      if (canIngest && allImportedTasks.length > 0) {
+        setImportStatus(`正在排队解析 ${allImportedTasks.length} 个文件...`)
+        enqueueBatch(project.id, allImportedTasks).catch(err => console.error("enqueueBatch failed:", err))
+      }
+      setTimeout(() => setImportStatus(null), 6000)
+    } catch (err) {
+      setImportError(`文件夹上传失败: ${extractErrMsg(err)}`)
+      console.error("[handleImportFolder] unexpected error:", err)
+    } finally {
+      setImporting(false)
+    }
     }
     input.click()
   }
+
 
   async function handleOpenSource(node: FileNode) {
     const targetPath = project ? await resolveSourcePreviewPath(normalizePath(project.path), node) : node.path
@@ -536,6 +698,29 @@ export function SourcesView() {
                 <Folder className="mr-1 h-4 w-4" />
                 Folder
               </Button>
+              <Button
+                size="sm" variant="outline" title="重建概念索引：扫描所有实体，生成跨版本服务项概念页"
+                disabled={importing}
+                onClick={async () => {
+                  if (!project) return
+                  setImporting(true)
+                  setImportStatus("正在重建概念索引...")
+                  try {
+                    const { buildServiceConceptIndex } = await import("@/lib/concept-aggregator")
+                    const { created, updated } = await buildServiceConceptIndex(project.path)
+                    setImportStatus(`✓ 概念索引重建完成：新建 ${created} 个，更新 ${updated} 个`)
+                    await loadSources()
+                  } catch (err) {
+                    setImportError(`概念重建失败: ${err instanceof Error ? err.message : String(err)}`)
+                  } finally {
+                    setImporting(false)
+                    setTimeout(() => setImportStatus(null), 5000)
+                  }
+                }}
+              >
+                <GitMerge className="mr-1 h-4 w-4" />
+                概念
+              </Button>
             </>
           )}
         </div>
@@ -552,7 +737,7 @@ export function SourcesView() {
         </div>
       )}
 
-      <ScrollArea className="flex-1">
+      <ScrollArea className="flex-1 min-h-0">
         {viewMode === "hierarchy" ? (
           <ServiceHierarchyPanel
             sources={sources}

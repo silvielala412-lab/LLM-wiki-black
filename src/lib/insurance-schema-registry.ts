@@ -511,7 +511,7 @@ export const INSURANCE_SCHEMA_REGISTRY: InsuranceEntitySchemaSpec[] = [
     domain: "service",
     entityType: "service_series",
     universalType: "concept",
-    purpose: "服务知识体系的顶层分类，如"添平安系列"/"享平安系列"。",
+    purpose: "服务知识体系的顶层分类，如『添平安系列』/『享平安系列』。",
     fields: [
       f("series_name", "系列名称", "如：添平安系列、享平安系列。", "critical"),
       f("series_summary", "系列简介", "本系列的整体定位和覆盖范围。", "high_confidence"),
@@ -527,7 +527,7 @@ export const INSURANCE_SCHEMA_REGISTRY: InsuranceEntitySchemaSpec[] = [
     domain: "service",
     entityType: "service_scenario",
     universalType: "concept",
-    purpose: "服务系列下的业务场景分类，如"医健"/"养老"/"家办"。是服务线的上级节点，用于导航型查询。",
+    purpose: "服务系列下的业务场景分类，如『医健』/『养老』/『家办』。是服务线的上级节点，用于导航型查询。",
     fields: [
       f("scenario_name", "场景名称", "如：医健、养老、家办。", "critical"),
       f("series_name", "所属系列", "所属的服务系列名称。", "critical"),
@@ -544,7 +544,7 @@ export const INSURANCE_SCHEMA_REGISTRY: InsuranceEntitySchemaSpec[] = [
     domain: "service",
     entityType: "service_line",
     universalType: "entity",
-    purpose: "场景下的具体服务产品线，如"安有医"/"臻享家医"/"居家养老"。一条服务线可有多个版本。",
+    purpose: "场景下的具体服务产品线，如『安有医』/『臻享家医』/『居家养老』。一条服务线可有多个版本。",
     fields: [
       f("line_name", "服务线名称", "如：安有医、臻享家医、居家养老。", "critical"),
       f("scenario_name", "所属场景", "医健 / 养老 / 家办。", "critical"),
@@ -563,7 +563,7 @@ export const INSURANCE_SCHEMA_REGISTRY: InsuranceEntitySchemaSpec[] = [
     domain: "service",
     entityType: "service_line_version",
     universalType: "entity",
-    purpose: "服务线的具体版本，如"臻享家医 V1"/"安有医 颐享版"。用户上传文件的最小归属单元。包含准入规则、服务体系等完整版本内容。",
+    purpose: "服务线的具体版本，如『臻享家医 V1』/『安有医 颐享版』。用户上传文件的最小归属单元。包含准入规则、服务体系等完整版本内容。",
     fields: [
       f("line_name", "服务线名称", "如：臻享家医、安有医、居家养老。", "critical"),
       f("version_name", "版本名称", "如：V1、颐享版、V2优享。", "critical"),
@@ -600,7 +600,7 @@ export const INSURANCE_SCHEMA_REGISTRY: InsuranceEntitySchemaSpec[] = [
     domain: "service",
     entityType: "service_item",
     universalType: "entity",
-    purpose: "服务线版本下的具体服务项目，是服务知识的最小业务单元。命名规范：{service_line}-{version}-{item_name}，如"臻享家医-V1-在线问诊"。",
+    purpose: "服务线版本下的具体服务项目，是服务知识的最小业务单元。命名规范：{service_line}-{version}-{item_name}，如『臻享家医-V1-在线问诊』。",
     fields: [
       // === DEDUP KEY 三元组（必须 critical）===
       f("line_name", "服务线名称", "如：臻享家医、安有医、居家养老。是 DEDUP_KEY 的一部分。", "critical"),
@@ -1734,20 +1734,61 @@ export function parseServiceItemTitle(
 }
 
 /**
+ * Canonical version name aliases: abbreviated / alternative names → canonical names.
+ * Keyed by lineName → { alias → canonicalVersionName }
+ */
+export const CANONICAL_VERSION_ALIASES: Record<string, Record<string, string>> = {
+  "安有医": {
+    "易核版": "尊享易核版",
+    "尊享易核": "尊享易核版",
+  },
+  "高端康养": {
+    "逸享plus": "逸享PLUS",
+    "逸享Plus": "逸享PLUS",
+  },
+  "居家养老": {
+    "v1优享": "V1优享",
+    "v2优享": "V2优享",
+  },
+}
+
+/**
+ * Resolve a potentially abbreviated/alias version name to its canonical form.
+ * Falls back to the input if no alias is found.
+ */
+export function resolveCanonicalVersionName(lineName: string, versionName: string): string {
+  const lineAliases = CANONICAL_VERSION_ALIASES[lineName]
+  if (lineAliases) {
+    const exact = lineAliases[versionName]
+    if (exact) return exact
+    // Case-insensitive fallback
+    const lower = versionName.toLowerCase()
+    for (const [alias, canonical] of Object.entries(lineAliases)) {
+      if (alias.toLowerCase() === lower) return canonical
+    }
+  }
+  return versionName
+}
+
+/**
  * 在 SERVICE_HIERARCHY 中查找某个服务线版本是否存在。
+ * 支持别名解析（如"易核版" → "尊享易核版"）。
  * 用于 ingest 时快速校验上传路径的合法性。
  */
 export function findServiceLineVersion(
   lineName: string,
   versionName: string,
-): { series: string; scenario: string } | null {
+): { series: string; scenario: string; canonicalVersionName: string } | null {
+  const canonical = resolveCanonicalVersionName(lineName, versionName)
   for (const series of SERVICE_HIERARCHY) {
     for (const scenario of series.scenarios) {
       for (const line of scenario.lines) {
         if (line.lineName === lineName) {
-          const version = line.versions.find(v => v.versionName === versionName)
+          const version = line.versions.find(v =>
+            v.versionName === canonical || v.versionName === versionName
+          )
           if (version) {
-            return { series: series.seriesName, scenario: scenario.scenarioName }
+            return { series: series.seriesName, scenario: scenario.scenarioName, canonicalVersionName: version.versionName }
           }
         }
       }
@@ -1755,3 +1796,27 @@ export function findServiceLineVersion(
   }
   return null
 }
+
+/**
+ * Find a service line by name only (no version required).
+ * Returns all versions for that line, or null if not found.
+ */
+export function findServiceLine(
+  lineName: string,
+): { series: string; scenario: string; versions: string[] } | null {
+  for (const series of SERVICE_HIERARCHY) {
+    for (const scenario of series.scenarios) {
+      for (const line of scenario.lines) {
+        if (line.lineName === lineName) {
+          return {
+            series: series.seriesName,
+            scenario: scenario.scenarioName,
+            versions: line.versions.map(v => v.versionName),
+          }
+        }
+      }
+    }
+  }
+  return null
+}
+

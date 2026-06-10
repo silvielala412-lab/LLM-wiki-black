@@ -197,7 +197,19 @@ export async function uploadFiles(
   // Pass as query param so the backend always gets it before reading the body
   const url = `${API_BASE}/upload/files?dest=${encodeURIComponent(destinationDir)}`
   const res = await fetch(url, { method: "POST", body: fd })
-  if (!res.ok) throw new Error(await res.text())
+  if (!res.ok) {
+    const text = await res.text().catch(() => "")
+    let msg = `HTTP ${res.status}: ${res.statusText}`
+    if (text) {
+      try {
+        const json = JSON.parse(text)
+        msg = json.error ?? json.message ?? text
+      } catch {
+        msg = text
+      }
+    }
+    throw new Error(msg)
+  }
   return res.json()
 }
 

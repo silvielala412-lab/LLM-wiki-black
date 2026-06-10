@@ -270,7 +270,11 @@ function App() {
     // Restore ingest queue (resume interrupted tasks). Keyed by the
     // project's stable UUID so the queue still finds the right project
     // even if the filesystem path changed since the task was enqueued.
-    import("@/lib/ingest-queue").then(({ restoreQueue }) => {
+    // Synchronously mark the project as active in the queue so that
+    // enqueueBatch / enqueueIngest can be called immediately (before the
+    // async restoreQueue finishes reading the disk queue file).
+    import("@/lib/ingest-queue").then(({ activateProject, restoreQueue }) => {
+      activateProject(proj.id, proj.path)
       restoreQueue(proj.id, proj.path).catch((err) =>
         console.error("Failed to restore ingest queue:", err)
       )
