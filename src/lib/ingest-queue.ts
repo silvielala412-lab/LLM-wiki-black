@@ -46,6 +46,8 @@ let sweepAbortController: AbortController | null = null
 /** Accumulates all entity titles written in this drain cycle for the deferred relation pass. */
 let sessionEntityTitles = new Set<string>()
 const PROCESSING_STALE_MS = 30 * 60 * 1000
+/** Heartbeat timer ID — polls processNext every 15s to self-recover from any stuck state. */
+let heartbeatTimer: ReturnType<typeof setInterval> | null = null
 
 // ── Persistence ───────────────────────────────────────────────────────────
 
@@ -351,6 +353,7 @@ export function getQueueSummary(): { pending: number; processing: number; failed
  * disk before clearing memory.
  */
 export function clearQueueState(): void {
+  stopHeartbeat()
   for (const [, ctrl] of abortControllers) ctrl.abort()
   if (sweepAbortController) sweepAbortController.abort()
   queue = []
@@ -375,6 +378,7 @@ export function clearQueueState(): void {
 export async function pauseQueue(): Promise<void> {
   if (!currentProjectId || !currentProjectPath) return
 
+  stopHeartbeat()
   const pausedProjectPath = currentProjectPath
 
   // Abort all running tasks
@@ -423,6 +427,34 @@ export async function pauseQueue(): Promise<void> {
 export function activateProject(projectId: string, projectPath: string): void {
   currentProjectId = projectId
   currentProjectPath = normalizePath(projectPath)
+  startHeartbeat()
+}
+
+/**
+ * Poll processNext every 15 s so the queue self-recovers from any unexpected
+ * stuck state (e.g. an unhandled rejection that prevents the normal cascade).
+ */
+function startHeartbeat(): void {
+  if (heartbeatTimer !== null) return          // already running
+  heartbeatTimer = setInterval(() => {
+    if (!currentProjectId) return
+    const hasPending = queue.some((t) => t.status === "pending")
+    const hasProcessing = queue.some((t) => t.status === "processing")
+    if (hasPending && activeCount === 0) {
+      log.warn("heartbeat: queue stalled, restarting", { pending: queue.filter(t => t.status==="pending").length })
+      processNext(currentProjectId)
+    } else if (!hasPending && !hasProcessing) {
+      // Nothing left — stop beating to avoid wasting resources
+      stopHeartbeat()
+    }
+  }, 15_000)
+}
+
+function stopHeartbeat(): void {
+  if (heartbeatTimer !== null) {
+    clearInterval(heartbeatTimer)
+    heartbeatTimer = null
+  }
 }
 
 export async function restoreQueue(
@@ -500,16 +532,19 @@ function startProcessingWatchdog(projectId: string, taskId: string, startedAt: n
     const ageMs = Date.now() - startedAt
     if (ageMs < PROCESSING_STALE_MS) return
 
-    if (currentAbortController) {
-      currentAbortController.abort()
-      currentAbortController = null
+    // Abort via per-task controller map (replaces old single-controller pattern)
+    const ctrl = abortControllers.get(taskId)
+    if (ctrl) {
+      ctrl.abort()
+      abortControllers.delete(taskId)
     }
 
     task.status = "pending"
+    task.startedAt = undefined
     task.error = `Processing timed out after ${Math.round(PROCESSING_STALE_MS / 60000)} minutes; requeued automatically`
-    processing = false
-    lastWrittenFiles = []
+    activeCount = Math.max(0, activeCount - 1)
 
+    log.warn("watchdog: task timed out, requeued", { file: task.sourcePath, ageMs })
     saveQueue(projectPath)
       .catch(() => {})
       .finally(() => processNext(projectId))
@@ -682,7 +717,7 @@ async function processNext(projectId: string): Promise<void> {
         log.warn("retry", { file: next.sourcePath, error: message, retry: next.retryCount, max: MAX_RETRIES, delayMs: retryDelayMs(message, next.retryCount) })
       }
 
-      await saveQueue(pp)
+      await saveQueue(pp).catch((e) => log.warn("saveQueue failed in catch", { error: String(e) }))
     } finally {
       activeCount = Math.max(0, activeCount - 1)
       if (delayBeforeNextMs > 0) {
