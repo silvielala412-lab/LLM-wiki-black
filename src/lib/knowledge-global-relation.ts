@@ -247,12 +247,9 @@ export function generateCandidatePairs(
   catalog: EntityEntry[],
   newEntityTitles?: ReadonlySet<string>,
 ): CandidatePair[] {
-  // Only consider entity types that have lateral relations
-  // Added service_item to the list (new hierarchical entity type)
-  const candidates = catalog.filter(e =>
-    ["service_benefit", "service_item", "product", "persona", "pitch", "process"].includes(e.entityType) ||
-    e.entityType === ""
-  )
+  // Exclude only source/query/synthesis types that don't have lateral relations
+  const LATERAL_EXCLUDE = new Set(["source", "query", "synthesis", "compliance_rule", "regulatory_doc"])
+  const candidates = catalog.filter(e => !LATERAL_EXCLUDE.has(e.entityType))
 
 
   const seen = new Set<string>()
