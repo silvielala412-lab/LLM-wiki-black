@@ -179,36 +179,83 @@ export async function buildServiceConceptIndex(projectPath: string): Promise<{
 }
 
 /**
- * Update a single entity's frontmatter to add `instance_of` relation
- * pointing to its concept page.
+ * Back-fill the `related: [...]` frontmatter field of every service_item entity
+ * with its cross-version siblings.
+ *
+ * For entity "安有医_惠享版_重疾定义说明", siblings are all other instances of
+ * the same concept name ("安有医_颐享版_重疾定义说明", etc.).
+ *
+ * This is a rule-based serial pass — no LLM required.
  */
-export async function injectInstanceOfRelation(
-  projectPath: string,
-  entityRelPath: string,
-  conceptName: string,
-): Promise<void> {
+export async function backfillEntityRelated(projectPath: string): Promise<{
+  updated: number
+  skipped: number
+}> {
   const pp = normalizePath(projectPath)
-  const fullPath = `${pp}/${entityRelPath}`
+  const conceptMap = await scanServiceItemConcepts(projectPath)
 
-  try {
-    let content = await readFile(fullPath)
-    // Skip if already has instance_of for this concept
-    if (content.includes(`instance_of: "${conceptName}"`) || content.includes(`instance_of: ${conceptName}`)) return
+  let updated = 0
+  let skipped = 0
 
-    // Inject into frontmatter relations section
-    content = content.replace(
-      /^(relations:\s*\[)(\s*\])/m,
-      `relations:\n  - type: instance_of\n    target: "wiki/concepts/${conceptName}.md"\n    label: "${conceptName}"`
-    )
-    if (!content.includes(`instance_of`)) {
-      // No relations array found — add after frontmatter tags
-      content = content.replace(
-        /^(tags:.*$)/m,
-        `$1\ninstance_of: "${conceptName}"`
-      )
+  for (const [, instances] of conceptMap) {
+    if (instances.length < 2) continue
+
+    const allTitles = instances.map(i => i.title)
+
+    for (const inst of instances) {
+      const siblings = allTitles.filter(t => t !== inst.title)
+      if (siblings.length === 0) { skipped++; continue }
+
+      const fullPath = `${pp}/${inst.entityRelPath}`
+      try {
+        const content = await readFile(fullPath)
+
+        // Build new related array (merge existing + siblings, deduplicate)
+        const existingMatch = content.match(/^related:\s*\[([^\]]*)\]/m)
+        const existing: string[] = existingMatch
+          ? existingMatch[1].split(",").map(s => s.trim().replace(/^["']|["']$/g, "")).filter(Boolean)
+          : []
+        const merged = Array.from(new Set([...existing, ...siblings]))
+        const newRelatedLine = `related: [${merged.map(t => `"${t}"`).join(", ")}]`
+
+        // Replace related line
+        const newContent = existingMatch
+          ? content.replace(/^related:\s*\[([^\]]*)\]/m, newRelatedLine)
+          : content.replace(/^(---\r?\n[\s\S]*?)(related:\s*\n)/m, (_, pre) => `${pre}${newRelatedLine}\n`)
+
+        if (newContent === content) { skipped++; continue }
+
+        await writeFile(fullPath, newContent)
+        updated++
+      } catch {
+        skipped++
+      }
     }
-    await writeFile(fullPath, content)
-  } catch {
-    // Non-critical — skip
+  }
+
+  return { updated, skipped }
+}
+
+/**
+ * Combined concept aggregation pass:
+ * 1. Build/update concept pages in wiki/concepts/
+ * 2. Back-fill each entity's `related` field with cross-version siblings
+ *
+ * Call this after a batch ingestion completes (onQueueDrained).
+ * No LLM required — purely rule-based title matching.
+ */
+export async function runConceptAggregator(projectPath: string): Promise<{
+  conceptsCreated: number
+  conceptsUpdated: number
+  entitiesUpdated: number
+}> {
+  const [conceptResult, relatedResult] = await Promise.all([
+    buildServiceConceptIndex(projectPath),
+    backfillEntityRelated(projectPath),
+  ])
+  return {
+    conceptsCreated: conceptResult.created,
+    conceptsUpdated: conceptResult.updated,
+    entitiesUpdated: relatedResult.updated,
   }
 }

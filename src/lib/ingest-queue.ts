@@ -557,7 +557,21 @@ async function onQueueDrained(projectId: string, projectPath: string): Promise<v
   if (currentProjectId !== projectId) return
   processedSinceDrain = false
 
-  // ── Deferred relation pass ───────────────────────────────────────────────
+  // ── Step 1: Concept aggregator (rule-based, no LLM) ─────────────────────
+  // Runs FIRST so that entity related fields are populated immediately,
+  // without waiting for the LLM relation pass. Groups service_item entities
+  // by concept name and back-fills sibling titles into each entity's `related`.
+  try {
+    const { runConceptAggregator } = await import("@/lib/concept-aggregator")
+    const caResult = await runConceptAggregator(projectPath)
+    if (caResult.conceptsCreated + caResult.conceptsUpdated + caResult.entitiesUpdated > 0) {
+      log.info("drain: concept aggregator done", caResult)
+    }
+  } catch (err) {
+    log.warn("drain: concept aggregator failed", { error: err instanceof Error ? err.message : String(err) })
+  }
+
+  // ── Step 2: Deferred LLM relation pass ───────────────────────────────────
   // Run once after all files are extracted, passing all entity titles written
   // during this drain cycle. Much more efficient than per-file passes.
   const titlesForPass = new Set(sessionEntityTitles)

@@ -30,24 +30,34 @@ export function AboutSection() {
     // Normalize path: replace Windows backslashes with forward slashes
     const normPath = project.path.replace(/\\/g, "/")
     try {
+      const { runConceptAggregator } = await import("@/lib/concept-aggregator")
+      setRebuildResult("Step 1/2: 概念聚合（规则匹配，无需 LLM）...")
+      const caResult = await runConceptAggregator(normPath)
+      setRebuildResult(
+        `Step 1 完成：新建概念页 ${caResult.conceptsCreated}，更新 ${caResult.conceptsUpdated}，` +
+        `实体 related 写入 ${caResult.entitiesUpdated} 条。Step 2/2: 扫描实体目录...`
+      )
+
       const { runGlobalRelationPass, buildEntityCatalog } = await import("@/lib/knowledge-global-relation")
-      setRebuildResult("正在扫描实体目录...")
       const catalog = await buildEntityCatalog(normPath)
       if (catalog.length === 0) {
-        setRebuildState("error")
-        setRebuildResult(`未找到实体文件（path: ${normPath}）`)
+        setRebuildState(caResult.entitiesUpdated > 0 ? "done" : "error")
+        setRebuildResult(
+          `Step 1 已完成，但未找到实体文件供 LLM 分析（path: ${normPath}）。` +
+          (caResult.entitiesUpdated > 0 ? "请刷新页面查看关联概念。" : "")
+        )
         return
       }
-      setRebuildResult(`已扫描到 ${catalog.length} 个实体，正在 LLM 批量判断关系（可能需要数分钟）...`)
-      const result = await runGlobalRelationPass(normPath, llmConfig, rebuildAbortRef.current.signal)
+      setRebuildResult(`Step 2/2: 已扫描 ${catalog.length} 个实体，正在 LLM 批量判断关系...`)
+      const result = await runGlobalRelationPass(normPath, llmConfig, rebuildAbortRef.current!.signal)
       if (rebuildAbortRef.current?.signal.aborted) { setRebuildState("idle"); setRebuildResult("已取消"); return }
-      setRebuildState(result.written > 0 ? "done" : "error")
+      setRebuildState("done")
       setRebuildResult(
-        `扫描 ${result.catalogSize} 实体，生成 ${result.candidatePairs} 候选对，` +
-        `写入 ${result.written} 条关系边，` +
-        `待审核 ${result.queued}，舍弃 ${result.discarded}` +
-        (result.errors.length > 0 ? `，${result.errors.length} 个错误` : "") +
-        (result.written === 0 ? "（置信度均低于阈值，建议检查 LLM 配置）" : "，请刷新页面查看关联概念")
+        `完成！概念页 +${caResult.conceptsCreated}/~${caResult.conceptsUpdated}，` +
+        `实体 related 写入 ${caResult.entitiesUpdated} 条，` +
+        `LLM 关系边写入 ${result.written} 条，舍弃 ${result.discarded}` +
+        (result.errors.length > 0 ? `，${result.errors.length} 错误` : "") +
+        "。请刷新页面查看关联概念。"
       )
     } catch (err) {
       setRebuildState("error")
