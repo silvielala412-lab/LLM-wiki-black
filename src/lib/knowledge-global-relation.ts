@@ -39,6 +39,7 @@ import { listDirectory, readFile, writeFile } from "@/commands/fs"
 import type { LlmConfig } from "@/stores/wiki-store"
 import { streamChat } from "@/lib/llm-client"
 import { getLogger } from "@/lib/logger"
+import { normalizePath } from "@/lib/path-utils"
 
 const log = getLogger("global-relation-pass")
 
@@ -133,39 +134,58 @@ const BATCH_SIZE = 20           // candidate pairs per LLM call
 
 // ─── Phase 1: Build Entity Catalog ───────────────────────────────────────────
 
-export async function buildEntityCatalog(projectPath: string): Promise<EntityEntry[]> {
-  const catalog: EntityEntry[] = []
+/** FileNode shape returned by the Rust /fs/list endpoint. */
+interface FileNode {
+  name: string
+  path: string
+  is_dir: boolean
+  children?: FileNode[]
+}
 
-  const dirs = [
-    `${projectPath}/wiki/entities`,
-    `${projectPath}/wiki/concepts`,
-  ]
-
-  /** Recursively collect all .md files (supports hierarchy subdirectories). */
-  async function scanDir(dir: string): Promise<void> {
-    let files: { name: string; path?: string; is_dir?: boolean }[] = []
-    try { files = await listDirectory(dir) } catch { return }
-
-    for (const file of files) {
-      if (file.is_dir) {
-        // Recurse into line/version subdirectories
-        const subPath = file.path ?? `${dir}/${file.name}`
-        await scanDir(subPath)
-      } else if (file.name.endsWith(".md") && !file.name.endsWith(".md.md")) {
-        const filePath = file.path ?? `${dir}/${file.name}`
-        try {
-          const content = await readFile(filePath)
-          const entry = parseEntityEntry(content, filePath)
-          if (entry) catalog.push(entry)
-        } catch {
-          // skip unreadable files
-        }
-      }
+/**
+ * Flatten the recursive FileNode tree into a flat list of .md file paths.
+ * The Rust backend returns a COMPLETE tree in one call — no need for recursive listDirectory.
+ */
+function flattenMdPaths(nodes: FileNode[]): string[] {
+  const paths: string[] = []
+  for (const n of nodes) {
+    if (n.is_dir && n.children) {
+      paths.push(...flattenMdPaths(n.children))
+    } else if (!n.is_dir && n.name.endsWith(".md") && !n.name.endsWith(".md.md")) {
+      paths.push(n.path)
     }
   }
+  return paths
+}
+
+export async function buildEntityCatalog(projectPath: string): Promise<EntityEntry[]> {
+  const catalog: EntityEntry[] = []
+  const pp = normalizePath(projectPath)
+
+  const dirs = [
+    `${pp}/wiki/entities`,
+    `${pp}/wiki/concepts`,
+  ]
 
   for (const dir of dirs) {
-    await scanDir(dir)
+    let nodes: FileNode[] = []
+    try {
+      nodes = (await listDirectory(dir)) as FileNode[]
+    } catch {
+      // directory may not exist — skip silently
+      continue
+    }
+
+    const mdPaths = flattenMdPaths(nodes)
+    for (const filePath of mdPaths) {
+      try {
+        const content = await readFile(filePath)
+        const entry = parseEntityEntry(content, filePath)
+        if (entry) catalog.push(entry)
+      } catch {
+        // skip unreadable files
+      }
+    }
   }
 
   return catalog
