@@ -38,6 +38,9 @@
 import { listDirectory, readFile, writeFile } from "@/commands/fs"
 import type { LlmConfig } from "@/stores/wiki-store"
 import { streamChat } from "@/lib/llm-client"
+import { getLogger } from "@/lib/logger"
+
+const log = getLogger("global-relation-pass")
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -653,7 +656,18 @@ export async function runGlobalRelationPass(
   // Phase 2 — only generate pairs involving new entities (if provided)
   // This prevents the exponential re-processing of already-judged pairs on
   // every subsequent ingest call, which was the primary cause of duplicate edges.
-  const candidatePairs = generateCandidatePairs(catalog, options?.newEntityTitles)
+  let candidatePairs = generateCandidatePairs(catalog, options?.newEntityTitles)
+
+  // If the incremental filter produced 0 candidates (e.g. newEntityTitles are
+  // filename stems that don't match frontmatter titles, or knowledge_domain
+  // mismatch), automatically fall back to a full pass.  This handles the
+  // common case where entities were ingested before the queue fix and have
+  // never had their relations built.
+  if (candidatePairs.length === 0 && options?.newEntityTitles && options.newEntityTitles.size > 0) {
+    log.info("incremental pass: 0 candidates — falling back to full pass", { catalogSize: catalog.length })
+    candidatePairs = generateCandidatePairs(catalog, undefined)
+  }
+
   if (candidatePairs.length === 0) {
     return { catalogSize: catalog.length, candidatePairs: 0, llmCallCount: 0, written: 0, queued: 0, discarded: 0, errors }
   }
@@ -673,7 +687,7 @@ export async function runGlobalRelationPass(
   const { written, queued, discarded, errors: applyErrors } = await applyRelationJudgments(judgments, catalogMap)
   errors.push(...applyErrors)
 
-  console.log(`[global-relation-pass] catalog=${catalog.length} pairs=${candidatePairs.length} calls=${llmCallCount} written=${written} queued=${queued} discarded=${discarded}`)
+  log.info("pass complete", { catalog: catalog.length, pairs: candidatePairs.length, calls: llmCallCount, written, queued, discarded })
 
   return { catalogSize: catalog.length, candidatePairs: candidatePairs.length, llmCallCount, written, queued, discarded, errors }
 }

@@ -1,16 +1,55 @@
-import { useEffect, useState, useCallback } from "react"
-import { Download, RefreshCw, CheckCircle2, Sparkles } from "lucide-react"
+import { useEffect, useState, useCallback, useRef } from "react"
+import { Download, RefreshCw, CheckCircle2, Sparkles, Network } from "lucide-react"
 import { useTranslation } from "react-i18next"
 import { clipServerStatus } from "@/commands/fs"
 import { Button } from "@/components/ui/button"
 import { useUpdateStore, hasAvailableUpdate } from "@/stores/update-store"
 import { checkForUpdates, toLatestReleaseUrl } from "@/lib/update-check"
 import { saveUpdateCheckState } from "@/lib/project-store"
+import { useWikiStore } from "@/stores/wiki-store"
 
 export function AboutSection() {
   const { t } = useTranslation()
   const [clipStatus, setClipStatus] = useState<string>("...")
   const updateStore = useUpdateStore()
+  const project = useWikiStore(s => s.project)
+  const llmConfig = useWikiStore(s => s.llmConfig)
+
+  // ── Rebuild relations state ──
+  type RebuildState = "idle" | "running" | "done" | "error"
+  const [rebuildState, setRebuildState] = useState<RebuildState>("idle")
+  const [rebuildResult, setRebuildResult] = useState<string>("")
+  const rebuildAbortRef = useRef<AbortController | null>(null)
+
+  const handleRebuildRelations = useCallback(async () => {
+    if (!project?.path) { setRebuildResult("未打开项目"); return }
+    const canLlm = !!(llmConfig.apiKey || llmConfig.provider === "ollama" || llmConfig.provider === "custom")
+    if (!canLlm) { setRebuildResult("LLM 未配置，请先在设置中填写 API Key"); setRebuildState("error"); return }
+    setRebuildState("running")
+    setRebuildResult("正在扫描实体目录...")
+    rebuildAbortRef.current = new AbortController()
+    try {
+      const { runGlobalRelationPass } = await import("@/lib/knowledge-global-relation")
+      setRebuildResult("正在进行全量关系推断（LLM 批量判断中，可能需要数分钟）...")
+      // No newEntityTitles → full pass on ALL entities
+      const result = await runGlobalRelationPass(project.path, llmConfig, rebuildAbortRef.current.signal)
+      if (rebuildAbortRef.current?.signal.aborted) { setRebuildState("idle"); setRebuildResult("已取消"); return }
+      setRebuildState("done")
+      setRebuildResult(
+        `完成！扫描 ${result.catalogSize} 个实体，生成 ${result.candidatePairs} 候选对，` +
+        `写入 ${result.written} 条关系边` + (result.errors.length > 0 ? `，${result.errors.length} 个错误` : "")
+      )
+    } catch (err) {
+      setRebuildState("error")
+      setRebuildResult(`失败: ${err instanceof Error ? err.message : String(err)}`)
+    } finally { rebuildAbortRef.current = null }
+  }, [project?.path, llmConfig])
+
+  const handleCancelRebuild = useCallback(() => {
+    rebuildAbortRef.current?.abort()
+    setRebuildState("idle")
+    setRebuildResult("")
+  }, [])
 
   useEffect(() => {
     let alive = true
@@ -105,6 +144,44 @@ export function AboutSection() {
             <span className={`text-sm ${r.mono ? "font-mono" : ""}`}>{r.value}</span>
           </div>
         ))}
+      </div>
+
+      {/* ── Knowledge maintenance card ────────────────────────────── */}
+      <div className="space-y-3 rounded-md border p-4">
+        <div className="flex items-center justify-between gap-3">
+          <div className="min-w-0">
+            <div className="text-sm font-medium flex items-center gap-2">
+              <Network className="h-4 w-4 text-blue-500" />
+              全量重建关系图谱
+            </div>
+            <div className="mt-0.5 text-xs text-muted-foreground">
+              对当前项目所有实体重新推断关联概念（跨文档语义关系）。
+              若上传文件后"关联概念"为空，可在队列跑完后点击此按钮。
+            </div>
+          </div>
+          {rebuildState === "running" ? (
+            <Button variant="outline" size="sm" onClick={handleCancelRebuild}
+              className="shrink-0 gap-1.5 text-red-600 border-red-300">
+              取消
+            </Button>
+          ) : (
+            <Button variant="outline" size="sm" onClick={handleRebuildRelations}
+              disabled={!project?.path || rebuildState === "running"}
+              className="shrink-0 gap-1.5">
+              <RefreshCw className={`h-3.5 w-3.5 ${rebuildState === "running" ? "animate-spin" : ""}`} />
+              {rebuildState === "running" ? "推断中..." : "立即重建"}
+            </Button>
+          )}
+        </div>
+        {rebuildResult && (
+          <div className={`text-xs rounded px-3 py-2 ${
+            rebuildState === "error" ? "bg-red-50 text-red-700 border border-red-200" :
+            rebuildState === "done"  ? "bg-emerald-50 text-emerald-700 border border-emerald-200" :
+                                       "bg-blue-50 text-blue-700 border border-blue-200"
+          }`}>
+            {rebuildResult}
+          </div>
+        )}
       </div>
 
       {/* ── Update check card ──────────────────────────────────── */}
