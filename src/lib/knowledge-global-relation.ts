@@ -127,8 +127,8 @@ const VOCAB_CLUSTERS: string[][] = [
   ["导医", "就医", "医疗"],
 ]
 
-const WRITE_THRESHOLD = 0.82    // write directly to relation_edges
-const QUEUE_THRESHOLD = 0.65    // enter review queue
+const WRITE_THRESHOLD = 0.65    // write directly to relation_edges (lowered: entities lack structural fields)
+const QUEUE_THRESHOLD = 0.50    // enter review queue
 const BATCH_SIZE = 20           // candidate pairs per LLM call
 
 // ─── Phase 1: Build Entity Catalog ───────────────────────────────────────────
