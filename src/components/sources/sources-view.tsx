@@ -144,9 +144,13 @@ export function SourcesView() {
             folderContext: `${lineName} > ${versionName}`,
           }))
           log.info("enqueue batch", { project: project.id, count: tasks.length, context: `${lineName}>${versionName}` })
-          enqueueBatch(project.id, tasks).catch((err) =>
-            log.error("enqueue batch failed", { error: err instanceof Error ? err.message : String(err) })
-          )
+          enqueueBatch(project.id, tasks).catch((err) => {
+            const msg = err instanceof Error ? err.message : String(err)
+            log.error("enqueue batch failed", { error: msg })
+            setImportError(`⚠️ 排队失败: ${msg}（请刷新页面后重试）`)
+          })
+        } else if (!canIngest) {
+          setImportError("⚠️ LLM 未配置，文件已上传但无法自动解析。请在设置中配置 API Key 后手动触发解析。")
         }
         setTimeout(() => setImportStatus(null), 5000)
       } catch (err) {
@@ -199,9 +203,13 @@ export function SourcesView() {
             folderContext: "",
           }))
           log.info("enqueue batch", { project: project.id, count: tasks.length })
-          enqueueBatch(project.id, tasks).catch((err) =>
-            log.error("enqueue batch failed", { error: err instanceof Error ? err.message : String(err) })
-          )
+          enqueueBatch(project.id, tasks).catch((err) => {
+            const msg = err instanceof Error ? err.message : String(err)
+            log.error("enqueue batch failed", { error: msg })
+            setImportError(`⚠️ 排队失败: ${msg}（请刷新页面后重试）`)
+          })
+        } else if (!canIngest) {
+          setImportError("⚠️ LLM 未配置，文件已上传但无法自动解析。请在设置中配置 API Key 后手动触发解析。")
         }
         setTimeout(() => setImportStatus(null), 4000)
       } catch (err) {
@@ -402,7 +410,15 @@ export function SourcesView() {
       if (canIngest && allImportedTasks.length > 0) {
         setImportStatus(`正在排队解析 ${allImportedTasks.length} 个文件...`)
         log.info("enqueue batch", { project: project.id, count: allImportedTasks.length })
-        enqueueBatch(project.id, allImportedTasks).catch(err => console.error("enqueueBatch failed:", err))
+        enqueueBatch(project.id, allImportedTasks).catch((err) => {
+          const msg = err instanceof Error ? err.message : String(err)
+          log.error("enqueue batch failed", { error: msg })
+          setImportError(`⚠️ 排队失败: ${msg}（请刷新页面后重试）`)
+        })
+      } else if (!canIngest) {
+        setImportError("⚠️ LLM 未配置，文件已上传但无法自动解析。请在设置中配置 API Key 或刷新页面后重试。")
+      } else if (allImportedTasks.length === 0) {
+        setImportError("⚠️ 无文件成功上传，请检查文件格式或服务器连接。")
       }
       setTimeout(() => setImportStatus(null), 6000)
     } catch (err) {
