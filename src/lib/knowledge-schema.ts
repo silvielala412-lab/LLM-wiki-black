@@ -5,6 +5,7 @@ export type KnowledgeIndustry = string
 
 export type InsuranceKnowledgeDomain =
   | "product"
+  | "product_catalog"    // 险种/产品库（独立于服务权益的保险产品结构化知识）
   | "customer"
   | "method"
   | "content"
@@ -220,6 +221,7 @@ export interface UniversalKnowledgeEntity {
 
 export const DOMAIN_LABELS: Record<string, string> = {
   product: "产品域",
+  product_catalog: "险种产品库",  // 新域：险种产品结构化知识
   customer: "客户画像域",
   method: "销售方法域",
   content: "销售内容域",
@@ -236,6 +238,11 @@ export const INSURANCE_ENTITY_TYPE_DOMAIN: Record<string, InsuranceKnowledgeDoma
   selling_point: "product",
   service_benefit: "product",
   coverage_rule: "product",
+  // ── product_catalog domain (险种产品库) ─────────────────────────────────
+  product_overview: "product_catalog",    // 险种总览（产品名称、保障责任摘要）
+  product_comparison: "product_catalog",  // 产品横向对比
+  rate_table: "product_catalog",          // 费率表
+  // ─────────────────────────────────────────────────────────────────────────
   persona: "customer",
   customer_persona: "customer",
   life_stage: "customer",
@@ -277,6 +284,11 @@ export const ENTITY_TYPE_TO_UNIVERSAL_TYPE: Record<string, UniversalEntityType> 
   selling_point: "concept",
   service_benefit: "entity",
   coverage_rule: "rule",
+  // product_catalog domain
+  product_overview: "entity",
+  product_comparison: "comparison",
+  rate_table: "data",
+  // customer domain
   persona: "entity",
   customer_persona: "entity",
   life_stage: "event",
@@ -472,7 +484,7 @@ export const UNIVERSAL_INSURANCE_SCHEMA_PROMPT = [
   "```yaml",
   "schema_version: \"2.1\"",
   "industry: insurance",
-  "knowledge_domain: product | customer | method | content | activity | cases | compliance | general",
+  "knowledge_domain: product | product_catalog | customer | method | content | activity | cases | compliance | general",
   "taxonomy_path: []  # path from the top insurance domain to the fine-grained subdomain, e.g. [product, service_benefit, family_doctor]",
   "type: concept | entity | event | process | rule | data | comparison | timeline | case | source",
   "entity_type: business-specific subtype, e.g. product_clause | service_benefit | persona | customer_signal | selling_scenario | pitch | objection_handling",

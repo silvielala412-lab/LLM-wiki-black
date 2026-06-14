@@ -335,6 +335,9 @@ interface PreparedIngestSource {
 
 type SchemaCandidateKind =
   | "product"
+  | "product_overview"    // product_catalog domain: 险种总览
+  | "product_comparison"  // product_catalog domain: 产品横向对比
+  | "rate_table"          // product_catalog domain: 费率表
   | "service_benefit"
   | "coverage_rule"
   | "process"
@@ -382,6 +385,9 @@ type DocumentIntentDocType =
   | "product_terms"
   | "product_manual"
   | "product_access_list"
+  | "product_catalog"          // product_catalog domain: 险种介绍/产品简介
+  | "rate_table"               // product_catalog domain: 费率表
+  | "product_comparison"       // product_catalog domain: 多产品对比
   | "sales_script"
   | "customer_persona"
   | "case_study"
@@ -681,6 +687,84 @@ function recognizeDocumentIntent(sourceContent: string): DocumentIntent {
   const signals = detectSchemaCandidateSignals(sourceContent)
   const serviceItems = estimateServiceTableItemCount(sourceContent)
   const productRows = estimateTableLikeRowCount(sourceContent)
+
+  // ── product_catalog domain: 险种/产品库识别 (优先于 product domain) ───────────
+  // 识别信号：费率表关键词 OR 险种大类关键词 + 产品代码/备案号 (且不是服务手册)
+  const hasRateTableSignal = hasAny(sourceContent, [
+    "费率表", "每万元", "年缴保费", "月缴保费", "保费示例", "保费参考",
+    "费率", "缴费率", "基本保费",
+  ])
+  const hasProductCategoryKeyword = hasAny(sourceContent, [
+    "重疾险", "医疗险", "年金险", "终身寿险", "定期寿险", "意外险",
+    "教育金", "养老金", "护理险", "失能险",
+  ])
+  const hasProductCodeSignal = hasAny(sourceContent, [
+    "产品代码", "险种代码", "主险代码",
+    "监管备案", "备案号", "保单号",
+    "保险责任", "责任免除", "投保年龄", "保障期间",
+  ])
+  const hasProductComparisonSignal = hasAny(sourceContent, [
+    "产品对比", "险种对比", "方案对比", "对比表", "横向对比",
+    "A产品", "B产品", "产品A", "产品B",
+  ])
+  const isNotServiceManual = !hasAny(sourceContent, [
+    "服务手册", "服务次数", "预约", "陪诊", "家庭医生服务",
+  ])
+
+  if (hasRateTableSignal && isNotServiceManual) {
+    return {
+      docType: "rate_table",
+      primaryDomain: "product_catalog",
+      secondaryDomains: ["product", "compliance"],
+      splitStrategy: "by_section",
+      estimatedItemCount: productRows,
+      targetSchemaKeys: ["insurance.product_catalog.RateTable", "insurance.product_catalog.ProductOverview"],
+      coverageUnit: "section",
+      boundaryHints: {
+        headingPatterns: ["^#{1,6}\\s+", "^第[一二三四五六七八九十0-9]+"],
+        tableHeaders: ["年龄", "性别", "保额", "年缴保费", "月缴保费", "费率"],
+        itemColumnNames: ["年龄", "保额", "保费"],
+        rulePatterns: ["备注", "说明", "注"],
+      },
+    }
+  }
+
+  if (hasProductComparisonSignal && isNotServiceManual) {
+    return {
+      docType: "product_comparison",
+      primaryDomain: "product_catalog",
+      secondaryDomains: ["product", "compliance", "customer"],
+      splitStrategy: "by_section",
+      estimatedItemCount: 0,
+      targetSchemaKeys: ["insurance.product_catalog.ProductComparison", "insurance.product_catalog.ProductOverview"],
+      coverageUnit: "section",
+      boundaryHints: {
+        headingPatterns: ["^#{1,6}\\s+", "^对比", "^方案"],
+        tableHeaders: ["产品名称", "产品代码", "保障责任", "费率", "健康告知"],
+        itemColumnNames: ["产品", "方案", "险种"],
+        rulePatterns: ["免责", "不承诺", "不保证", "仅供参考"],
+      },
+    }
+  }
+
+  if ((hasProductCategoryKeyword && hasProductCodeSignal) && isNotServiceManual) {
+    return {
+      docType: "product_catalog",
+      primaryDomain: "product_catalog",
+      secondaryDomains: ["product", "compliance"],
+      splitStrategy: "by_section",
+      estimatedItemCount: 0,
+      targetSchemaKeys: ["insurance.product_catalog.ProductOverview", "insurance.product_catalog.RateTable"],
+      coverageUnit: "section",
+      boundaryHints: {
+        headingPatterns: ["^#{1,6}\\s+", "^第[一二三四五六七八九十0-9]+条", "^第[一二三四五六七八九十0-9]+章"],
+        tableHeaders: ["保险责任", "责任免除", "等待期", "投保年龄", "产品代码"],
+        itemColumnNames: ["险种", "产品", "责任"],
+        rulePatterns: ["保险责任", "责任免除", "等待期", "缴费期间", "保障期间"],
+      },
+    }
+  }
+  // ─────────────────────────────────────────────────────────────────────────────
 
   if (signals.caseStudy && !signals.productAccessList) {
     return {

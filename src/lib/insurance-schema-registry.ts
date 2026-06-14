@@ -12,9 +12,9 @@ export interface InsuranceFieldSpec {
 export interface InsuranceEntitySchemaSpec {
   schemaKey: string
   label: string
-  domain: "product" | "customer" | "method" | "content" | "activity" | "cases" | "compliance" | "service"
+  domain: "product" | "product_catalog" | "customer" | "method" | "content" | "activity" | "cases" | "compliance" | "service"
   entityType: string
-  universalType: "concept" | "entity" | "event" | "process" | "rule" | "data" | "case" | "source"
+  universalType: "concept" | "entity" | "event" | "process" | "rule" | "data" | "comparison" | "case" | "source"
   purpose: string
   fields: InsuranceFieldSpec[]
   relationHints: string[]
@@ -1819,4 +1819,117 @@ export function findServiceLine(
   }
   return null
 }
+
+// ─── product_catalog domain (险种产品库) ────────────────────────────────────────
+//
+// 定位：独立于 product domain 的服务权益知识，专门管理险种结构化产品知识。
+// 典型文档：险种简介、费率表、多产品对比表。
+// 路径规范：wiki/product_catalog/
+//
+// 插拔控制：在 recognizeDocumentIntent() 里通过 PRODUCT_CATALOG_KEYWORDS 开关整个 domain。
+
+export const PRODUCT_CATALOG_SCHEMA: InsuranceEntitySchemaSpec[] = [
+  {
+    schemaKey: "insurance.product_catalog.ProductOverview",
+    label: "险种总览",
+    domain: "product_catalog",
+    entityType: "product_overview",
+    universalType: "entity",
+    purpose: "单个险种的结构化知识页，职责和服务权益不同：不写服务次数、不写服务提供方，尽量表达险种层面的产品代码、保障责任、费率表、健康告知、投保要求等核心信息。",
+    fields: [
+      f("product_code", "产品代码", "官方产品代码，是 dedup_key 的首选基天。", "critical"),
+      f("product_name", "官方完整名称", "官方条款或说明书中的完整名称。", "critical"),
+      f("product_category", "产品大类", "重疾/医疗/年金/终身寿/定期寿/意外/教育金/养老金等。", "critical"),
+      f("product_status", "业务状态", "在售/即将停售/已停售/调整中。", "critical"),
+      f("effective_date", "上线日期", "官方生效或上线日期。", "critical"),
+      f("core_responsibilities", "核心保险责任", "结构化列出责任名称、触发条件、给付比例/金额。", "critical"),
+      f("exclusions_official", "责任免除", "结构化列出官方免责条款。", "critical"),
+      f("regulatory_filing_no", "监管备案号", "合规必备；缺失进入 knowledge_gaps。", "critical"),
+      f("target_age_range", "投保年龄范围", "例如 18-55 周岁。", "high_confidence"),
+      f("waiting_period_days", "等待期天数", "数字字段，能抽数字就抽数字。", "high_confidence"),
+      f("payment_period_options", "交费期选项", "趸交/3年/5年/10年/20年/30年/终身等。", "high_confidence"),
+      f("coverage_period_options", "保障期选项", "例如终身、至70岁。", "high_confidence"),
+      f("premium_calculation_basis", "费率基础", "性别费率/统一费率/职业类别等。", "high_confidence"),
+      f("claim_settlement_logic", "理赔触发逻辑", "确诊、达到状态、实施手术等触发条件。", "high_confidence"),
+      f("underwriting_basics", "核保基本要求", "健康告知、财务核保门槛、职业限制。", "high_confidence"),
+      f("product_alias", "别名/俗称", "客户或代理人常用叫法。", "recommended"),
+      f("related_service_packages", "关联服务权益包", "用 product domain 的 ServiceBenefit 关系表达。", "recommended"),
+      f("product_documents", "产品文档路径", "条款、说明书、费率表来源路径。", "recommended"),
+    ],
+    relationHints: [
+      "Customer.Persona 用 recommended_for",
+      "product_catalog.RateTable 用 has_part",
+      "product_catalog.ProductComparison 用 applies_to",
+      "product.ServiceBenefit 用 bundled_with",
+      "Compliance.ComplianceRule 用 governed_by",
+      "Cases.SuccessCase 用 supported_by",
+    ],
+    lintRules: [
+      "product_code 和 product_name 必须同时存在，缺一不能进入 active。",
+      "product_category 必须使用标准险种大类，不得自造分类名。",
+      "已停售产品 6 个月后应进入历史产品分区。",
+      "product_overview 不得将服务权益描述为险种责任。",
+    ],
+  },
+  {
+    schemaKey: "insurance.product_catalog.ProductComparison",
+    label: "产品对比",
+    domain: "product_catalog",
+    entityType: "product_comparison",
+    universalType: "comparison",
+    purpose: "两个或多个险种的横向对比页面。典型场景：客户问 'A和B哪个好'、同类险种实力对比、升级替换方案对比。",
+    fields: [
+      f("comparison_title", "对比标题", "有画面感的对比标题，如《重疾险旧客升级方案对比》。", "critical"),
+      f("products_compared", "对比产品列表", "各产品的 product_code 列表。", "critical"),
+      f("comparison_dimensions", "对比维度", "保障范围/费率/责任免除/健康告知/等待期等。", "critical"),
+      f("comparison_table", "对比表格", "结构化 Markdown 表格或 JSON 对比数据。", "critical"),
+      f("recommended_for", "适合客户画像", "不同产品分别适合哪类客户。", "high_confidence"),
+      f("key_differentiators", "核心差异点", "而不是全面罗列差异，就最关键的 2-3 个差异下判断。", "high_confidence"),
+      f("selection_logic", "选品逻辑", "怎么帮客户分析应该选哪个。", "high_confidence"),
+      f("compliance_caution", "对比合规提示", "竞品对比需合规。", "high_confidence"),
+      f("as_of_date", "数据有效日期", "对比资料对应的有效期，贝有时效性。", "high_confidence"),
+    ],
+    relationHints: [
+      "对比产品用 applies_to 关联各 product_overview",
+      "Persona 用 recommended_for",
+      "Compliance.ComplianceRule 用 governed_by",
+    ],
+    lintRules: [
+      "products_compared 至少 2 个产品。",
+      "as_of_date 缺失时应进入 needs_review。",
+      "对比内容不得包含明确保证性收益承诺或绝对化描述。",
+    ],
+  },
+  {
+    schemaKey: "insurance.product_catalog.RateTable",
+    label: "费率表",
+    domain: "product_catalog",
+    entityType: "rate_table",
+    universalType: "data",
+    purpose: "单个险种的费率表页面，提供数字化索引层供 RAG 直接检索。不招募整张费率表，而是提取要概和典型示例，原表存放在 source page。",
+    fields: [
+      f("related_product", "对应产品", "所属产品的 product_code。", "critical"),
+      f("rate_table_version", "费率表版本", "生效日期或版本号。", "critical"),
+      f("rate_dimensions", "费率维度", "年龄/性别/交费期/保额等。", "critical"),
+      f("sample_rates", "典型示例", "几个代表性年龄+保额+保费的示例，不要将整张表全部确招进来。", "critical"),
+      f("rate_basis", "费率基础", "每万元保额年保费（所和年保费）。", "high_confidence"),
+      f("effective_date", "生效日期", "费率表官方生效日期。", "high_confidence"),
+      f("coverage_period", "适用保障期", "本费率表适用的保障期。", "high_confidence"),
+      f("payment_period", "适用交费期", "本费率表适用的交费期选项。", "high_confidence"),
+      f("source_file", "原表文件路径", "指向原始费率表的 source page。", "recommended"),
+    ],
+    relationHints: [
+      "related_product 用 part_of 指向 product_overview",
+      "Compliance.RegulatoryDoc 用 governed_by",
+    ],
+    lintRules: [
+      "related_product 必填且必须指向已知的 ProductOverview。",
+      "rate_table_version 缺失时进入 needs_review。",
+      "将整张费率表确招到相关字段是允许的，但实际内容应放在 source page 而非此处。",
+    ],
+  },
+]
+
+// Extend INSURANCE_SCHEMA_REGISTRY to include product_catalog entries
+INSURANCE_SCHEMA_REGISTRY.push(...PRODUCT_CATALOG_SCHEMA)
 
