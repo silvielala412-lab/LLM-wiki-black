@@ -1,4 +1,4 @@
-﻿import { createDirectory, readFile, writeFile, listDirectory, readFileAsBase64 } from "@/commands/fs"
+import { createDirectory, readFile, writeFile, listDirectory, readFileAsBase64 } from "@/commands/fs"
 import { getLogger } from "@/lib/logger"
 
 // Module-level namespaced loggers — no coupling to console or UI
@@ -1658,47 +1658,85 @@ const SERVICE_RULE_PAGE_BODY_SPEC = `
 ## 实贻示例               【可选】该规则在实际服务中的应用示例
 `.trim()
 
-// In v2, actual entity title = {line_name}-{version_name}-{item_name}
-// The INSURANCE_SERVICE_MANUAL_NODES defines the canonical item_name and detection aliases.
-const INSURANCE_SERVICE_MANUAL_NODES = [
-  { title: "家庭医生服务", kind: "service_item", aliases: ["家庭医生"] },
-  { title: "在线问诊", kind: "service_item", aliases: ["在线问诊"] },
-  { title: "音视频问诊", kind: "service_item", aliases: ["音视频问诊", "音视频随访", "音视频首访"] },
-  { title: "名医大咖", kind: "service_item", aliases: ["名医大咖"] },
-  { title: "特色体检", kind: "service_item", aliases: ["特色体检", "深度检查", "报告解读"] },
-  { title: "21天社群训练营", kind: "service_item", aliases: ["21天社群训练营"] },
-  { title: "用药服务", kind: "service_item", aliases: ["用药服务"] },
-  { title: "数字化慢病管理", kind: "service_item", aliases: ["数字化管理", "慢病管理"] },
-  { title: "门诊预约协助", kind: "service_item", aliases: ["门诊预约协助"] },
-  { title: "就医陪诊", kind: "service_item", aliases: ["就医陪诊"] },
-  { title: "重疾专案管理", kind: "service_item", aliases: ["重疾专案管理"] },
-  { title: "心理咨询", kind: "service_item", aliases: ["心理咨询"] },
-  { title: "检查安排协助", kind: "service_item", aliases: ["检查安排协助"] },
-  { title: "专家会诊", kind: "service_item", aliases: ["专家会诊"] },
-  { title: "海外远程书面咨询", kind: "service_item", aliases: ["海外远程书面咨询"] },
-  { title: "国内住院安排协助", kind: "service_item", aliases: ["国内住院安排协助", "住院安排协助"] },
-  { title: "手术安排协助", kind: "service_item", aliases: ["手术安排协助"] },
-  { title: "海外重疾住院安排协助", kind: "service_item", aliases: ["海外重疾住院安排协助"] },
-  { title: "住院照护", kind: "service_item", aliases: ["住院照护"] },
-  { title: "出院安排协助", kind: "service_item", aliases: ["出院安排协助"] },
-  { title: "康复门诊协助", kind: "service_item", aliases: ["康复门诊协助"] },
-  { title: "康复住院协助", kind: "service_item", aliases: ["康复住院协助"] },
-  { title: "上门护理", kind: "service_item", aliases: ["上门护理"] },
-  { title: "康复训练管理", kind: "service_item", aliases: ["康复训练管理"] },
-  { title: "服务激活流程", kind: "process", aliases: ["激活权益", "绑定家庭医生", "健康测评", "首访", "建档"] },
-  { title: "服务中止规则", kind: "rule", aliases: ["服务中止"] },
-  { title: "服务终止规则", kind: "rule", aliases: ["服务终止", "服务终止时间/情形"] },
-  { title: "重疾服务等待期与非共享规则", kind: "rule", aliases: ["90天等待期", "非共享", "仅限1人使用"] },
-  { title: "合规免责说明", kind: "compliance_rule", aliases: ["不承担", "仅供参考", "最终决定权", "法律责任", "免责"] },
-] as const
-
-function detectedServiceManualNodes(sourceContent: string): typeof INSURANCE_SERVICE_MANUAL_NODES[number][] {
-  if (!/(服务手册|服务体系|服务内容及标准|服务流程|服务期限|常见问题|家庭医生|重疾全程服务)/i.test(sourceContent)) {
-    return []
-  }
-  return INSURANCE_SERVICE_MANUAL_NODES.filter((node) =>
-    node.aliases.some((alias) => sourceContent.includes(alias)),
-  )
+/**
+ * Per-version SOFT reference checklist of expected service items.
+ * Passed to the LLM as GUIDANCE only:
+ *   ✅ Extract an item if found in the PDF (even if not on this list)
+ *   ⚠️  Skip an item if NOT found in the PDF (list is not mandatory)
+ *   ✅ Extract a PDF item not on this list (list is not exhaustive)
+ */
+const SERVICE_VERSION_REFERENCE_ITEMS: Record<string, ReadonlyArray<{ item: string; scenario: string }>> = {
+  "安有医/尊享易核版": [
+    { item: "在线问诊",       scenario: "院前就医" },
+    { item: "门诊预约协助",   scenario: "院前就医" },
+    { item: "就医陪诊",       scenario: "院前就医" },
+    { item: "高级门诊预约",   scenario: "院前就医" },
+    { item: "高级陪诊",       scenario: "院中治疗" },
+    { item: "住院安排协助",   scenario: "院中治疗" },
+    { item: "住院照护",       scenario: "院中治疗" },
+    { item: "手术安排",       scenario: "院中治疗" },
+    { item: "专家会诊",       scenario: "院中治疗" },
+    { item: "质重就医协助",   scenario: "院中治疗" },
+    { item: "国内院外药购药", scenario: "院中治疗" },
+    { item: "高端医疗垫付",   scenario: "院中治疗" },
+    { item: "高端医疗直付",   scenario: "院中治疗" },
+    { item: "出院安排协助",   scenario: "院中治疗" },
+    { item: "远程康复指导",   scenario: "院后康复" },
+    { item: "上门康复护理",   scenario: "院后康复" },
+    { item: "康复门诊协助",   scenario: "院后康复" },
+    { item: "康复住院协助",   scenario: "院后康复" },
+    { item: "慢病管理",       scenario: "健康管理" },
+    { item: "自选健康检测",   scenario: "健康管理" },
+  ],
+  "安有医/尊享版": [
+    { item: "在线问诊",     scenario: "院前就医" },
+    { item: "门诊预约协助", scenario: "院前就医" },
+    { item: "就医陪诊",     scenario: "院前就医" },
+    { item: "高级陪诊",     scenario: "院中治疗" },
+    { item: "住院安排协助", scenario: "院中治疗" },
+    { item: "住院照护",     scenario: "院中治疗" },
+    { item: "手术安排",     scenario: "院中治疗" },
+    { item: "专家会诊",     scenario: "院中治疗" },
+    { item: "出院安排协助", scenario: "院中治疗" },
+    { item: "远程康复指导", scenario: "院后康复" },
+    { item: "上门康复护理", scenario: "院后康复" },
+    { item: "康复门诊协助", scenario: "院后康复" },
+    { item: "慢病管理",     scenario: "健康管理" },
+  ],
+  "安有医/悦享版": [
+    { item: "在线问诊",     scenario: "院前就医" },
+    { item: "门诊预约协助", scenario: "院前就医" },
+    { item: "就医陪诊",     scenario: "院前就医" },
+    { item: "住院安排协助", scenario: "院中治疗" },
+    { item: "住院照护",     scenario: "院中治疗" },
+    { item: "出院安排协助", scenario: "院中治疗" },
+    { item: "远程康复指导", scenario: "院后康复" },
+    { item: "慢病管理",     scenario: "健康管理" },
+  ],
+  "安有医/惠享版": [
+    { item: "在线问诊",     scenario: "院前就医" },
+    { item: "门诊预约协助", scenario: "院前就医" },
+    { item: "就医陪诊",     scenario: "院前就医" },
+    { item: "住院安排协助", scenario: "院中治疗" },
+    { item: "住院照护",     scenario: "院中治疗" },
+    { item: "出院安排协助", scenario: "院中治疗" },
+    { item: "远程康复指导", scenario: "院后康复" },
+  ],
+  "安有医/颐享版": [
+    { item: "在线问诊",             scenario: "院前就医" },
+    { item: "门诊预约协助",         scenario: "院前就医" },
+    { item: "就医陪诊",             scenario: "院前就医" },
+    { item: "高级陪诊",             scenario: "院中治疗" },
+    { item: "住院安排协助",         scenario: "院中治疗" },
+    { item: "住院照护",             scenario: "院中治疗" },
+    { item: "手术安排",             scenario: "院中治疗" },
+    { item: "专家会诊",             scenario: "院中治疗" },
+    { item: "海外重疾住院安排协助", scenario: "院中治疗" },
+    { item: "出院安排协助",         scenario: "院中治疗" },
+    { item: "远程康复指导",         scenario: "院后康复" },
+    { item: "上门康复护理",         scenario: "院后康复" },
+    { item: "康复门诊协助",         scenario: "院后康复" },
+  ],
 }
 
 function buildServiceManualNodeDirective(
@@ -1721,10 +1759,34 @@ function buildServiceManualNodeDirective(
     ? `\nNaming convention (v2): each service_item page title MUST follow the pattern "{service_line}-{version}-{item_name}" (e.g., "${makeItemTitle("在线问诊")}"). Do NOT use bare item names like "在线问诊" as the title.`
     : ""
 
+  // P1: FORBIDDEN rules for version-specific extraction
+  const forbiddenRules = serviceLineCtx ? [
+    `FORBIDDEN: entity_type=service_benefit — use entity_type=service_item for ALL service content from this version handbook. service_benefit is ONLY for cross-version generic concepts.`,
+    `FORBIDDEN: bare entity titles without prefix (e.g. "在线问诊", "住院照护"). Every service entity page title MUST start with "${serviceLineCtx.lineName}-${serviceLineCtx.versionName}-".`,
+  ] : []
+
+  // P0: inject per-version soft reference checklist
+  const versionKey = serviceLineCtx ? `${serviceLineCtx.lineName}/${serviceLineCtx.versionName}` : null
+  const refItems = versionKey ? (SERVICE_VERSION_REFERENCE_ITEMS[versionKey] ?? null) : null
+  const refSection = (serviceLineCtx && refItems && refItems.length > 0)
+    ? [
+      "",
+      `## Version Reference Service List (SOFT GUIDANCE — ${serviceLineCtx.lineName} ${serviceLineCtx.versionName})`,
+      "Use this checklist when scanning the PDF. Rules:",
+      "  ✅ Item in list AND found in PDF → MUST generate a separate entity page",
+      "  ⚠️  Item in list but NOT in PDF → SKIP it, do not create an empty entity",
+      "  ✅ Item found in PDF but NOT in list → STILL extract it",
+      "",
+      ...refItems.map((r) => `  - [${r.scenario}] ${makeItemTitle(r.item)}`),
+    ].join("\n")
+    : ""
+
   return [
     "## Service Manual Node Extraction Requirements",
     "This source appears to be an insurance service manual. Treat service items, process rules, and compliance disclaimers as first-class reusable knowledge nodes.",
     prefixNote,
+    ...forbiddenRules,
+    refSection,
     "",
     `Detected service/rule candidates (${nodes.length}): ${nodes.map((node) => node.title).join("、")}.`,
     "",
@@ -1752,6 +1814,50 @@ function buildServiceManualNodeDirective(
     ruleNodes.length > 0 ? `Rule/process/compliance pages expected: ${ruleNodes.map((node) => node.title).join("、")}.` : "",
   ].filter(Boolean).join("\n")
 }
+
+// In v2, actual entity title = {line_name}-{version_name}-{item_name}
+// The INSURANCE_SERVICE_MANUAL_NODES defines the canonical item_name and detection aliases.
+const INSURANCE_SERVICE_MANUAL_NODES = [
+  { title: "家庭医生服务", kind: "service_item", aliases: ["家庭医生"] },
+  { title: "在线问诊", kind: "service_item", aliases: ["在线问诊"] },
+  { title: "音视频问诊", kind: "service_item", aliases: ["音视频问诊", "音视频随访", "音视频首访"] },
+  { title: "名医大咖", kind: "service_item", aliases: ["名医大咖"] },
+  { title: "特色体检", kind: "service_item", aliases: ["特色体检", "深度检查", "报告解读"] },
+  { title: "21天社群训练营", kind: "service_item", aliases: ["21天社群训练营"] },
+  { title: "用药服务", kind: "service_item", aliases: ["用药服务"] },
+  { title: "数字化慢病管理", kind: "service_item", aliases: ["数字化管理", "慢病管理"] },
+  { title: "门诊预约协助", kind: "service_item", aliases: ["门诊预约协助"] },
+  { title: "就医陪诊", kind: "service_item", aliases: ["就医陪诊"] },
+  { title: "重疾专案管理", kind: "service_item", aliases: ["重疾专案管理"] },
+  { title: "心理咨询", kind: "service_item", aliases: ["心理咨询"] },
+  { title: "检查安排协助", kind: "service_item", aliases: ["检查安排协助"] },
+  { title: "专家会诊", kind: "service_item", aliases: ["专家会诊"] },
+  { title: "海外远程书面咨询", kind: "service_item", aliases: ["海外远程书面咨询"] },
+  { title: "国内住院安排协助", kind: "service_item", aliases: ["国内住院安排协助", "住院安排协助"] },
+  { title: "手术安排", kind: "service_item", aliases: ["手术安排"] },
+  { title: "海外重疾住院安排协助", kind: "service_item", aliases: ["海外重疾住院安排协助"] },
+  { title: "住院照护", kind: "service_item", aliases: ["住院照护"] },
+  { title: "出院安排协助", kind: "service_item", aliases: ["出院安排协助"] },
+  { title: "康复门诊协助", kind: "service_item", aliases: ["康复门诊协助"] },
+  { title: "康复住院协助", kind: "service_item", aliases: ["康复住院协助"] },
+  { title: "上门护理", kind: "service_item", aliases: ["上门护理"] },
+  { title: "康复训练管理", kind: "service_item", aliases: ["康复训练管理"] },
+  { title: "服务激活流程", kind: "process", aliases: ["激活权益", "绑定家庭医生", "健康测评", "首访", "建档"] },
+  { title: "服务中止规则", kind: "rule", aliases: ["服务中止"] },
+  { title: "服务终止规则", kind: "rule", aliases: ["服务终止", "服务终止时间/情形"] },
+  { title: "重疾服务等待期与非共享规则", kind: "rule", aliases: ["90天等待期", "非共享", "仅限1人使用"] },
+  { title: "合规免责说明", kind: "compliance_rule", aliases: ["不承担", "仅供参考", "最终决定权", "法律责任", "免责"] },
+] as const
+
+function detectedServiceManualNodes(sourceContent: string): typeof INSURANCE_SERVICE_MANUAL_NODES[number][] {
+  if (!/(服务手册|服务体系|服务内容及标准|服务流程|服务期限|常见问题|家庭医生|重疾全程服务)/i.test(sourceContent)) {
+    return []
+  }
+  return INSURANCE_SERVICE_MANUAL_NODES.filter((node) =>
+    node.aliases.some((alias) => sourceContent.includes(alias)),
+  )
+}
+
 
 function isImageSourcePath(path: string): boolean {
   const ext = path.split(".").pop()?.toLowerCase() ?? ""

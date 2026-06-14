@@ -18,7 +18,7 @@ import { createDirectory, readFile, writeFile } from "@/commands/fs"
 
 const MARKER = "__PDF_IMAGE_PAGES__"
 const OCR_PAGE_TIMEOUT_MS = 180_000
-const OCR_PDF_PAGE_CONCURRENCY = 3
+const OCR_PDF_PAGE_CONCURRENCY = 20
 
 const TABLE_OCR_PROMPT = [
   "请对这张图片做高精度 OCR，直接输出可供知识库入库的原文。",

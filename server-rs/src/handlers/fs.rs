@@ -414,6 +414,62 @@ pub async fn read_file(
     Ok(Json(json!(content)))
 }
 
+/// Detect garbled PDF text layers — scanned PDFs often have a corrupt embedded
+/// text layer (characters extracted but scrambled / heavily repeated).
+///
+/// A text is considered garbled if ANY of the following is true:
+///   1. Unique char ratio < 0.015  (e.g. "居家会员" repeated 500×)
+///   2. Top-1 word accounts for > 20% of all words (extreme repetition)
+///   3. Average word length < 1.3 chars (Chinese text with no spaces would
+///      normally produce CJK tokens; this catches mojibake-style output)
+fn is_garbled_pdf_text(text: &str) -> bool {
+    let chars: Vec<char> = text.chars().collect();
+    let total_chars = chars.len();
+    if total_chars < 50 {
+        return false; // too short to judge
+    }
+
+    // 1. Unique character ratio
+    let unique_chars: std::collections::HashSet<char> = chars
+        .iter()
+        .filter(|c| !c.is_whitespace())
+        .cloned()
+        .collect();
+    let non_ws_total = chars.iter().filter(|c| !c.is_whitespace()).count();
+    if non_ws_total > 0 {
+        let unique_ratio = unique_chars.len() as f64 / non_ws_total as f64;
+        if unique_ratio < 0.015 {
+            tracing::warn!(
+                "PDF text quality: unique_char_ratio={:.4} < 0.015 — treating as garbled",
+                unique_ratio
+            );
+            return true;
+        }
+    }
+
+    // 2. Top word dominance
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let total_words = words.len();
+    if total_words > 20 {
+        let mut freq: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for w in &words {
+            *freq.entry(w).or_insert(0) += 1;
+        }
+        if let Some(max_count) = freq.values().copied().max() {
+            let dominance = max_count as f64 / total_words as f64;
+            if dominance > 0.20 {
+                tracing::warn!(
+                    "PDF text quality: top_word_dominance={:.4} > 0.20 — treating as garbled",
+                    dominance
+                );
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 /// Async PDF content extraction with three-tier fallback:
 ///   1. Internal OCR API  (if OCR_ENDPOINT configured) — handles all PDFs
 ///   2. pdf-extract       (pure Rust, fast)             — text-layer PDFs only
@@ -458,13 +514,19 @@ async fn extract_pdf_content_async(path: &str, state: &AppState) -> anyhow::Resu
         Ok(Ok(Ok(text))) if !text.trim().is_empty() => {
             let trimmed = text.trim().to_string();
             let char_count = trimmed.chars().count();
-            if char_count >= 200 {
+            if char_count >= 200 && !is_garbled_pdf_text(&trimmed) {
                 return Ok(trimmed);
             }
+            if char_count >= 200 {
+                tracing::warn!(
+                    "pdf-extract: {char_count} chars but text quality check failed for {path}; falling through to OCR"
+                );
+            } else {
+                tracing::warn!(
+                    "pdf-extract returned only {char_count} chars for {path}; trying image fallback in case this is a scanned/image PDF with a weak text layer"
+                );
+            }
             short_text_fallback = Some(trimmed);
-            tracing::warn!(
-                "pdf-extract returned only {char_count} chars for {path}; trying image fallback in case this is a scanned/image PDF with a weak text layer"
-            );
         }
         Ok(Ok(Err(e))) => {
             tracing::warn!("pdf-extract failed for {path}: {e}, trying image fallback");
@@ -484,13 +546,19 @@ async fn extract_pdf_content_async(path: &str, state: &AppState) -> anyhow::Resu
         Ok(Ok(text)) if !text.trim().is_empty() => {
             let trimmed = text.trim().to_string();
             let char_count = trimmed.chars().count();
-            if char_count >= 200 {
+            if char_count >= 200 && !is_garbled_pdf_text(&trimmed) {
                 tracing::info!("pdftotext extracted {char_count} chars for {path}");
                 return Ok(trimmed);
             }
-            tracing::warn!(
-                "pdftotext returned only {char_count} chars for {path}; trying image fallback"
-            );
+            if char_count >= 200 {
+                tracing::warn!(
+                    "pdftotext: {char_count} chars but text quality check failed for {path}; falling through to OCR"
+                );
+            } else {
+                tracing::warn!(
+                    "pdftotext returned only {char_count} chars for {path}; trying image fallback"
+                );
+            }
             if short_text_fallback
                 .as_ref()
                 .map(|existing| trimmed.len() > existing.len())
