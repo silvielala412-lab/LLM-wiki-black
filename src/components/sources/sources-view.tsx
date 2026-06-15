@@ -230,9 +230,10 @@ export function SourcesView() {
           enqueueBatch(project.id, tasks_pc).catch((err) => {
             const msg = err instanceof Error ? err.message : String(err)
             log.error("product enqueue failed", { error: msg })
-            setImportError(\u26a0\ufe0f 排队失败: \)
+            setImportError(`\u26a0\ufe0f \u6392\u961f\u5931\u8d25: ${msg}`)
           })
-          setImportError("⚠️ LLM 未配置，文件已上传但无法自动解析。")
+        } else if (!canIngest) {
+          setImportError("\u26a0\ufe0f LLM \u672a\u914d\u7f6e\uff0c\u6587\u4ef6\u5df2\u4e0a\u4f20\u4f46\u65e0\u6cd5\u81ea\u52a8\u89e3\u6790\u3002")
         }
         setTimeout(() => setImportStatus(null), 5000)
       } catch (err) {
