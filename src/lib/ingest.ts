@@ -247,7 +247,7 @@ function buildProductCatalogGenerationOverride(
     `- \u274c FORBIDDEN: wiki/entities/ \u2014 do not write ANY files here`,
     `- \u274c FORBIDDEN: wiki/concepts/ \u2014 do not write ANY files here`,
     `- \u274c FORBIDDEN: per-field entity pages (\u300c\u4ea4\u8d39\u65b9\u5f0f\u300d\u300c\u7b49\u5f85\u671f\u300d\u300c\u4fdd\u989d\u300d are ATTRIBUTES inside module body, NOT standalone files)`,
-    isBatchMode ? `- \u274c FORBIDDEN: any module not in this batch: ${batchModules!.map(m => `\u300c${m}\u300d`).join("\u3001")}` : "",
+    isBatchMode ? ("- \u274c FORBIDDEN: any module not in this batch: " + batchModules!.map(m => "\u300c" + m + "\u300d").join("\u3001")) : "",
     ``,
     `### TARGET MODULE FILES (exact filenames \u2014 ${isBatchMode ? "this batch only" : "generate only ones with evidence"})`,
     moduleTable,
@@ -273,7 +273,6 @@ function buildProductCatalogGenerationOverride(
     `| \u4ea4\u8d39\u65b9\u5f0f | \u4e00\u6b21\u6027\u652f\u4ed8 | 1.0 |`,
     `---END FILE---`,
   ].join("\n")
-}
 }
 
 import type { ChunkingConfig } from "@/types/wiki"
