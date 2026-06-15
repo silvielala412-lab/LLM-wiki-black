@@ -236,10 +236,9 @@ function buildProductCatalogGenerationOverride(
     ``,
     `### \u26a0\ufe0f MODULE NAME WHITELIST (\u4e25\u683c\u6309\u767d\u540d\u5355 — DO NOT DEVIATE)`,
     `\u6a21\u5757\u540d\u5fc5\u987b\u4e25\u683c\u4f7f\u7528\u4ee5\u4e0b\u5217\u51fa\u7684\u51c6\u786e\u6587\u5b57\uff0c\u7981\u6b62\u81ea\u9020\u3001\u7f29\u5199\u6216\u6539\u9020\u3002\u5982\u679c\u539f\u6587\u5185\u5bb9\u5bf9\u5e94\u67d0\u6a21\u5757\u4f46\u540d\u79f0\u4e0d\u5728\u767d\u540d\u5355\u5185\uff0c\u5c06\u5185\u5bb9\u5408\u5e76\u5165\u6700\u8fd1\u6a21\u5757\u7684 body \u4e2d\u3002`,
-    isBatchMode
-      ? `\u672c\u6279\u53ef\u751f\u6210\u7684\u6a21\u5757\uff1a${targetModules.map(m => `\u300c${m.moduleName}\u300d`).join("\u3001")}`,
-      : `${category}\u5168\u90e8\u6a21\u5757\u767d\u540d\u5355\uff1a${allModules.map(m => `\u300c${m.moduleName}\u300d`).join("\u3001")}`,
-    ``,
+    (isBatchMode
+      ? "\u672c\u6279\u53ef\u751f\u6210\u7684\u6a21\u5757\uff1a" + targetModules.map(m => "\u300c" + m.moduleName + "\u300d").join("\u3001")
+      : (category + "\u5168\u90e8\u6a21\u5757\u767d\u540d\u5355\uff1a" + allModules.map(m => "\u300c" + m.moduleName + "\u300d").join("\u3001"))),
     `### ABSOLUTE PATH RULES`,
     `- \u2705 ALLOWED: wiki/product_catalog/${category}-${productName}-{\u6a21\u5757\u540d}.md  (\u6a21\u5757\u540d\u5fc5\u987b\u6765\u81ea\u767d\u540d\u5355)`,
     isFirstBatch
