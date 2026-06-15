@@ -19,7 +19,7 @@ interface CacheData {
   entries: Record<string, CacheEntry> // keyed by content hash; legacy filename keys are still read
 }
 
-const INGEST_PIPELINE_VERSION = "section-scan-merge-v10"
+const INGEST_PIPELINE_VERSION = "field-scan-merge-v11"
 const PIPELINE_VERSION_STRICT = true
 
 async function sha256(content: string): Promise<string> {
