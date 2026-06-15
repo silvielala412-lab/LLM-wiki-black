@@ -141,8 +141,11 @@ async function streamText(
   await streamChat(
     config,
     messages,
-    (chunk) => { out += chunk },
-    (err) => { streamError = err },
+    {
+      onToken: (chunk) => { out += chunk },
+      onDone: () => {},
+      onError: (err) => { streamError = err },
+    },
     signal,
     overrides,
   )
