@@ -3533,19 +3533,39 @@ async function autoIngestImpl(
   // ── Step 3: Write files ───────────────────────────────────────
   activity.updateItem(activityId, { detail: "Writing files...", step: "Analysing entity deduplication" })
 
-  // Hard post-filter for product catalog tasks:
-  // Even if the LLM ignores prompt constraints and emits wiki/entities/ blocks,
-  // strip them here so they NEVER touch disk.
+  // For product catalog tasks: reroute any wiki/entities/ or wiki/concepts/ FILE blocks
+  // to the correct wiki/product_catalog/{category}-{product}-{moduleName}.md path.
+  // We do NOT discard them — the LLM content is valuable, just misplaced.
+  // The file title (last segment without .md) is used as the module name.
   let generationToWrite = generation
   if (productCtxForIngest) {
-    // Remove any FILE block whose path starts with wiki/entities/ or wiki/concepts/
+    const { category, productName } = productCtxForIngest
+    const allModuleNames = new Set(
+      PRODUCT_CATALOG_MODULES[category]?.map((m) => m.moduleName) ?? [],
+    )
     generationToWrite = generation.replace(
-      /---FILE:\s*wiki\/(?:entities|concepts)\/[^\n]*\n[\s\S]*?---END FILE---/g,
-      (match) => {
-        const pathMatch = match.match(/---FILE:\s*([^\n]+)/)
-        const droppedPath = pathMatch?.[1]?.trim() ?? "unknown"
-        log.warn("[product-catalog] stripped forbidden entities block", { path: droppedPath, source: fileName })
-        return ""
+      /---FILE:\s*(wiki\/(?:entities|concepts)\/[^\n]+)\n/g,
+      (_match, badPath: string) => {
+        // Extract the last segment as a candidate module name
+        const segments = badPath.trim().split("/")
+        const rawName = (segments[segments.length - 1] ?? "").replace(/\.md$/i, "").trim()
+
+        // Try exact match against known module names first
+        let moduleName = rawName
+        if (!allModuleNames.has(rawName)) {
+          // Try fuzzy match: find a registered module whose name is contained in rawName
+          const fuzzy = [...allModuleNames].find(
+            (m) => rawName.includes(m) || m.includes(rawName),
+          )
+          if (fuzzy) moduleName = fuzzy
+          // else: keep rawName — better to write with an imperfect name than lose content
+        }
+
+        const newPath = `wiki/product_catalog/${category}-${productName}-${moduleName}.md`
+        log.warn("[product-catalog] rerouted misplaced entity block", {
+          from: badPath, to: newPath, source: fileName,
+        })
+        return `---FILE: ${newPath}\n`
       },
     )
   }
