@@ -25,6 +25,17 @@ import {
 
 const log = getLogger("product-catalog-extractor")
 
+/**
+ * Clean the product name by stripping source file name suffixes.
+ * e.g. "平安e生保（尊享版）医疗保险(保险条款)" → "平安e生保（尊享版）医疗保险"
+ */
+function cleanProductName(name: string): string {
+  // Strip common source document type suffixes in parentheses
+  return name
+    .replace(/[（(](?:保险条款|产品条款|产品说明书|投保须知|费率表|核保手册|理赔指南|服务手册|条款)[）)]/g, "")
+    .trim()
+}
+
 // ── Types ─────────────────────────────────────────────────────────────────
 
 /** Markdown content extracted for a module from one section. */
@@ -294,20 +305,37 @@ function mergeModuleFragments(
       continue
     }
 
-    // Simple merge: concatenate with section separators
     // Deduplicate identical fragments (from overlapping sections)
-    const uniqueMarkdowns: string[] = []
+    const uniqueFragments: ModuleFragment[] = []
     const seen = new Set<string>()
     for (const f of fragments) {
-      // Normalize for dedup (trim + collapse whitespace)
       const normalized = f.markdown.replace(/\s+/g, " ").trim()
       if (!seen.has(normalized)) {
         seen.add(normalized)
-        uniqueMarkdowns.push(f.markdown)
+        uniqueFragments.push(f)
       }
     }
 
-    const content = uniqueMarkdowns.join("\n\n")
+    // If only one source section, output clean content.
+    // If multiple sections contribute, add source context markers.
+    let content: string
+    if (uniqueFragments.length === 1) {
+      content = uniqueFragments[0].markdown
+    } else {
+      // Multiple sections → merge with section markers for traceability
+      const parts: string[] = []
+      for (let idx = 0; idx < uniqueFragments.length; idx++) {
+        const f = uniqueFragments[idx]
+        if (idx > 0) {
+          parts.push("")
+          parts.push(`---`)
+          parts.push(`<!-- 以下内容来自文档第 ${f.sectionIndex + 1} 部分 -->`)
+          parts.push("")
+        }
+        parts.push(f.markdown)
+      }
+      content = parts.join("\n")
+    }
     results.push({
       moduleName,
       content,
@@ -369,11 +397,15 @@ export async function runProductCatalogExtraction(
   sourceContent: string,
   fileName: string,
   category: InsuranceCategoryType,
-  productName: string,
+  rawProductName: string,
   llmConfig: LlmConfig,
   activityId: string,
   signal?: AbortSignal,
 ): Promise<string[]> {
+  // Clean productName: strip source file name suffixes like (保险条款)
+  const productName = cleanProductName(rawProductName)
+  log.info("product name cleaned", { raw: rawProductName, clean: productName })
+
   const activity = useActivityStore.getState()
   const allModules = PRODUCT_CATALOG_MODULES[category] ?? []
 

@@ -3360,6 +3360,8 @@ async function autoIngestImpl(
       detail: `Product catalog: ${writtenPaths.length} files written`,
       filesWritten: writtenPaths,
     })
+    // Trigger knowledge tree refresh so new product catalog files appear immediately
+    useWikiStore.getState().bumpDataVersion()
     return writtenPaths
   }
 
