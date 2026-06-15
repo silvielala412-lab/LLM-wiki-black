@@ -1,4 +1,4 @@
-import { createDirectory, readFile, writeFile, listDirectory, readFileAsBase64 } from "@/commands/fs"
+﻿import { createDirectory, readFile, writeFile, listDirectory, readFileAsBase64 } from "@/commands/fs"
 import { getLogger } from "@/lib/logger"
 
 // Module-level namespaced loggers — no coupling to console or UI
@@ -228,47 +228,53 @@ function buildProductCatalogGenerationOverride(
   }).join("\n")
 
   return [
-    `## ⚠️ PRODUCT CATALOG MODE${isBatchMode ? ` — BATCH ${(batchIndex ?? 0) + 1}` : ""} (OVERRIDES ALL DEFAULTS)`,
+    `## \u26a0\ufe0f PRODUCT CATALOG MODE${isBatchMode ? ` \u2014 BATCH ${(batchIndex ?? 0) + 1}` : ""} (OVERRIDES ALL DEFAULTS)`,
     ``,
     isBatchMode
-      ? `You are a focused product knowledge compiler. This batch extracts ONLY ${targetModules.length} specific modules from the source document.`
+      ? `You are a focused product knowledge compiler. This batch extracts ONLY ${targetModules.length} specific modules.`
       : `You are a product knowledge compiler for an insurance knowledge base.`,
     ``,
-    `### ABSOLUTE PATH RULES`,
-    `- ✅ ALLOWED: wiki/product_catalog/${category}-${productName}-{模块名}.md`,
-    isFirstBatch
-      ? `- ✅ ALLOWED: wiki/sources/${sourceBaseName}.md  (source summary — generate once)`
-      : `- ❌ DO NOT regenerate wiki/sources/${sourceBaseName}.md  (already done in batch 0)`,
-    `- ❌ FORBIDDEN: wiki/entities/ — do not write ANY files here`,
-    `- ❌ FORBIDDEN: wiki/concepts/ — do not write ANY files here`,
-    `- ❌ FORBIDDEN: per-field entity pages ("交费方式", "等待期" are ATTRIBUTES, not pages)`,
-    isBatchMode ? `- ❌ DO NOT generate modules other than: ${batchModules!.join("、")}` : "",
+    `### \u26a0\ufe0f MODULE NAME WHITELIST (\u4e25\u683c\u6309\u767d\u540d\u5355 — DO NOT DEVIATE)`,
+    `\u6a21\u5757\u540d\u5fc5\u987b\u4e25\u683c\u4f7f\u7528\u4ee5\u4e0b\u5217\u51fa\u7684\u51c6\u786e\u6587\u5b57\uff0c\u7981\u6b62\u81ea\u9020\u3001\u7f29\u5199\u6216\u6539\u9020\u3002\u5982\u679c\u539f\u6587\u5185\u5bb9\u5bf9\u5e94\u67d0\u6a21\u5757\u4f46\u540d\u79f0\u4e0d\u5728\u767d\u540d\u5355\u5185\uff0c\u5c06\u5185\u5bb9\u5408\u5e76\u5165\u6700\u8fd1\u6a21\u5757\u7684 body \u4e2d\u3002`,
+    isBatchMode
+      ? `\u672c\u6279\u53ef\u751f\u6210\u7684\u6a21\u5757\uff1a${targetModules.map(m => `\u300c${m.moduleName}\u300d`).join("\u3001")}`,
+      : `${category}\u5168\u90e8\u6a21\u5757\u767d\u540d\u5355\uff1a${allModules.map(m => `\u300c${m.moduleName}\u300d`).join("\u3001")}`,
     ``,
-    `### TARGET MODULE FILES FOR THIS ${isBatchMode ? "BATCH" : "DOCUMENT"} (ONLY THESE)`,
+    `### ABSOLUTE PATH RULES`,
+    `- \u2705 ALLOWED: wiki/product_catalog/${category}-${productName}-{\u6a21\u5757\u540d}.md  (\u6a21\u5757\u540d\u5fc5\u987b\u6765\u81ea\u767d\u540d\u5355)`,
+    isFirstBatch
+      ? `- \u2705 ALLOWED: wiki/sources/${sourceBaseName}.md  (source summary \u2014 generate once)`
+      : `- \u274c DO NOT regenerate wiki/sources/${sourceBaseName}.md  (already done in batch 0)`,
+    `- \u274c FORBIDDEN: wiki/entities/ \u2014 do not write ANY files here`,
+    `- \u274c FORBIDDEN: wiki/concepts/ \u2014 do not write ANY files here`,
+    `- \u274c FORBIDDEN: per-field entity pages (\u300c\u4ea4\u8d39\u65b9\u5f0f\u300d\u300c\u7b49\u5f85\u671f\u300d\u300c\u4fdd\u989d\u300d are ATTRIBUTES inside module body, NOT standalone files)`,
+    isBatchMode ? `- \u274c FORBIDDEN: any module not in this batch: ${batchModules!.map(m => `\u300c${m}\u300d`).join("\u3001")}` : "",
+    ``,
+    `### TARGET MODULE FILES (exact filenames \u2014 ${isBatchMode ? "this batch only" : "generate only ones with evidence"})`,
     moduleTable,
     ``,
-    `### MANDATORY FRONTMATTER FIELDS FOR EVERY MODULE FILE`,
+    `### MANDATORY FRONTMATTER FIELDS`,
     `knowledge_domain: product_catalog`,
     `insurance_category: "${category}"`,
     `product_name: "${productName}"`,
-    `dedup_key: "${category}-${productName}-{模块名}"`,
-    `entity_type: (see table above for correct value per module)`,
-    `confidence: 1.0 for explicitly stated facts; 0.7 for inferred`,
-    `inferred_fields: [list of fields NOT directly stated in source text]`,
+    `dedup_key: "${category}-${productName}-{\u6a21\u5757\u540d}"`,
+    `entity_type: (see table above)`,
+    `confidence: 1.0 for explicitly stated; 0.7 for inferred`,
+    `inferred_fields: [fields not directly stated in source]`,
     ``,
-    `### MODULE BODY STRUCTURE (every module file must contain)`,
-    `## 一句话摘要\n(one-sentence summary of this module's key facts)`,
-    `## 原文依据\n(direct quotes from the source document, minimum 2)`,
-    `## 结构化内容\n(table or list of field values)`,
-    `## 待补全信息\n(fields not found in this document — need manual fill)`,
+    `### MODULE BODY STRUCTURE`,
+    `## \u4e00\u53e5\u8bdd\u6458\u8981`,
+    `## \u539f\u6587\u4f9d\u636e  (\u76f4\u63a5\u5f15\u7528\u539f\u6587\uff0c\u4e0d\u5c11\u4e8e2\u6761)`,
+    `## \u7ed3\u6784\u5316\u5185\u5bb9  (\u8868\u683c\u6216\u5217\u8868\uff0c\u5b57\u6bb5\u540d\u662f\u5c5e\u6027\u4e0d\u662f\u6587\u4ef6)`,
+    `## \u5f85\u8865\u5168\u4fe1\u606f  (\u6587\u6863\u672a\u63d0\u4f9b\u7684\u5b57\u6bb5\uff0c\u9700\u4eba\u5de5\u8865\u5145)`,
     ``,
-    `Example:`,
-    `---FILE: wiki/product_catalog/${category}-${productName}-${targetModules[0]?.moduleName ?? "产品基础信息"}.md---`,
-    `| 字段 | 值 | 置信度 |`,
+    `---FILE: wiki/product_catalog/${category}-${productName}-${targetModules[0]?.moduleName ?? "\u4ea7\u54c1\u57fa\u7840\u4fe1\u606f"}.md---`,
+    `| \u5b57\u6bb5 | \u503c | \u7f6e\u4fe1\u5ea6 |`,
     `|---|---|---|`,
-    `| 交费方式 | 一次性支付 | 1.0 |`,
+    `| \u4ea4\u8d39\u65b9\u5f0f | \u4e00\u6b21\u6027\u652f\u4ed8 | 1.0 |`,
     `---END FILE---`,
   ].join("\n")
+}
 }
 
 import type { ChunkingConfig } from "@/types/wiki"
