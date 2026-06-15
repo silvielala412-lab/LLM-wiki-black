@@ -3441,15 +3441,52 @@ async function autoIngestImpl(
     }
   }
 
-  const preparedSource = await prepareSourceForIngest(
-    enrichedSourceContent,
-    fileName,
-    llmConfig,
-    activityId,
-    signal,
-    !!parseProductCatalogCtxFromFolderContext(folderContext), // use insurance digest for product catalog
-  )
+  // For product catalog batch tasks: bypass hierarchical compression entirely.
+  // Rationale: each batch only targets 4 specific modules, so context budget is
+  // plentiful. Passing the full raw source lets the LLM scan the actual clause text
+  // instead of working from a lossy chunk-digest synthesis.
+  //
+  // We cap at RAW_PRODUCT_CATALOG_CHAR_LIMIT to stay within LLM context windows.
+  // For most insurers (128K-1M token models), 300K chars fits comfortably.
+  const isProductCatalogBatch = !!parseProductCatalogCtxFromFolderContext(folderContext)
+  const RAW_PRODUCT_CATALOG_CHAR_LIMIT = 300_000
+
+  let preparedSource: Awaited<ReturnType<typeof prepareSourceForIngest>>
+  if (isProductCatalogBatch) {
+    // Use raw source directly — no compression, no digest, no information loss
+    const rawContent = enrichedSourceContent.length <= RAW_PRODUCT_CATALOG_CHAR_LIMIT
+      ? enrichedSourceContent
+      : enrichedSourceContent.slice(0, RAW_PRODUCT_CATALOG_CHAR_LIMIT) +
+        `\n\n[...原文超过 ${RAW_PRODUCT_CATALOG_CHAR_LIMIT} 字符，已截取前 ${RAW_PRODUCT_CATALOG_CHAR_LIMIT} 字符...]`
+    preparedSource = {
+      content: rawContent,
+      originalChars: enrichedSourceContent.length,
+      contextChars: rawContent.length,
+      chunkCount: 1,
+      processingMode: "direct",
+      qualityConfidence: "high",
+      qualityNotes: [
+        `Product catalog batch mode: raw source passed directly (${rawContent.length} of ${enrichedSourceContent.length} chars).`,
+        enrichedSourceContent.length > RAW_PRODUCT_CATALOG_CHAR_LIMIT
+          ? `Source truncated at ${RAW_PRODUCT_CATALOG_CHAR_LIMIT} chars — consider splitting the PDF or raising RAW_PRODUCT_CATALOG_CHAR_LIMIT.`
+          : "Full source content used.",
+      ],
+    }
+    activity.updateItem(activityId, {
+      detail: `Product catalog: raw source (${Math.round(rawContent.length / 1000)}K chars) → batch extraction`,
+    })
+  } else {
+    preparedSource = await prepareSourceForIngest(
+      enrichedSourceContent,
+      fileName,
+      llmConfig,
+      activityId,
+      signal,
+      false,
+    )
+  }
   const sourceForPrompts = preparedSource.content
+
   const smartIngestPlan = buildSmartIngestPlan(enrichedSourceContent)
   // For product catalog documents, skip schema candidate extraction — they generate
   // per-field entity pages (e.g. "交费方式", "等待期") which pollute wiki/entities/.
