@@ -1,19 +1,14 @@
 /**
  * Product Catalog Extraction Pipeline — Section-Scan + Merge Architecture
  *
- * Instead of sending the full 200K document 7 times (once per module batch),
- * this pipeline:
- *   1. Splits the document into semantic sections (~15-30K chars each)
- *   2. Sends each section to the LLM ONCE, extracting ALL matching modules
- *   3. Merges per-module data fragments across sections
- *   4. Writes final .md files
+ * V2: Full-markdown extraction (not JSON field-value).
  *
- * Benefits vs batch-of-modules:
- *   - Token cost: ~116K total vs ~1.4M (12× savings)
- *   - Latency: ~30s (parallel sections) vs ~3.5min (serial batches)
- *   - Quality: scattered info (e.g. 投保年龄 on page 1, 40, 95) is
- *     naturally aggregated because the merge step collects across sections
- *   - No compression: each section is small enough to fit in context raw
+ * For each section of the document, the LLM outputs FULL MARKDOWN content
+ * for each matching module using ---MODULE: name--- / ---END--- delimiters.
+ * This preserves clause text, numbered lists, tables, conditions — everything
+ * that JSON field-value format would lose.
+ *
+ * Cross-section merge simply concatenates markdown fragments per module.
  */
 
 import { chunkMarkdown, type Chunk } from "@/lib/text-chunker"
@@ -32,98 +27,92 @@ const log = getLogger("product-catalog-extractor")
 
 // ── Types ─────────────────────────────────────────────────────────────────
 
-/** One data point extracted from a section for a specific module. */
-export interface ModuleField {
-  field: string
-  value: string
-  confidence: number
-  /** Direct quote from source text. */
-  quote: string
-  /** Which section this data came from. */
+/** Markdown content extracted for a module from one section. */
+interface ModuleFragment {
+  moduleName: string
+  markdown: string
   sectionIndex: number
 }
 
-/** All data extracted for a single module, aggregated across sections. */
-export interface ModuleExtraction {
-  moduleName: string
-  fields: ModuleField[]
-  /** Whether any section had data for this module. */
-  found: boolean
-}
-
-/** Per-section extraction result: which modules had data in this section. */
+/** Per-section extraction result. */
 interface SectionExtractionResult {
   sectionIndex: number
-  sectionHeading: string
-  modules: Record<string, ModuleField[]>
+  fragments: ModuleFragment[]
+}
+
+/** Final merged module with all content across sections. */
+interface MergedModule {
+  moduleName: string
+  /** Concatenated markdown from all sections. */
+  content: string
+  /** How many sections contributed data. */
+  sectionCount: number
+  found: boolean
 }
 
 // ── Section splitting ─────────────────────────────────────────────────────
 
 /**
  * Split source content into semantic sections for parallel extraction.
- * Uses larger chunks than the embedding chunker — we want "chapter-level"
- * splits that correspond to logical document sections (产品概述, 投保规则, etc.)
+ * Chapter-level splits (~15-30K chars).
  */
 export function splitIntoSections(sourceContent: string): Chunk[] {
   return chunkMarkdown(sourceContent, {
     targetChars: 25000,   // ~5000 tokens per section
-    maxChars: 40000,      // allow up to 8K tokens for large sections
+    maxChars: 40000,      // up to 8K tokens for large sections
     minChars: 3000,       // don't emit tiny fragments
     overlapChars: 500,    // small overlap to catch boundary info
   })
 }
 
-// ── Per-section LLM extraction ────────────────────────────────────────────
+// ── Per-section LLM extraction (full markdown output) ─────────────────────
 
 function buildSectionExtractionPrompt(
-  moduleNames: string[],
+  modules: ProductModule[],
   category: InsuranceCategoryType,
   productName: string,
   sectionIndex: number,
   totalSections: number,
 ): string {
-  const moduleList = moduleNames.map((m) => `  - "${m}"`).join("\n")
+  // Build module list with descriptions for better matching
+  const moduleList = modules.map((m) =>
+    `  - 「${m.moduleName}」(${m.entityType})`
+  ).join("\n")
+
   return [
-    "You are a precise insurance policy data extractor.",
-    "You will receive ONE SECTION of an insurance product document.",
-    "Your job: scan this section and extract STRUCTURED DATA for any of the target modules listed below.",
+    `你是一个保险条款信息抽取专家。你将收到一份「${category}」类保险产品「${productName}」文档的第 ${sectionIndex + 1}/${totalSections} 个章节。`,
     "",
-    `Insurance category: ${category}`,
-    `Product: ${productName}`,
-    `Section: ${sectionIndex + 1} / ${totalSections}`,
+    "## 你的任务",
+    "仔细阅读本章节内容，将其中的信息归类到以下目标模块中。",
+    "**对于每个在本章节中有相关内容的模块，输出该模块的完整 markdown 内容。**",
     "",
-    "## Target modules (extract data ONLY for modules that have relevant content in this section):",
+    "## 目标模块列表",
     moduleList,
     "",
-    "## Output format: VALID JSON only. No markdown, no explanation.",
-    "Return a JSON object where each key is a module name from the list above.",
-    "Only include modules that have ACTUAL DATA in this section. Omit modules with no relevant content.",
+    "## 输出格式",
+    "使用以下分隔符格式输出，每个模块一个块：",
     "",
-    "Each module's value is an array of field objects:",
-    "```json",
-    "{",
-    '  "投保年龄": [',
-    '    { "field": "投保年龄范围", "value": "18-55周岁", "confidence": 1.0, "quote": "被保险人投保时须年满18周岁且不超过55周岁" },',
-    '    { "field": "续保年龄上限", "value": "80周岁", "confidence": 1.0, "quote": "续保可至80周岁" }',
-    "  ],",
-    '  "疾病等待期": [',
-    '    { "field": "等待期天数", "value": "90天", "confidence": 1.0, "quote": "自合同生效之日起90日内..." }',
-    "  ]",
-    "}",
+    "```",
+    "---MODULE: 投保年龄---",
+    "（这里输出该模块的完整内容，保持原文的信息量）",
+    "---END---",
+    "",
+    "---MODULE: 疾病等待期---",
+    "（这里输出该模块的完整内容）",
+    "---END---",
     "```",
     "",
-    "Rules:",
-    "- `field`: descriptive field name in Chinese",
-    "- `value`: the EXACT value from the source text (numbers, percentages, dates, conditions)",
-    "- `confidence`: 1.0 if explicitly stated; 0.7 if inferred; 0.5 if uncertain",
-    "- `quote`: verbatim quote from source text (keep original wording, max 200 chars)",
-    "- If this section has NO data for any target module, return an empty object: {}",
-    "- Do NOT invent data. Only extract what is explicitly present in this section.",
-    "- Preserve tables, lists, and structured data as-is in the value field",
-    "- For health declaration questions (健康告知), extract EACH question as a separate field",
-    "- For exclusion clauses (责任免除), extract EACH clause as a separate field",
-    "- For claim materials (理赔材料), extract EACH item as a separate field",
+    "## 关键规则",
+    "1. **保留完整信息**：不要摘要、不要压缩。原文写了什么就保留什么。条款原文、编号、金额、百分比、条件清单全部保留。",
+    "2. **保留表格和列表**：如果原文有表格，完整复制；如果有编号列表（1. 2. 3.），完整复制。",
+    "3. **保留原文措辞**：使用原文的用词，不要改写或简化。",
+    "4. **适当组织结构**：可以加 markdown 标题（##、###）来组织信息，但内容必须是原文。",
+    "5. **一个信息可以归属多个模块**：如果某段内容同时涉及「保障责任」和「赔付规则」，两个模块都输出。",
+    "6. **空模块不输出**：如果本章节没有某个模块的信息，不要输出该模块的 ---MODULE--- 块。",
+    "7. **健康告知要逐条列出**：每个告知问题单独一行。",
+    "8. **责任免除要逐条列出**：每个免责条款单独列出，保留编号。",
+    "9. **费率表要保留完整表格数据**。",
+    "10. 对于本章节完全没有涉及的模块，直接跳过不输出。",
   ].join("\n")
 }
 
@@ -154,6 +143,45 @@ async function streamText(
 }
 
 /**
+ * Parse ---MODULE: name--- / ---END--- blocks from LLM response.
+ */
+function parseModuleBlocks(response: string, validModuleNames: Set<string>): ModuleFragment[] {
+  const fragments: ModuleFragment[] = []
+  // Match all ---MODULE: xxx--- ... ---END--- blocks
+  const regex = /---MODULE:\s*(.+?)\s*---\n([\s\S]*?)---END---/g
+  let match: RegExpExecArray | null
+
+  while ((match = regex.exec(response)) !== null) {
+    const moduleName = match[1].trim()
+    const markdown = match[2].trim()
+
+    if (!markdown) continue
+
+    // Fuzzy match: try exact first, then check if any valid name contains/is contained by the output
+    let matchedName: string | null = null
+    if (validModuleNames.has(moduleName)) {
+      matchedName = moduleName
+    } else {
+      // Fuzzy: find the closest valid module name
+      for (const valid of validModuleNames) {
+        if (moduleName.includes(valid) || valid.includes(moduleName)) {
+          matchedName = valid
+          break
+        }
+      }
+    }
+
+    if (matchedName) {
+      fragments.push({ moduleName: matchedName, markdown, sectionIndex: 0 })
+    } else {
+      log.warn("unrecognized module name in LLM output", { moduleName, preview: markdown.slice(0, 100) })
+    }
+  }
+
+  return fragments
+}
+
+/**
  * Extract all matching module data from a single section.
  */
 async function extractModulesFromSection(
@@ -161,7 +189,7 @@ async function extractModulesFromSection(
   sectionIndex: number,
   sectionHeading: string,
   totalSections: number,
-  moduleNames: string[],
+  modules: ProductModule[],
   category: InsuranceCategoryType,
   productName: string,
   llmConfig: LlmConfig,
@@ -169,12 +197,12 @@ async function extractModulesFromSection(
   signal?: AbortSignal,
 ): Promise<SectionExtractionResult> {
   const prompt = buildSectionExtractionPrompt(
-    moduleNames, category, productName, sectionIndex, totalSections,
+    modules, category, productName, sectionIndex, totalSections,
   )
 
   const activity = useActivityStore.getState()
   activity.updateItem(activityId, {
-    detail: `Section ${sectionIndex + 1}/${totalSections}: extracting modules...`,
+    detail: `章节 ${sectionIndex + 1}/${totalSections}: 正在抽取模块...`,
   })
 
   let rawResponse: string
@@ -186,141 +214,115 @@ async function extractModulesFromSection(
         {
           role: "user",
           content: [
-            `## Section ${sectionIndex + 1}/${totalSections}`,
-            sectionHeading ? `Heading context: ${sectionHeading}` : "",
+            `## 章节 ${sectionIndex + 1}/${totalSections}`,
+            sectionHeading ? `章节标题上下文: ${sectionHeading}` : "",
             "",
             sectionText,
           ].filter(Boolean).join("\n"),
         },
       ],
       signal,
-      { temperature: 0.05, max_tokens: 4096 },
+      { temperature: 0.05, max_tokens: 8192 },
     )
   } catch (err) {
     log.warn("section extraction failed", {
       section: sectionIndex,
       error: err instanceof Error ? err.message : String(err),
     })
-    return { sectionIndex, sectionHeading, modules: {} }
+    return { sectionIndex, fragments: [] }
   }
 
-  // Parse JSON response
-  const modules: Record<string, ModuleField[]> = {}
-  try {
-    // Strip markdown code fences if LLM wrapped the JSON
-    let jsonStr = rawResponse
-    const fenceMatch = jsonStr.match(/```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/)
-    if (fenceMatch) jsonStr = fenceMatch[1]
+  // Parse ---MODULE--- blocks
+  const validNames = new Set(modules.map((m) => m.moduleName))
+  const fragments = parseModuleBlocks(rawResponse, validNames)
 
-    // Also try to find the outermost { ... }
-    const braceStart = jsonStr.indexOf("{")
-    const braceEnd = jsonStr.lastIndexOf("}")
-    if (braceStart >= 0 && braceEnd > braceStart) {
-      jsonStr = jsonStr.slice(braceStart, braceEnd + 1)
-    }
-
-    const parsed = JSON.parse(jsonStr) as Record<string, Array<{
-      field?: string
-      value?: string
-      confidence?: number
-      quote?: string
-    }>>
-
-    for (const [moduleName, fields] of Object.entries(parsed)) {
-      if (!Array.isArray(fields)) continue
-      if (!moduleNames.includes(moduleName)) continue // skip unknown modules
-      modules[moduleName] = fields
-        .filter((f) => f.field && f.value)
-        .map((f) => ({
-          field: String(f.field),
-          value: String(f.value),
-          confidence: typeof f.confidence === "number" ? f.confidence : 0.7,
-          quote: String(f.quote || ""),
-          sectionIndex,
-        }))
-    }
-  } catch (parseErr) {
-    log.warn("section JSON parse failed", {
-      section: sectionIndex,
-      responseLength: rawResponse.length,
-      error: parseErr instanceof Error ? parseErr.message : String(parseErr),
-      responsePreview: rawResponse.slice(0, 300),
-    })
+  // Tag each fragment with the section index
+  for (const f of fragments) {
+    f.sectionIndex = sectionIndex
   }
 
-  const foundModules = Object.keys(modules).filter((k) => modules[k].length > 0)
-  if (foundModules.length > 0) {
+  if (fragments.length > 0) {
     log.info("section extraction done", {
       section: sectionIndex + 1,
       heading: sectionHeading.slice(0, 60),
-      modules: foundModules,
-      totalFields: Object.values(modules).reduce((sum, fields) => sum + fields.length, 0),
+      modules: fragments.map((f) => f.moduleName),
+      totalChars: fragments.reduce((sum, f) => sum + f.markdown.length, 0),
+    })
+  } else {
+    log.info("section extraction: no modules found", {
+      section: sectionIndex + 1,
+      responseLength: rawResponse.length,
+      responsePreview: rawResponse.slice(0, 200),
     })
   }
 
-  return { sectionIndex, sectionHeading, modules }
+  return { sectionIndex, fragments }
 }
 
 // ── Cross-section merge ───────────────────────────────────────────────────
 
 /**
- * Merge per-module data from all sections. Deduplicates identical field+value
- * pairs; keeps both when values differ for the same field.
+ * Merge per-module markdown from all sections. Concatenates content per module.
+ * Deduplicates identical paragraphs that might appear due to section overlap.
  */
-export function mergeModuleFragments(
+function mergeModuleFragments(
   sectionResults: SectionExtractionResult[],
   allModuleNames: string[],
-): ModuleExtraction[] {
-  const byModule = new Map<string, ModuleField[]>()
+): MergedModule[] {
+  const byModule = new Map<string, ModuleFragment[]>()
 
-  // Initialize all modules
   for (const name of allModuleNames) {
     byModule.set(name, [])
   }
 
-  // Collect fields from all sections
-  for (const section of sectionResults) {
-    for (const [moduleName, fields] of Object.entries(section.modules)) {
-      const existing = byModule.get(moduleName)
+  // Sort by section index to maintain document order
+  const sortedResults = [...sectionResults].sort((a, b) => a.sectionIndex - b.sectionIndex)
+
+  for (const section of sortedResults) {
+    for (const fragment of section.fragments) {
+      const existing = byModule.get(fragment.moduleName)
       if (existing) {
-        existing.push(...fields)
+        existing.push(fragment)
       }
     }
   }
 
-  // Deduplicate: same field + same value → keep only the higher confidence one
-  const results: ModuleExtraction[] = []
-  for (const [moduleName, allFields] of byModule) {
-    const deduped = deduplicateFields(allFields)
+  const results: MergedModule[] = []
+  for (const [moduleName, fragments] of byModule) {
+    if (fragments.length === 0) {
+      results.push({ moduleName, content: "", sectionCount: 0, found: false })
+      continue
+    }
+
+    // Simple merge: concatenate with section separators
+    // Deduplicate identical fragments (from overlapping sections)
+    const uniqueMarkdowns: string[] = []
+    const seen = new Set<string>()
+    for (const f of fragments) {
+      // Normalize for dedup (trim + collapse whitespace)
+      const normalized = f.markdown.replace(/\s+/g, " ").trim()
+      if (!seen.has(normalized)) {
+        seen.add(normalized)
+        uniqueMarkdowns.push(f.markdown)
+      }
+    }
+
+    const content = uniqueMarkdowns.join("\n\n")
     results.push({
       moduleName,
-      fields: deduped,
-      found: deduped.length > 0,
+      content,
+      sectionCount: fragments.length,
+      found: true,
     })
   }
 
   return results
 }
 
-function deduplicateFields(fields: ModuleField[]): ModuleField[] {
-  const seen = new Map<string, ModuleField>()
-  for (const f of fields) {
-    const key = `${f.field}|||${f.value}`
-    const existing = seen.get(key)
-    if (!existing || f.confidence > existing.confidence) {
-      seen.set(key, f)
-    }
-  }
-  return [...seen.values()]
-}
-
 // ── Final .md file generation ─────────────────────────────────────────────
 
-/**
- * Generate the markdown content for a single module file.
- */
-export function buildModuleMarkdownFile(
-  extraction: ModuleExtraction,
+function buildModuleMarkdownFile(
+  merged: MergedModule,
   category: InsuranceCategoryType,
   productName: string,
   moduleDef: ProductModule | undefined,
@@ -329,108 +331,27 @@ export function buildModuleMarkdownFile(
 
   // Frontmatter
   lines.push("---")
-  lines.push(`title: "${category}-${productName}-${extraction.moduleName}"`)
+  lines.push(`title: "${category}-${productName}-${merged.moduleName}"`)
   lines.push(`knowledge_domain: product_catalog`)
   lines.push(`insurance_category: "${category}"`)
   lines.push(`product_name: "${productName}"`)
   lines.push(`entity_type: "${moduleDef?.entityType || "product_detail"}"`)
-  lines.push(`dedup_key: "${category}-${productName}-${extraction.moduleName}"`)
+  lines.push(`dedup_key: "${category}-${productName}-${merged.moduleName}"`)
   lines.push(`status: candidate`)
   lines.push(`created_by: auto-extract`)
-  lines.push(`extraction_method: section-scan-merge`)
-  const inferred = extraction.fields.filter((f) => f.confidence < 1.0)
-  if (inferred.length > 0) {
-    lines.push(`inferred_fields: [${inferred.map((f) => `"${f.field}"`).join(", ")}]`)
-  }
+  lines.push(`extraction_method: section-scan-merge-v2`)
+  lines.push(`source_sections: ${merged.sectionCount}`)
   lines.push("---")
   lines.push("")
 
   // Title
-  lines.push(`# ${extraction.moduleName}`)
+  lines.push(`# ${merged.moduleName}`)
   lines.push("")
 
-  // One-sentence summary
-  lines.push("## 一句话摘要")
-  lines.push("")
-  const topFields = extraction.fields.slice(0, 3)
-  if (topFields.length > 0) {
-    lines.push(
-      topFields.map((f) => `${f.field}：${f.value}`).join("；") + "。",
-    )
-  } else {
-    lines.push("（此模块在源文档中未发现明确数据）")
-  }
-  lines.push("")
-
-  // Structured content table
-  lines.push("## 结构化内容")
-  lines.push("")
-  if (extraction.fields.length > 0) {
-    lines.push("| 字段 | 值 | 置信度 |")
-    lines.push("|---|---|---|")
-    for (const f of extraction.fields) {
-      // Escape pipes in values for table safety
-      const safeValue = f.value.replace(/\|/g, "\\|").replace(/\n/g, " ")
-      lines.push(`| ${f.field} | ${safeValue} | ${f.confidence} |`)
-    }
-  } else {
-    lines.push("（无结构化数据）")
-  }
-  lines.push("")
-
-  // Source quotes
-  const quotes = extraction.fields
-    .filter((f) => f.quote && f.quote.trim())
-    .map((f) => f.quote)
-  const uniqueQuotes = [...new Set(quotes)]
-  lines.push("## 原文依据")
-  lines.push("")
-  if (uniqueQuotes.length > 0) {
-    for (const q of uniqueQuotes.slice(0, 10)) {
-      lines.push(`> ${q.replace(/\n/g, "\n> ")}`)
-      lines.push("")
-    }
-  } else {
-    lines.push("（无原文引用）")
-  }
-  lines.push("")
-
-  // Missing info
-  lines.push("## 待补全信息")
-  lines.push("")
-  if (moduleDef) {
-    const expectedFields = getExpectedFieldsForModule(moduleDef)
-    const extractedFieldNames = new Set(extraction.fields.map((f) => f.field))
-    const missing = expectedFields.filter((f) => !extractedFieldNames.has(f))
-    if (missing.length > 0) {
-      for (const m of missing) {
-        lines.push(`- [ ] ${m}`)
-      }
-    } else {
-      lines.push("（暂无）")
-    }
-  } else {
-    lines.push("（暂无）")
-  }
+  // Full content — this is the real value: complete clause text, tables, lists
+  lines.push(merged.content)
 
   return lines.join("\n")
-}
-
-/** Heuristic: expected fields for common module types. */
-function getExpectedFieldsForModule(moduleDef: ProductModule): string[] {
-  const name = moduleDef.moduleName
-  const map: Record<string, string[]> = {
-    "产品基础信息": ["产品名称", "保险公司", "保险期间", "交费方式", "保额范围"],
-    "投保年龄": ["投保年龄范围", "续保年龄上限"],
-    "投保职业": ["职业类别限制", "特殊职业限制"],
-    "投保人群": ["适用人群", "不适用人群"],
-    "疾病等待期": ["等待期天数", "适用范围", "等待期内出险处理"],
-    "犹豫期": ["犹豫期天数", "退费规则"],
-    "专属健康告知": ["健康告知问题列表"],
-    "责任免除": ["免责条款列表"],
-    "费率表": ["费率数据"],
-  }
-  return map[name] || []
 }
 
 // ── Top-level orchestrator ────────────────────────────────────────────────
@@ -455,16 +376,15 @@ export async function runProductCatalogExtraction(
 ): Promise<string[]> {
   const activity = useActivityStore.getState()
   const allModules = PRODUCT_CATALOG_MODULES[category] ?? []
-  const allModuleNames = allModules.map((m) => m.moduleName)
 
-  if (allModuleNames.length === 0) {
+  if (allModules.length === 0) {
     log.warn("no modules defined for category", { category })
     return []
   }
 
   // ── Phase 1: Split into sections ───────────────────────────────────
   activity.updateItem(activityId, {
-    detail: `Splitting document into sections...`,
+    detail: `正在按章节切分文档...`,
   })
 
   const sections = splitIntoSections(sourceContent)
@@ -476,18 +396,17 @@ export async function runProductCatalogExtraction(
   })
 
   if (sections.length === 0) {
-    log.warn("no sections produced", { file: fileName })
+    log.warn("no sections produced", { file: fileName, contentLength: sourceContent.length })
     return []
   }
 
   activity.updateItem(activityId, {
-    detail: `${sections.length} sections found. Starting parallel extraction...`,
+    detail: `切分为 ${sections.length} 个章节，开始并行抽取...`,
   })
 
   // ── Phase 2: Parallel per-section extraction ───────────────────────
   const sectionResults: SectionExtractionResult[] = []
 
-  // Process sections in parallel batches
   for (let i = 0; i < sections.length; i += MAX_SECTION_PARALLEL) {
     if (signal?.aborted) break
     const batch = sections.slice(i, i + MAX_SECTION_PARALLEL)
@@ -497,7 +416,7 @@ export async function runProductCatalogExtraction(
         i + batchOffset,
         section.headingPath,
         sections.length,
-        allModuleNames,
+        allModules,
         category,
         productName,
         llmConfig,
@@ -518,15 +437,16 @@ export async function runProductCatalogExtraction(
     }
 
     activity.updateItem(activityId, {
-      detail: `Extracted ${Math.min(i + MAX_SECTION_PARALLEL, sections.length)}/${sections.length} sections...`,
+      detail: `已抽取 ${Math.min(i + MAX_SECTION_PARALLEL, sections.length)}/${sections.length} 个章节...`,
     })
   }
 
   // ── Phase 3: Cross-section merge ───────────────────────────────────
   activity.updateItem(activityId, {
-    detail: `Merging data across ${sectionResults.length} sections...`,
+    detail: `正在跨章节合并 ${sectionResults.length} 个章节的数据...`,
   })
 
+  const allModuleNames = allModules.map((m) => m.moduleName)
   const mergedModules = mergeModuleFragments(sectionResults, allModuleNames)
   const foundModules = mergedModules.filter((m) => m.found)
 
@@ -534,31 +454,31 @@ export async function runProductCatalogExtraction(
     file: fileName,
     totalModules: allModuleNames.length,
     foundModules: foundModules.length,
-    totalFields: foundModules.reduce((sum, m) => sum + m.fields.length, 0),
+    totalChars: foundModules.reduce((sum, m) => sum + m.content.length, 0),
     moduleNames: foundModules.map((m) => m.moduleName),
   })
 
   if (foundModules.length === 0) {
     log.warn("no modules found in any section", { file: fileName })
     activity.updateItem(activityId, {
-      detail: `No module data found in ${sections.length} sections.`,
+      detail: `在 ${sections.length} 个章节中未发现模块数据。`,
     })
     return []
   }
 
   // ── Phase 4: Write .md files ───────────────────────────────────────
   activity.updateItem(activityId, {
-    detail: `Writing ${foundModules.length} module files...`,
+    detail: `正在写入 ${foundModules.length} 个模块文件...`,
   })
 
   const writtenPaths: string[] = []
   const catalogDir = `${projectPath}/wiki/product_catalog`
   await createDirectory(catalogDir)
 
-  for (const extraction of foundModules) {
-    const moduleDef = allModules.find((m) => m.moduleName === extraction.moduleName)
-    const mdContent = buildModuleMarkdownFile(extraction, category, productName, moduleDef)
-    const mdFileName = `${category}-${productName}-${extraction.moduleName}.md`
+  for (const merged of foundModules) {
+    const moduleDef = allModules.find((m) => m.moduleName === merged.moduleName)
+    const mdContent = buildModuleMarkdownFile(merged, category, productName, moduleDef)
+    const mdFileName = `${category}-${productName}-${merged.moduleName}.md`
     const mdPath = `${catalogDir}/${mdFileName}`
     const relativePath = `wiki/product_catalog/${mdFileName}`
 
@@ -567,7 +487,8 @@ export async function runProductCatalogExtraction(
       writtenPaths.push(relativePath)
       log.info("module file written", {
         path: relativePath,
-        fields: extraction.fields.length,
+        chars: merged.content.length,
+        sections: merged.sectionCount,
       })
     } catch (err) {
       log.error("failed to write module file", {
@@ -582,7 +503,7 @@ export async function runProductCatalogExtraction(
   const sourceSummaryPath = `wiki/sources/${sourceBaseName}.md`
   const sourceSummaryFullPath = `${projectPath}/${sourceSummaryPath}`
   try {
-    const summaryContent = [
+    const summaryLines = [
       "---",
       `title: "${fileName}"`,
       `entity_type: source`,
@@ -594,26 +515,26 @@ export async function runProductCatalogExtraction(
       "",
       `# ${fileName}`,
       "",
-      `**Insurance category:** ${category}`,
-      `**Product:** ${productName}`,
-      `**Extraction method:** section-scan-merge (${sections.length} sections)`,
-      `**Modules extracted:** ${foundModules.length}/${allModuleNames.length}`,
+      `**险种类别：** ${category}`,
+      `**产品名称：** ${productName}`,
+      `**抽取方式：** 章节扫描-合并 (${sections.length} 个章节)`,
+      `**已抽取模块：** ${foundModules.length}/${allModuleNames.length}`,
       "",
-      "## Extracted modules",
+      "## 已抽取模块",
       "",
       ...foundModules.map(
-        (m) => `- **${m.moduleName}** (${m.fields.length} fields)`,
+        (m) => `- **${m.moduleName}** (${m.content.length} 字, 来自 ${m.sectionCount} 个章节)`,
       ),
       "",
-      "## Missing modules",
+      "## 未抽取模块",
       "",
       ...mergedModules
         .filter((m) => !m.found)
         .map((m) => `- [ ] ${m.moduleName}`),
-    ].join("\n")
+    ]
 
     await createDirectory(`${projectPath}/wiki/sources`)
-    await writeFile(sourceSummaryFullPath, summaryContent)
+    await writeFile(sourceSummaryFullPath, summaryLines.join("\n"))
     writtenPaths.push(sourceSummaryPath)
   } catch (err) {
     log.warn("failed to write source summary", {
@@ -623,7 +544,7 @@ export async function runProductCatalogExtraction(
   }
 
   activity.updateItem(activityId, {
-    detail: `Done: ${foundModules.length} modules, ${writtenPaths.length} files written.`,
+    detail: `完成：${foundModules.length} 个模块，${writtenPaths.length} 个文件已写入。`,
   })
 
   return writtenPaths
