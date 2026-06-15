@@ -232,5 +232,163 @@
 
 ---
 
-*最后更新：2026-06-09*  
+## v2.1 — 险种产品知识库（Product Catalog Pipeline）
+**分支**：`feature/product-catalog-domain`  
+**Commits**：`74ddd07` → `637adcc`  
+**时间**：2026-06-14 ~ 2026-06-15  
+**目标**：从无到有构建险种产品文档的自动化摄入与管理体系，支持上传 → 分批提取 → 模块化存储 → 前端浏览全链路
+
+---
+
+### 新增文件
+
+| 文件 | 作用 |
+|------|------|
+| `src/lib/product-catalog-modules.ts` | 险种模块定义注册表（6险种 × 20-30模块） |
+
+---
+
+### 核心架构：方案A（险种-产品-模块 三段命名）
+
+```
+wiki/product_catalog/{险种类别}-{产品名}-{模块名}.md
+示例：wiki/product_catalog/医疗险-安心百万医疗险2026版-保障责任.md
+```
+
+**为什么不用嵌套目录**：平铺 + Scheme A 名称使 RAG 能直接从文件名获得完整上下文（险种 + 产品 + 模块），无需读取 frontmatter。
+
+---
+
+### product-catalog-modules.ts 设计
+
+```
+PRODUCT_CATALOG_MODULES: Record<InsuranceCategoryType, ProductModule[]>
+  医疗险: [...BASE_MODULES, ...MEDICAL_MODULES]   // ~40 个模块
+  重疾险: [...BASE_MODULES, ...CI_MODULES]         // ~35 个模块
+  意外险 / 寿险 / 年金险 / 意外医疗险: 同上
+
+BASE_MODULES (所有险种共有):
+  产品基础信息, 投保年龄, 专属健康告知, 疾病等待期, 犹豫期,
+  通用责任免除, 理赔报案, 分年龄保费费率表, ...
+
+inferModulesFromSourceFileName(fileName, category):
+  条款.pdf  → 条款相关模块清单
+  费率表.xlsx → [分年龄保费费率表]
+  核保.pdf   → 核保相关模块清单
+  →  用于驱动模块批次划分
+
+getModuleBatchesForFile(fileName, category, batchSize=2):
+  将 inferModulesFromSourceFileName 结果按 batchSize 切分
+  →  用于 handleProductUpload 多任务排队
+
+encodeProductCatalogFolderContext(category, product, modules[], idx):
+  → "product_catalog > 医疗险 > XX > batch:0:产品基础信息,投保年龄"
+```
+
+---
+
+### ingest.ts 关键改动
+
+#### 1. parseProductCatalogCtxFromFolderContext（扩展）
+```typescript
+// 原格式（向下兼容）: "product_catalog > 医疗险 > 产品名"
+// 新格式: "product_catalog > 医疗险 > 产品名 > batch:0:模块1,模块2"
+返回: { category, productName, batchIndex?, batchModules? }
+```
+
+#### 2. buildProductCatalogGenerationOverride（新增，System Prompt 级别拦截）
+- 注入位置：`buildGenerationPrompt` 的 **最前面**，覆盖 "You are a wiki maintainer" 角色
+- 批次模式：只列出本批次的 2 个模块，明确禁止生成其他模块
+- 路径规则：
+  - ✅ ALLOWED: `wiki/product_catalog/{scheme A path}`
+  - ✅ ALLOWED: `wiki/sources/…` (仅 batch 0)
+  - ❌ FORBIDDEN: `wiki/entities/` / `wiki/concepts/`
+  - ❌ FORBIDDEN: 为「交费方式」「等待期」等字段值创建独立实体页
+
+#### 3. extractSchemaDrivenCandidates 跳过（关键 Bug Fix）
+```typescript
+// product_catalog 文档跳过候选实体扫描
+// 原因：该扫描会把「等待期」「交费方式」等字段值作为独立候选
+// 结果：LLM 据此在 wiki/entities/ 生成大量无效实体页
+const schemaCandidates = productCtxForIngest ? [] : extractSchemaDrivenCandidates(...)
+```
+
+#### 4. 模块批次策略（核心性能/质量决策）
+
+**问题**：一次 LLM call 要求生成 30+ 文件 → 文件名混乱、内容不完整、路径偏移。
+
+**方案**：每个文件 → N 个队列任务（每任务 2 个模块）：
+```
+产品条款.pdf → inferModulesFromSourceFileName → 6个模块
+  任务0: batch:0:产品基础信息,投保年龄
+  任务1: batch:1:疾病等待期,犹豫期
+  任务2: batch:2:通用责任免除,一般住院医疗
+```
+每个 LLM call 只生成 2 个文件 → 精准、完整、命名正确。
+
+---
+
+### knowledge-tree.tsx 改动（产品库 Tab）
+
+```
+知识面板 Tab:
+  类型  |  服务线  |  产品库   ← 新增第三个 tab
+```
+
+产品库视图结构：
+```
+险种类别（医疗险 · 2产品 · 12页）        [ShieldCheck 蓝色图标]
+  └─ 安心百万医疗险2026版  [5模块 绿色]  [FolderOpen 琥珀色]
+      ├─ 医疗险-安心百万医疗险2026版-产品基础信息
+      ├─ 医疗险-安心百万医疗险2026版-保障责任
+      └─ ...（每个模块可点击预览）
+```
+
+新增 `parseProductCatalogTitle(filename)` 解析 Scheme A 文件名 → `{ category, product, module }`，用于前端分组展示。
+
+模块数量色彩：绿色(≥5) / 蓝色(≥2) / 灰色(< 2)，直观反映知识完整度。
+
+---
+
+### sources-view.tsx 改动（Product Catalog Upload Panel）
+
+- Shield 图标按钮 → 打开产品库上传面板
+- 险种类别选择（6 险种 tabs）
+- 产品名输入框 + 文件上传
+- **排队状态展示**：「已排队 N 个模块批次任务（M 文件 × 分批）」
+
+---
+
+### knowledge-schema-normalizer.ts 改动
+
+```typescript
+// 新增路径识别
+if (path.includes("/wiki/product_catalog/")) return "product"
+```
+
+---
+
+### 待测试项
+
+- [ ] 上传一个「产品条款.pdf」到 医疗险 > [产品名]
+  - 验证：队列显示 N 个批次任务
+  - 验证：生成的文件路径以 `wiki/product_catalog/医疗险-产品名-` 开头
+  - 验证：无 `wiki/entities/` 输出
+  - 验证：每批文件数量 ≤ 2
+- [ ] 验证产品库 Tab 能正确展示抽取结果（按险种→产品→模块分组）
+- [ ] 上传费率表 XLSX → 验证只触发费率相关模块的批次任务
+
+---
+
+### 已知限制 / 后续优化
+
+- 批次之间独立调用：同一文档被读取多次（性能可优化：先缓存 OCR 结果）
+- `inferModulesFromSourceFileName` 基于文件名关键词，对自定义文件名可能误推断
+  → 后续可在上传面板让用户手动选「文档类型」
+- wiki/overview.md 每个批次都会更新（冗余）
+  → 后续可只在最后一个批次触发 overview 更新
+
+---
+
+*最后更新：2026-06-15*  
 *维护者：Claude (Antigravity) + Codex*
