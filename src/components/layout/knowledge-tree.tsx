@@ -1,11 +1,12 @@
 import React, { useState, useEffect, useCallback } from "react"
-import { FileText, Users, Lightbulb, BookOpen, HelpCircle, GitMerge, BarChart3, ChevronRight, ChevronDown, Layout, Globe, ShieldCheck, CalendarClock, BriefcaseBusiness, Network, FolderOpen } from "lucide-react"
+import { FileText, Users, Lightbulb, BookOpen, HelpCircle, GitMerge, BarChart3, ChevronRight, ChevronDown, Layout, Globe, ShieldCheck, CalendarClock, BriefcaseBusiness, Network, FolderOpen, Package } from "lucide-react"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { useWikiStore } from "@/stores/wiki-store"
 import { readFile, listDirectory } from "@/commands/fs"
 import type { FileNode } from "@/types/wiki"
 import { normalizePath } from "@/lib/path-utils"
 import { SERVICE_HIERARCHY } from "@/lib/insurance-schema-registry"
+import { INSURANCE_CATEGORIES, type InsuranceCategoryType } from "@/lib/product-catalog-modules"
 
 interface WikiPageInfo {
   path: string; title: string; type: string; domain: string; tags: string[]; origin?: string
@@ -66,7 +67,7 @@ export function KnowledgeTree() {
   const fileTree = useWikiStore((s) => s.fileTree)
 
   const [pages, setPages] = useState<WikiPageInfo[]>([])
-  const [groupMode, setGroupMode] = useState<"type" | "service">("type")
+  const [groupMode, setGroupMode] = useState<"type" | "service" | "product">("type")
   const [expandedTypes, setExpandedTypes] = useState<Set<string>>(new Set(["overview", "entity", "concept", "source"]))
   const [expandedSeries, setExpandedSeries] = useState<Set<string>>(new Set(SERVICE_HIERARCHY.map(s => s.seriesName)))
   const [expandedScenarios, setExpandedScenarios] = useState<Set<string>>(new Set())
@@ -75,6 +76,9 @@ export function KnowledgeTree() {
   const [checkedPaths, setCheckedPaths] = useState<Set<string>>(new Set())
   const [showBulkConfirm, setShowBulkConfirm] = useState(false)
   const [isDeleting, setIsDeleting] = useState(false)
+  // Product catalog: list of files in wiki/product_catalog/
+  const [productCatalogPages, setProductCatalogPages] = useState<WikiPageInfo[]>([])
+  const [expandedProducts, setExpandedProducts] = useState<Set<string>>(new Set())
 
   const loadPages = useCallback(async () => {
     if (!project) return
@@ -90,6 +94,19 @@ export function KnowledgeTree() {
         catch { infos.push({ path: f.path, title: f.name.replace(".md",""), type:"other", domain:"general", tags:[] }) }
       }
       setPages(infos)
+      // Load product catalog pages from wiki/product_catalog/
+      try {
+        const pcTree = await listDirectory(`${pp}/wiki/product_catalog`)
+        const pcFiles = flattenMdFiles(pcTree)
+        const pcInfos: WikiPageInfo[] = []
+        for (const f of pcFiles) {
+          try { pcInfos.push(parseInfo(f.path, f.name, await readFile(f.path))) }
+          catch { pcInfos.push({ path: f.path, title: f.name.replace(".md",""), type:"entity", domain:"product_catalog", tags:[] }) }
+        }
+        setProductCatalogPages(pcInfos)
+      } catch {
+        setProductCatalogPages([])
+      }
     } catch { setPages([]) }
   }, [project])
 
@@ -138,9 +155,10 @@ export function KnowledgeTree() {
         <div className="p-2">
           <div className="mb-2 px-2 text-xs font-semibold uppercase text-muted-foreground">{project.name}</div>
 
-          <div className="mb-2 grid grid-cols-2 gap-1 px-1">
+          <div className="mb-2 grid grid-cols-3 gap-1 px-1">
             <button onClick={()=>setGroupMode("type")} className={`rounded-md px-2 py-1 text-xs ${groupMode==="type"?"bg-accent text-accent-foreground":"text-muted-foreground hover:bg-accent/50"}`}>类型</button>
             <button onClick={()=>setGroupMode("service")} className={`rounded-md px-2 py-1 text-xs ${groupMode==="service"?"bg-accent text-accent-foreground":"text-muted-foreground hover:bg-accent/50"}`}>服务线</button>
+            <button onClick={()=>setGroupMode("product")} className={`rounded-md px-2 py-1 text-xs ${groupMode==="product"?"bg-accent text-accent-foreground":"text-muted-foreground hover:bg-accent/50"}`}>产品库</button>
           </div>
 
           {checkedCount > 0 && (
@@ -243,6 +261,19 @@ export function KnowledgeTree() {
 
           {/* Other non-hierarchy pages (only in service mode) */}
           {groupMode === "service" && otherPages.length > 0 && <OtherSection pages={otherPages} selectedFile={selectedFile} checkedPaths={checkedPaths} setSelectedFile={setSelectedFile} toggleCheck={toggleCheck}/>}
+
+          {/* ── PRODUCT CATALOG mode ── */}
+          {groupMode === "product" && (
+            <ProductCatalogSection
+              pages={productCatalogPages}
+              selectedFile={selectedFile}
+              checkedPaths={checkedPaths}
+              setSelectedFile={setSelectedFile}
+              toggleCheck={toggleCheck}
+              expandedProducts={expandedProducts}
+              toggleProduct={(key) => toggle(setExpandedProducts, key)}
+            />
+          )}
 
           <RawSourcesSection/>
         </div>
@@ -352,6 +383,7 @@ function parseInfo(path:string,fileName:string,content:string):WikiPageInfo {
   }
   if(!fm||title===fileName.replace(".md","")){ const hm=content.match(/^#\s+(.+)$/m); if(hm)title=hm[1].trim() }
   if(n.includes("/wiki/entities/"))type="entity"
+  else if(n.includes("/wiki/product_catalog/")){ type="entity"; domain="product_catalog" }
   else if(n.includes("/wiki/concepts/"))type="concept"
   else if(n.includes("/wiki/sources/"))type="source"
   else if(n.includes("/wiki/queries/"))type="query"
@@ -376,4 +408,130 @@ function flattenAllFiles(nodes:FileNode[]):FileNode[]{
   const f:FileNode[]=[]
   for(const n of nodes){if(n.is_dir&&n.children)f.push(...flattenAllFiles(n.children));else if(!n.is_dir)f.push(n)}
   return f
+}
+
+// ─── Product Catalog Section ─────────────────────────────────────────────────
+// Displays wiki/product_catalog/ files grouped by insurance category and product.
+// File naming follows scheme A: {category}-{product}-{module}.md
+// Parsing: split on first and second "-" segment.
+
+function parseProductCatalogTitle(fileName: string): { category: string; product: string; module: string } | null {
+  const base = fileName.replace(/\.md$/i, "")
+  // Find the insurance category prefix
+  const categories = INSURANCE_CATEGORIES as readonly string[]
+  for (const cat of categories) {
+    if (base.startsWith(cat + "-")) {
+      const rest = base.slice(cat.length + 1)
+      const dashIdx = rest.indexOf("-")
+      if (dashIdx === -1) return { category: cat, product: rest, module: "" }
+      return { category: cat, product: rest.slice(0, dashIdx), module: rest.slice(dashIdx + 1) }
+    }
+  }
+  return null
+}
+
+function ProductCatalogSection({ pages, selectedFile, checkedPaths, setSelectedFile, toggleCheck, expandedProducts, toggleProduct }: {
+  pages: WikiPageInfo[]
+  selectedFile: string | null
+  checkedPaths: Set<string>
+  setSelectedFile: (p: string) => void
+  toggleCheck: (p: string, e: React.MouseEvent) => void
+  expandedProducts: Set<string>
+  toggleProduct: (key: string) => void
+}) {
+  if (pages.length === 0) {
+    return (
+      <div className="flex flex-col items-center justify-center py-8 text-center text-xs text-muted-foreground/60">
+        <Package className="h-8 w-8 mb-2 text-muted-foreground/30" />
+        <p>尚无产品知识库文件</p>
+        <p className="mt-0.5">上传产品文档后自动抽取到 wiki/product_catalog/</p>
+      </div>
+    )
+  }
+
+  // Group by category → product
+  const grouped = new Map<string, Map<string, WikiPageInfo[]>>()
+  const unknown: WikiPageInfo[] = []
+  for (const page of pages) {
+    const parsed = parseProductCatalogTitle(page.path.split("/").pop() ?? "")
+    if (!parsed) { unknown.push(page); continue }
+    if (!grouped.has(parsed.category)) grouped.set(parsed.category, new Map())
+    const catMap = grouped.get(parsed.category)!
+    if (!catMap.has(parsed.product)) catMap.set(parsed.product, [])
+    catMap.get(parsed.product)!.push(page)
+  }
+
+  return (
+    <div className="space-y-1">
+      {INSURANCE_CATEGORIES.filter(cat => grouped.has(cat)).map(cat => {
+        const products = grouped.get(cat)!
+        const catKey = `cat-${cat}`
+        const catExpanded = expandedProducts.has(catKey)
+        const totalCount = [...products.values()].reduce((s, a) => s + a.length, 0)
+        return (
+          <div key={cat} className="mb-1">
+            {/* Category header */}
+            <button
+              onClick={() => toggleProduct(catKey)}
+              className="flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-sm font-semibold hover:bg-accent/50"
+            >
+              {catExpanded
+                ? <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                : <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />}
+              <ShieldCheck className="h-3.5 w-3.5 shrink-0 text-blue-500" />
+              <span className="flex-1 text-left">{cat}</span>
+              <span className="text-xs text-blue-400">{products.size}产品 · {totalCount}页</span>
+            </button>
+
+            {catExpanded && [...products.entries()].map(([product, modulePages]) => {
+              const productKey = `product-${cat}-${product}`
+              const productExpanded = expandedProducts.has(productKey)
+              return (
+                <div key={productKey} className="ml-3 mb-0.5">
+                  {/* Product header */}
+                  <button
+                    onClick={() => toggleProduct(productKey)}
+                    className="flex w-full items-center gap-1.5 rounded-md px-2 py-1 text-sm hover:bg-accent/50"
+                  >
+                    {productExpanded
+                      ? <ChevronDown className="h-3 w-3 shrink-0 text-muted-foreground" />
+                      : <ChevronRight className="h-3 w-3 shrink-0 text-muted-foreground" />}
+                    <FolderOpen className="h-3 w-3 shrink-0 text-amber-500" />
+                    <span className="flex-1 text-left font-medium text-sm truncate">{product}</span>
+                    <span className={`text-xs rounded px-1 ${
+                      modulePages.length >= 5 ? "bg-green-100 text-green-600" :
+                      modulePages.length >= 2 ? "bg-blue-100 text-blue-600" :
+                      "bg-muted text-muted-foreground"
+                    }`}>{modulePages.length}模块</span>
+                  </button>
+
+                  {productExpanded && (
+                    <div className="ml-4">
+                      {modulePages.map(p => (
+                        <PageRow
+                          key={p.path}
+                          page={p}
+                          selectedFile={selectedFile}
+                          checkedPaths={checkedPaths}
+                          setSelectedFile={setSelectedFile}
+                          toggleCheck={toggleCheck}
+                        />
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+        )
+      })}
+
+      {unknown.length > 0 && (
+        <div className="mt-1 border-t pt-1">
+          <div className="px-2 py-1 text-[11px] text-muted-foreground/60">其他产品文件 ({unknown.length})</div>
+          {unknown.map(p => <PageRow key={p.path} page={p} selectedFile={selectedFile} checkedPaths={checkedPaths} setSelectedFile={setSelectedFile} toggleCheck={toggleCheck} />)}
+        </div>
+      )}
+    </div>
+  )
 }

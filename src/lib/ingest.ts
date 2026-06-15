@@ -162,6 +162,72 @@ function buildProductCatalogExtractionDirective(
   ].join("\n")
 }
 
+/**
+ * Hard override system prompt prefix injected into buildGenerationPrompt when the
+ * source is a product catalog document. Replaces the generic "wiki maintainer" role
+ * and bans all wiki/entities/ / wiki/concepts/ output.
+ *
+ * Design: placed at the VERY START of the system prompt array so it wins the
+ * "first position" + "last position" priority rules for instruction following.
+ */
+function buildProductCatalogGenerationOverride(
+  category: InsuranceCategoryType,
+  productName: string,
+  sourceFileName: string,
+): string {
+  const modules = PRODUCT_CATALOG_MODULES[category]
+  const requiredModules = getRequiredModules(category)
+  const sourceBaseName = sourceFileName.replace(/\.[^.]+$/, "")
+
+  const moduleTable = modules.map((m) => {
+    const flag = requiredModules.includes(m.moduleName) ? "[必填]" : "[选填]"
+    const path = `wiki/product_catalog/${category}-${productName}-${m.moduleName}.md`
+    return `  ${flag} ${path}  (entity_type: ${m.entityType})`
+  }).join("\n")
+
+  return [
+    `## ⚠️ PRODUCT CATALOG MODE — SPECIAL EXTRACTION RULES (OVERRIDES ALL DEFAULTS)`,
+    ``,
+    `You are a product knowledge compiler for an insurance knowledge base. This source is a product document.`,
+    ``,
+    `### ABSOLUTE PATH RULES (violations cause the page to be silently discarded)`,
+    `- ✅ ALLOWED: wiki/product_catalog/${category}-${productName}-{模块名}.md`,
+    `- ✅ ALLOWED: wiki/sources/${sourceBaseName}.md  (one source summary page)`,
+    `- ❌ FORBIDDEN: wiki/entities/ — do not write ANY files here`,
+    `- ❌ FORBIDDEN: wiki/concepts/ — do not write ANY files here`,
+    `- ❌ FORBIDDEN: Creating individual entity pages for field values like "交费方式" or "等待期"`,
+    ``,
+    `### TARGET MODULE FILES (create only the ones for which the document has evidence)`,
+    moduleTable,
+    ``,
+    `### MANDATORY FRONTMATTER FIELDS FOR EVERY MODULE FILE`,
+    `knowledge_domain: product_catalog`,
+    `insurance_category: "${category}"`,
+    `product_name: "${productName}"`,
+    `dedup_key: "${category}-${productName}-{模块名}"`,
+    `entity_type: (see table above for correct value per module)`,
+    `confidence: 1.0 for explicitly stated facts; 0.7 for inferred`,
+    `inferred_fields: [list of fields NOT directly stated in source text]`,
+    ``,
+    `### WHAT TO PUT IN EACH MODULE (not separate entity pages)`,
+    `All extracted facts from this document MUST go INTO the relevant module file body and attributes.`,
+    `Do NOT create a separate entity page for "交费方式", "等待期", "保额" etc.`,
+    `Those are FIELDS (attributes) inside a module file, not standalone knowledge pages.`,
+    ``,
+    `Example correct output:`,
+    `---FILE: wiki/product_catalog/${category}-${productName}-产品基础信息.md---`,
+    `---  (frontmatter with all required fields) ---`,
+    `## 一句话摘要`,
+    `...`,
+    `## 基础参数`,
+    `| 字段 | 值 |`,
+    `|---|---|`,
+    `| 交费方式 | 一次性支付 |`,
+    `| 等待期 | 90天 |`,
+    `---END FILE---`,
+  ].join("\n")
+}
+
 import type { ChunkingConfig } from "@/types/wiki"
 import { useAuthStore } from "@/stores/auth-store"
 import { chunkMarkdown } from "@/lib/text-chunker"
@@ -3270,7 +3336,13 @@ async function autoIngestImpl(
   )
   const sourceForPrompts = preparedSource.content
   const smartIngestPlan = buildSmartIngestPlan(enrichedSourceContent)
-  const schemaCandidates = extractSchemaDrivenCandidates(enrichedSourceContent, smartIngestPlan)
+  // For product catalog documents, skip schema candidate extraction — they generate
+  // per-field entity pages (e.g. "交费方式", "等待期") which pollute wiki/entities/.
+  // Product catalog has its own module-based extraction system.
+  const productCtxForIngest = parseProductCatalogCtxFromFolderContext(folderContext)
+  const schemaCandidates = productCtxForIngest
+    ? []
+    : extractSchemaDrivenCandidates(enrichedSourceContent, smartIngestPlan)
   const schemaCandidateManifest = buildSchemaCandidateManifest(schemaCandidates, smartIngestPlan, serviceLineCtx)
   await persistSmartCompileArtifacts(pp, fileName, smartIngestPlan, schemaCandidates)
   if (schemaCandidates.length > 0) {
@@ -3345,7 +3417,7 @@ async function autoIngestImpl(
 
   let generation = ""
   const generationMessages: Parameters<typeof streamChat>[1] = [
-    { role: "system", content: buildGenerationPrompt(schema, purpose, index, fileName, overview, sourceForPrompts, chunking, _getUploaderUsername(), preparedSource, serviceLineCtx) },
+    { role: "system", content: buildGenerationPrompt(schema, purpose, index, fileName, overview, sourceForPrompts, chunking, _getUploaderUsername(), preparedSource, serviceLineCtx, productCtxForIngest) },
     {
       role: "user",
       content: [
@@ -4796,12 +4868,22 @@ export function buildGenerationPrompt(
   uploaderUsername = "unknown",
   preparedSource?: PreparedIngestSource,
   serviceLineCtx?: { lineName: string; versionName: string } | null,
+  productCatalogCtx?: { category: InsuranceCategoryType; productName: string } | null,
 ): string {
   // Use original filename (without extension) as the source summary page name
   const sourceBaseName = sourceFileName.replace(/\.[^.]+$/, "")
 
+  // ── PRODUCT CATALOG HARD OVERRIDE ────────────────────────────────────────
+  // When the source belongs to the product catalog domain, prepend a hard
+  // override block that completely replaces the generic "What to generate"
+  // section. This must come BEFORE all other instructions in the system
+  // prompt so it wins the "most recent instruction" priority tie-breaker.
+  const productCatalogOverride = productCatalogCtx
+    ? buildProductCatalogGenerationOverride(productCatalogCtx.category, productCatalogCtx.productName, sourceFileName)
+    : null
+
   return [
-    "You are a wiki maintainer. Based on the analysis provided, generate wiki files.",
+    productCatalogOverride ?? "You are a wiki maintainer. Based on the analysis provided, generate wiki files.",
     "",
     languageRule(sourceContent),
     "",
@@ -4818,15 +4900,27 @@ export function buildGenerationPrompt(
     "## What to generate",
     "",
     `1. A source summary page at **wiki/sources/${sourceBaseName}.md** (MUST use this exact path)`,
-    "2. Entity pages in wiki/entities/ for key entities identified in the analysis",
-    "3. Concept pages in wiki/concepts/ for key concepts identified in the analysis",
+    productCatalogCtx
+      ? `2. Module files in wiki/product_catalog/ ONLY. Naming: wiki/product_catalog/${productCatalogCtx.category}-${productCatalogCtx.productName}-{模块名}.md. DO NOT write to wiki/entities/.`
+      : "2. Entity pages in wiki/entities/ for key entities identified in the analysis",
+    productCatalogCtx
+      ? null
+      : "3. Concept pages in wiki/concepts/ for key concepts identified in the analysis",
     "4. An updated wiki/index.md — add new entries to existing categories, preserve all existing entries",
     "5. A log entry for wiki/log.md (just the new entry to append, format: ## [YYYY-MM-DD] ingest | Title)",
     "6. An updated wiki/overview.md — a high-level summary of what the entire wiki covers, updated to reflect the newly ingested source. This should be a comprehensive 2-5 paragraph overview of ALL topics in the wiki, not just the new source.",
     "",
     "## Page Naming Requirements",
     "",
-    serviceLineCtx
+    productCatalogCtx
+      ? [
+          `Product catalog naming rule — ALL files MUST follow scheme A:`,
+          `  wiki/product_catalog/${productCatalogCtx.category}-${productCatalogCtx.productName}-{模块名}.md`,
+          `  where 模块名 is one of: ${PRODUCT_CATALOG_MODULES[productCatalogCtx.category].map(m => m.moduleName).join("、")}`,
+          `Example: wiki/product_catalog/${productCatalogCtx.category}-${productCatalogCtx.productName}-${PRODUCT_CATALOG_MODULES[productCatalogCtx.category][0]?.moduleName ?? "产品基础信息"}.md`,
+          `NEVER write to wiki/entities/. NEVER create per-field entity pages.`,
+        ].join("\n")
+      : serviceLineCtx
       ? [
           "**Service hierarchy v2 naming (REQUIRED for this file):**",
           `- service_item entities: MUST follow \`${serviceLineCtx.lineName}-${serviceLineCtx.versionName}-{服务项名称}\``,
