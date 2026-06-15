@@ -1,4 +1,4 @@
-﻿import { createDirectory, readFile, writeFile, listDirectory, readFileAsBase64 } from "@/commands/fs"
+import { createDirectory, readFile, writeFile, listDirectory, readFileAsBase64 } from "@/commands/fs"
 import { getLogger } from "@/lib/logger"
 
 // Module-level namespaced loggers — no coupling to console or UI
@@ -3532,7 +3532,25 @@ async function autoIngestImpl(
 
   // ── Step 3: Write files ───────────────────────────────────────
   activity.updateItem(activityId, { detail: "Writing files...", step: "Analysing entity deduplication" })
-  const { writtenPaths, warnings: writeWarnings, hardFailures } = await writeFileBlocks(pp, generation, fileName)
+
+  // Hard post-filter for product catalog tasks:
+  // Even if the LLM ignores prompt constraints and emits wiki/entities/ blocks,
+  // strip them here so they NEVER touch disk.
+  let generationToWrite = generation
+  if (productCtxForIngest) {
+    // Remove any FILE block whose path starts with wiki/entities/ or wiki/concepts/
+    generationToWrite = generation.replace(
+      /---FILE:\s*wiki\/(?:entities|concepts)\/[^\n]*\n[\s\S]*?---END FILE---/g,
+      (match) => {
+        const pathMatch = match.match(/---FILE:\s*([^\n]+)/)
+        const droppedPath = pathMatch?.[1]?.trim() ?? "unknown"
+        log.warn("[product-catalog] stripped forbidden entities block", { path: droppedPath, source: fileName })
+        return ""
+      },
+    )
+  }
+
+  const { writtenPaths, warnings: writeWarnings, hardFailures } = await writeFileBlocks(pp, generationToWrite, fileName)
 
   // Stamp all newly written wiki pages as "candidate" (knowledge governance).
   // Skip structural pages (index, log, overview) — they don't need review.
