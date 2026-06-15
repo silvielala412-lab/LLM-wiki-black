@@ -3140,6 +3140,14 @@ async function autoIngestImpl(
   ])
   const sourceCacheContent = await readSourceCacheContent(sp, rawSourceContent)
 
+  // For product catalog batch tasks: suffix the cache content with the folderContext
+  // (which encodes batch index + module names). Without this, all batches for the
+  // same PDF share the same hash → batch 0 writes its cache entry, batches 1-N
+  // get a cache HIT and are skipped entirely.
+  const effectiveCacheContent = folderContext
+    ? `${sourceCacheContent}\n<!-- folderContext:${folderContext} -->`
+    : sourceCacheContent
+
   // ── Image-PDF OCR: detect scanned PDFs and run vision-model OCR ──
   let sourceContent = rawSourceContent
   let sourceOrigin: IngestSourceOrigin = "raw"
@@ -3245,7 +3253,7 @@ async function autoIngestImpl(
   // re-running them costs only the extraction time and converges the
   // source-summary page on the current pipeline's contract regardless
   // of when the file was first ingested.
-  const cachedFiles = await checkIngestCache(pp, fileName, sourceCacheContent)
+  const cachedFiles = await checkIngestCache(pp, fileName, effectiveCacheContent)
   console.log(`[ingest:diag] cache check for "${fileName}":`, cachedFiles === null ? "MISS (full pipeline)" : `HIT (${cachedFiles.length} cached files)`)
   if (cachedFiles !== null) {
     try {
@@ -3993,7 +4001,7 @@ async function autoIngestImpl(
   // — they represent deterministic decisions and caching them is
   // safe.
   if (writtenPaths.length > 0 && hardFailures.length === 0) {
-    await saveIngestCache(pp, fileName, sourceCacheContent, writtenPaths)
+    await saveIngestCache(pp, fileName, effectiveCacheContent, writtenPaths)
   } else if (hardFailures.length > 0) {
     console.warn(
       `[ingest] Skipping cache save for "${fileName}" — ${hardFailures.length} block(s) failed to write: ${hardFailures.join(", ")}`,
