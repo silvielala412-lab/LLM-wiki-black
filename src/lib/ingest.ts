@@ -2810,6 +2810,60 @@ function buildChunkDigestPrompt(fileName: string, chunkNumber: number, totalChun
   ].join("\n")
 }
 
+/**
+ * Specialized chunk digest prompt for insurance product documents.
+ * Unlike the generic digest, this preserves verbatim clause text, specific
+ * numbers, conditions, and procedures — organized by insurance module type.
+ * This is critical for downstream module generation to have enough detail.
+ */
+function buildInsuranceChunkDigestPrompt(fileName: string, chunkNumber: number, totalChunks: number): string {
+  return [
+    "You are a precise insurance policy analyst extracting structured clause data from one chunk of an insurance product document.",
+    "Your goal: preserve ALL specific rules, numbers, conditions, lists, and procedures found in this chunk.",
+    "Do NOT summarize or generalize — keep original wording for specific values (ages, amounts, percentages, days, lists).",
+    "Use Chinese where the source is Chinese.",
+    "",
+    "Output Markdown organized into these sections (only include sections with actual content in this chunk):",
+    "",
+    "## 产品基础信息",
+    "产品名称、保险公司、保险期间、交费方式、保额范围等基本要素",
+    "",
+    "## 投保约束",
+    "投保年龄（精确范围）、投保职业类别限制、投保人群、未成年人保额上限、孕妇限制等",
+    "",
+    "## 核保规则",
+    "健康告知问题（逐条列出）、标体/加费/除外/延期/拒保的具体判定条件",
+    "",
+    "## 时间约束",
+    "等待期（天数、适用疾病类型）、犹豫期（天数、退费规则）",
+    "",
+    "## 保障责任",
+    "每项保障的名称、保障范围、赔付比例、保额上限、适用条件（逐条保留原文）",
+    "",
+    "## 费用与免赔",
+    "年度免赔额（金额）、有无社保费率差异、续保条款（年限、条件）",
+    "",
+    "## 责任免除",
+    "通用免责条款逐条列出、既往症定义和免责范围",
+    "",
+    "## 保单保全",
+    "投保人变更、受益人变更、退保（现金价值计算方式）、复效条件、减保、加保、保单贷款",
+    "",
+    "## 理赔规则",
+    "报案流程、理赔所需材料清单（逐一列出）、赔付比例（有社保/无社保）、常见拒赔情形",
+    "",
+    "## 增值服务",
+    "住院垫付条件、就医绿通、异地就医限制等",
+    "",
+    "## 费率数据",
+    "保费表格数据（年龄段、保费金额，尽量保留完整表格）",
+    "",
+    `Source file: ${fileName}`,
+    `Chunk: ${chunkNumber}/${totalChunks}`,
+    "If this chunk contains no data for a section, OMIT that section entirely.",
+  ].join("\n")
+}
+
 function buildDigestMergePrompt(fileName: string): string {
   return [
     "You are merging chunk-level knowledge digests from a long source document.",
@@ -2913,6 +2967,10 @@ async function prepareSourceForIngest(
   llmConfig: LlmConfig,
   activityId: string,
   signal?: AbortSignal,
+  /** When true, uses insurance-specific chunk digest prompts to preserve
+   *  clause details (specific numbers, conditions, lists) instead of
+   *  the generic entity/concept/relations format. */
+  isProductCatalog = false,
 ): Promise<PreparedIngestSource> {
   if (sourceContent.length <= DIRECT_SOURCE_CHAR_LIMIT) {
     return {
@@ -2953,7 +3011,12 @@ async function prepareSourceForIngest(
       const digest = await streamTextWithCompileFallback(
         llmConfig,
         [
-          { role: "system", content: buildChunkDigestPrompt(fileName, i + 1, chunks.length) },
+          {
+            role: "system",
+            content: isProductCatalog
+              ? buildInsuranceChunkDigestPrompt(fileName, i + 1, chunks.length)
+              : buildChunkDigestPrompt(fileName, i + 1, chunks.length),
+          },
           { role: "user", content: chunkHeader },
         ],
         signal,
@@ -3384,6 +3447,7 @@ async function autoIngestImpl(
     llmConfig,
     activityId,
     signal,
+    !!parseProductCatalogCtxFromFolderContext(folderContext), // use insurance digest for product catalog
   )
   const sourceForPrompts = preparedSource.content
   const smartIngestPlan = buildSmartIngestPlan(enrichedSourceContent)
