@@ -212,8 +212,8 @@ export function SourcesView() {
         await loadSources()
         const canIngest = !!(llmConfig.apiKey || llmConfig.provider === "ollama" || llmConfig.provider === "custom")
         if (canIngest && importedPaths.length > 0) {
-        } else if (!canIngest) {
           // Module-batch: each file -> N tasks (2 modules per task)
+          // Prevents one LLM call generating 30+ files with broken naming.
           const tasks_pc: Array<{ sourcePath: string; folderContext: string }> = []
           for (const absPath of importedPaths) {
             const sourcePath = absPath.startsWith(pp + "/") ? absPath.slice(pp.length + 1) : absPath
