@@ -1,0 +1,902 @@
+[Skip to content](https://github.com/sdyckjq-lab/llm-wiki-skill#start-of-content)
+
+## Navigation Menu
+
+[Sign in](https://github.com/login?return_to=https%3A%2F%2Fgithub.com%2Fsdyckjq-lab%2Fllm-wiki-skill)
+- PlatformAI CODE CREATION[GitHub CopilotWrite better code with AI](https://github.com/features/copilot)[GitHub SparkBuild and deploy intelligent apps](https://github.com/features/spark)[GitHub ModelsManage and compare prompts](https://github.com/features/models)[MCP RegistryNewIntegrate external tools](https://github.com/mcp)DEVELOPER WORKFLOWS[ActionsAutomate any workflow](https://github.com/features/actions)[CodespacesInstant dev environments](https://github.com/features/codespaces)[IssuesPlan and track work](https://github.com/features/issues)[Code ReviewManage code changes](https://github.com/features/code-review)APPLICATION SECURITY[GitHub Advanced SecurityFind and fix vulnerabilities](https://github.com/security/advanced-security)[Code securitySecure your code as you build](https://github.com/security/advanced-security/code-security)[Secret protectionStop leaks before they start](https://github.com/security/advanced-security/secret-protection)EXPLORE[Why GitHub](https://github.com/why-github)[Documentation](https://docs.github.com)[Blog](https://github.blog)[Changelog](https://github.blog/changelog)[Marketplace](https://github.com/marketplace)[View all features](https://github.com/features)
+- AI CODE CREATION[GitHub CopilotWrite better code with AI](https://github.com/features/copilot)[GitHub SparkBuild and deploy intelligent apps](https://github.com/features/spark)[GitHub ModelsManage and compare prompts](https://github.com/features/models)[MCP RegistryNewIntegrate external tools](https://github.com/mcp)
+- [GitHub CopilotWrite better code with AI](https://github.com/features/copilot)
+- [GitHub SparkBuild and deploy intelligent apps](https://github.com/features/spark)
+- [GitHub ModelsManage and compare prompts](https://github.com/features/models)
+- [MCP RegistryNewIntegrate external tools](https://github.com/mcp)
+- DEVELOPER WORKFLOWS[ActionsAutomate any workflow](https://github.com/features/actions)[CodespacesInstant dev environments](https://github.com/features/codespaces)[IssuesPlan and track work](https://github.com/features/issues)[Code ReviewManage code changes](https://github.com/features/code-review)
+- [ActionsAutomate any workflow](https://github.com/features/actions)
+- [CodespacesInstant dev environments](https://github.com/features/codespaces)
+- [IssuesPlan and track work](https://github.com/features/issues)
+- [Code ReviewManage code changes](https://github.com/features/code-review)
+- APPLICATION SECURITY[GitHub Advanced SecurityFind and fix vulnerabilities](https://github.com/security/advanced-security)[Code securitySecure your code as you build](https://github.com/security/advanced-security/code-security)[Secret protectionStop leaks before they start](https://github.com/security/advanced-security/secret-protection)
+- [GitHub Advanced SecurityFind and fix vulnerabilities](https://github.com/security/advanced-security)
+- [Code securitySecure your code as you build](https://github.com/security/advanced-security/code-security)
+- [Secret protectionStop leaks before they start](https://github.com/security/advanced-security/secret-protection)
+- EXPLORE[Why GitHub](https://github.com/why-github)[Documentation](https://docs.github.com)[Blog](https://github.blog)[Changelog](https://github.blog/changelog)[Marketplace](https://github.com/marketplace)
+- [Why GitHub](https://github.com/why-github)
+- [Documentation](https://docs.github.com)
+- [Blog](https://github.blog)
+- [Changelog](https://github.blog/changelog)
+- [Marketplace](https://github.com/marketplace)
+
+## Navigation Menu
+
+- SolutionsBY COMPANY SIZE[Enterprises](https://github.com/enterprise)[Small and medium teams](https://github.com/team)[Startups](https://github.com/enterprise/startups)[Nonprofits](https://github.com/solutions/industry/nonprofits)BY USE CASE[App Modernization](https://github.com/solutions/use-case/app-modernization)[DevSecOps](https://github.com/solutions/use-case/devsecops)[DevOps](https://github.com/solutions/use-case/devops)[CI/CD](https://github.com/solutions/use-case/ci-cd)[View all use cases](https://github.com/solutions/use-case)BY INDUSTRY[Healthcare](https://github.com/solutions/industry/healthcare)[Financial services](https://github.com/solutions/industry/financial-services)[Manufacturing](https://github.com/solutions/industry/manufacturing)[Government](https://github.com/solutions/industry/government)[View all industries](https://github.com/solutions/industry)[View all solutions](https://github.com/solutions)
+- BY COMPANY SIZE[Enterprises](https://github.com/enterprise)[Small and medium teams](https://github.com/team)[Startups](https://github.com/enterprise/startups)[Nonprofits](https://github.com/solutions/industry/nonprofits)
+- [Enterprises](https://github.com/enterprise)
+- [Small and medium teams](https://github.com/team)
+- [Startups](https://github.com/enterprise/startups)
+- [Nonprofits](https://github.com/solutions/industry/nonprofits)
+- BY USE CASE[App Modernization](https://github.com/solutions/use-case/app-modernization)[DevSecOps](https://github.com/solutions/use-case/devsecops)[DevOps](https://github.com/solutions/use-case/devops)[CI/CD](https://github.com/solutions/use-case/ci-cd)[View all use cases](https://github.com/solutions/use-case)
+- [App Modernization](https://github.com/solutions/use-case/app-modernization)
+- [DevSecOps](https://github.com/solutions/use-case/devsecops)
+- [DevOps](https://github.com/solutions/use-case/devops)
+- [CI/CD](https://github.com/solutions/use-case/ci-cd)
+- [View all use cases](https://github.com/solutions/use-case)
+- BY INDUSTRY[Healthcare](https://github.com/solutions/industry/healthcare)[Financial services](https://github.com/solutions/industry/financial-services)[Manufacturing](https://github.com/solutions/industry/manufacturing)[Government](https://github.com/solutions/industry/government)[View all industries](https://github.com/solutions/industry)
+- [Healthcare](https://github.com/solutions/industry/healthcare)
+- [Financial services](https://github.com/solutions/industry/financial-services)
+- [Manufacturing](https://github.com/solutions/industry/manufacturing)
+- [Government](https://github.com/solutions/industry/government)
+- [View all industries](https://github.com/solutions/industry)
+- ResourcesEXPLORE BY TOPIC[AI](https://github.com/resources/articles?topic=ai)[Software Development](https://github.com/resources/articles?topic=software-development)[DevOps](https://github.com/resources/articles?topic=devops)[Security](https://github.com/resources/articles?topic=security)[View all topics](https://github.com/resources/articles)EXPLORE BY TYPE[Customer stories](https://github.com/customer-stories)[Events & webinars](https://github.com/resources/events)[Ebooks & reports](https://github.com/resources/whitepapers)[Business insights](https://github.com/solutions/executive-insights)[GitHub Skills](https://skills.github.com)SUPPORT & SERVICES[Documentation](https://docs.github.com)[Customer support](https://support.github.com)[Community forum](https://github.com/orgs/community/discussions)[Trust center](https://github.com/trust-center)[Partners](https://github.com/partners)[View all resources](https://github.com/resources)
+- EXPLORE BY TOPIC[AI](https://github.com/resources/articles?topic=ai)[Software Development](https://github.com/resources/articles?topic=software-development)[DevOps](https://github.com/resources/articles?topic=devops)[Security](https://github.com/resources/articles?topic=security)[View all topics](https://github.com/resources/articles)
+- [AI](https://github.com/resources/articles?topic=ai)
+- [Software Development](https://github.com/resources/articles?topic=software-development)
+- [DevOps](https://github.com/resources/articles?topic=devops)
+- [Security](https://github.com/resources/articles?topic=security)
+- [View all topics](https://github.com/resources/articles)
+
+## Navigation Menu
+
+- EXPLORE BY TYPE[Customer stories](https://github.com/customer-stories)[Events & webinars](https://github.com/resources/events)[Ebooks & reports](https://github.com/resources/whitepapers)[Business insights](https://github.com/solutions/executive-insights)[GitHub Skills](https://skills.github.com)
+- [Customer stories](https://github.com/customer-stories)
+- [Events & webinars](https://github.com/resources/events)
+- [Ebooks & reports](https://github.com/resources/whitepapers)
+- [Business insights](https://github.com/solutions/executive-insights)
+- [GitHub Skills](https://skills.github.com)
+- SUPPORT & SERVICES[Documentation](https://docs.github.com)[Customer support](https://support.github.com)[Community forum](https://github.com/orgs/community/discussions)[Trust center](https://github.com/trust-center)[Partners](https://github.com/partners)
+- [Documentation](https://docs.github.com)
+- [Customer support](https://support.github.com)
+- [Community forum](https://github.com/orgs/community/discussions)
+- [Trust center](https://github.com/trust-center)
+- [Partners](https://github.com/partners)
+- Open SourceCOMMUNITY[GitHub SponsorsFund open source developers](https://github.com/sponsors)PROGRAMS[Security Lab](https://securitylab.github.com)[Maintainer Community](https://maintainers.github.com)[Accelerator](https://github.com/accelerator)[GitHub Stars](https://stars.github.com)[Archive Program](https://archiveprogram.github.com)REPOSITORIES[Topics](https://github.com/topics)[Trending](https://github.com/trending)[Collections](https://github.com/collections)
+- COMMUNITY[GitHub SponsorsFund open source developers](https://github.com/sponsors)
+- [GitHub SponsorsFund open source developers](https://github.com/sponsors)
+- PROGRAMS[Security Lab](https://securitylab.github.com)[Maintainer Community](https://maintainers.github.com)[Accelerator](https://github.com/accelerator)[GitHub Stars](https://stars.github.com)[Archive Program](https://archiveprogram.github.com)
+- [Security Lab](https://securitylab.github.com)
+- [Maintainer Community](https://maintainers.github.com)
+- [Accelerator](https://github.com/accelerator)
+- [GitHub Stars](https://stars.github.com)
+- [Archive Program](https://archiveprogram.github.com)
+- REPOSITORIES[Topics](https://github.com/topics)[Trending](https://github.com/trending)[Collections](https://github.com/collections)
+- [Topics](https://github.com/topics)
+- [Trending](https://github.com/trending)
+- [Collections](https://github.com/collections)
+- EnterpriseENTERPRISE SOLUTIONS[Enterprise platformAI-powered developer platform](https://github.com/enterprise)AVAILABLE ADD-ONS[GitHub Advanced SecurityEnterprise-grade security features](https://github.com/security/advanced-security)[Copilot for BusinessEnterprise-grade AI features](https://github.com/features/copilot/copilot-business)[Premium SupportEnterprise-grade 24/7 support](https://github.com/premium-support)
+- ENTERPRISE SOLUTIONS[Enterprise platformAI-powered developer platform](https://github.com/enterprise)
+- [Enterprise platformAI-powered developer platform](https://github.com/enterprise)
+- AVAILABLE ADD-ONS[GitHub Advanced SecurityEnterprise-grade security features](https://github.com/security/advanced-security)[Copilot for BusinessEnterprise-grade AI features](https://github.com/features/copilot/copilot-business)[Premium SupportEnterprise-grade 24/7 support](https://github.com/premium-support)
+- [GitHub Advanced SecurityEnterprise-grade security features](https://github.com/security/advanced-security)
+- [Copilot for BusinessEnterprise-grade AI features](https://github.com/features/copilot/copilot-business)
+- [Premium SupportEnterprise-grade 24/7 support](https://github.com/premium-support)
+- [Pricing](https://github.com/pricing)
+- AI CODE CREATION[GitHub CopilotWrite better code with AI](https://github.com/features/copilot)[GitHub SparkBuild and deploy intelligent apps](https://github.com/features/spark)[GitHub ModelsManage and compare prompts](https://github.com/features/models)[MCP RegistryNewIntegrate external tools](https://github.com/mcp)
+- [GitHub CopilotWrite better code with AI](https://github.com/features/copilot)
+- [GitHub SparkBuild and deploy intelligent apps](https://github.com/features/spark)
+- [GitHub ModelsManage and compare prompts](https://github.com/features/models)
+- [MCP RegistryNewIntegrate external tools](https://github.com/mcp)
+
+## Navigation Menu
+
+- DEVELOPER WORKFLOWS[ActionsAutomate any workflow](https://github.com/features/actions)[CodespacesInstant dev environments](https://github.com/features/codespaces)[IssuesPlan and track work](https://github.com/features/issues)[Code ReviewManage code changes](https://github.com/features/code-review)
+- [ActionsAutomate any workflow](https://github.com/features/actions)
+- [CodespacesInstant dev environments](https://github.com/features/codespaces)
+- [IssuesPlan and track work](https://github.com/features/issues)
+- [Code ReviewManage code changes](https://github.com/features/code-review)
+- APPLICATION SECURITY[GitHub Advanced SecurityFind and fix vulnerabilities](https://github.com/security/advanced-security)[Code securitySecure your code as you build](https://github.com/security/advanced-security/code-security)[Secret protectionStop leaks before they start](https://github.com/security/advanced-security/secret-protection)
+- [GitHub Advanced SecurityFind and fix vulnerabilities](https://github.com/security/advanced-security)
+- [Code securitySecure your code as you build](https://github.com/security/advanced-security/code-security)
+- [Secret protectionStop leaks before they start](https://github.com/security/advanced-security/secret-protection)
+- EXPLORE[Why GitHub](https://github.com/why-github)[Documentation](https://docs.github.com)[Blog](https://github.blog)[Changelog](https://github.blog/changelog)[Marketplace](https://github.com/marketplace)
+- [Why GitHub](https://github.com/why-github)
+- [Documentation](https://docs.github.com)
+- [Blog](https://github.blog)
+- [Changelog](https://github.blog/changelog)
+- [Marketplace](https://github.com/marketplace)
+- [GitHub CopilotWrite better code with AI](https://github.com/features/copilot)
+- [GitHub SparkBuild and deploy intelligent apps](https://github.com/features/spark)
+- [GitHub ModelsManage and compare prompts](https://github.com/features/models)
+- [MCP RegistryNewIntegrate external tools](https://github.com/mcp)
+[GitHub CopilotWrite better code with AI](https://github.com/features/copilot)
+[GitHub SparkBuild and deploy intelligent apps](https://github.com/features/spark)
+[GitHub ModelsManage and compare prompts](https://github.com/features/models)
+[MCP RegistryNewIntegrate external tools](https://github.com/mcp)
+- [ActionsAutomate any workflow](https://github.com/features/actions)
+- [CodespacesInstant dev environments](https://github.com/features/codespaces)
+- [IssuesPlan and track work](https://github.com/features/issues)
+- [Code ReviewManage code changes](https://github.com/features/code-review)
+[ActionsAutomate any workflow](https://github.com/features/actions)
+[CodespacesInstant dev environments](https://github.com/features/codespaces)
+[IssuesPlan and track work](https://github.com/features/issues)
+[Code ReviewManage code changes](https://github.com/features/code-review)
+- [GitHub Advanced SecurityFind and fix vulnerabilities](https://github.com/security/advanced-security)
+- [Code securitySecure your code as you build](https://github.com/security/advanced-security/code-security)
+- [Secret protectionStop leaks before they start](https://github.com/security/advanced-security/secret-protection)
+[GitHub Advanced SecurityFind and fix vulnerabilities](https://github.com/security/advanced-security)
+[Code securitySecure your code as you build](https://github.com/security/advanced-security/code-security)
+[Secret protectionStop leaks before they start](https://github.com/security/advanced-security/secret-protection)
+- [Why GitHub](https://github.com/why-github)
+- [Documentation](https://docs.github.com)
+- [Blog](https://github.blog)
+- [Changelog](https://github.blog/changelog)
+- [Marketplace](https://github.com/marketplace)
+[Why GitHub](https://github.com/why-github)
+[Documentation](https://docs.github.com)
+[Blog](https://github.blog)
+[Changelog](https://github.blog/changelog)
+[Marketplace](https://github.com/marketplace)
+[View all features](https://github.com/features)
+- BY COMPANY SIZE[Enterprises](https://github.com/enterprise)[Small and medium teams](https://github.com/team)[Startups](https://github.com/enterprise/startups)[Nonprofits](https://github.com/solutions/industry/nonprofits)
+- [Enterprises](https://github.com/enterprise)
+- [Small and medium teams](https://github.com/team)
+- [Startups](https://github.com/enterprise/startups)
+- [Nonprofits](https://github.com/solutions/industry/nonprofits)
+
+## Navigation Menu
+
+- BY USE CASE[App Modernization](https://github.com/solutions/use-case/app-modernization)[DevSecOps](https://github.com/solutions/use-case/devsecops)[DevOps](https://github.com/solutions/use-case/devops)[CI/CD](https://github.com/solutions/use-case/ci-cd)[View all use cases](https://github.com/solutions/use-case)
+- [App Modernization](https://github.com/solutions/use-case/app-modernization)
+- [DevSecOps](https://github.com/solutions/use-case/devsecops)
+- [DevOps](https://github.com/solutions/use-case/devops)
+- [CI/CD](https://github.com/solutions/use-case/ci-cd)
+- [View all use cases](https://github.com/solutions/use-case)
+- BY INDUSTRY[Healthcare](https://github.com/solutions/industry/healthcare)[Financial services](https://github.com/solutions/industry/financial-services)[Manufacturing](https://github.com/solutions/industry/manufacturing)[Government](https://github.com/solutions/industry/government)[View all industries](https://github.com/solutions/industry)
+- [Healthcare](https://github.com/solutions/industry/healthcare)
+- [Financial services](https://github.com/solutions/industry/financial-services)
+- [Manufacturing](https://github.com/solutions/industry/manufacturing)
+- [Government](https://github.com/solutions/industry/government)
+- [View all industries](https://github.com/solutions/industry)
+- [Enterprises](https://github.com/enterprise)
+- [Small and medium teams](https://github.com/team)
+- [Startups](https://github.com/enterprise/startups)
+- [Nonprofits](https://github.com/solutions/industry/nonprofits)
+[Enterprises](https://github.com/enterprise)
+[Small and medium teams](https://github.com/team)
+[Startups](https://github.com/enterprise/startups)
+[Nonprofits](https://github.com/solutions/industry/nonprofits)
+- [App Modernization](https://github.com/solutions/use-case/app-modernization)
+- [DevSecOps](https://github.com/solutions/use-case/devsecops)
+- [DevOps](https://github.com/solutions/use-case/devops)
+- [CI/CD](https://github.com/solutions/use-case/ci-cd)
+- [View all use cases](https://github.com/solutions/use-case)
+[App Modernization](https://github.com/solutions/use-case/app-modernization)
+[DevSecOps](https://github.com/solutions/use-case/devsecops)
+[DevOps](https://github.com/solutions/use-case/devops)
+[CI/CD](https://github.com/solutions/use-case/ci-cd)
+[View all use cases](https://github.com/solutions/use-case)
+- [Healthcare](https://github.com/solutions/industry/healthcare)
+- [Financial services](https://github.com/solutions/industry/financial-services)
+- [Manufacturing](https://github.com/solutions/industry/manufacturing)
+- [Government](https://github.com/solutions/industry/government)
+- [View all industries](https://github.com/solutions/industry)
+[Healthcare](https://github.com/solutions/industry/healthcare)
+[Financial services](https://github.com/solutions/industry/financial-services)
+[Manufacturing](https://github.com/solutions/industry/manufacturing)
+[Government](https://github.com/solutions/industry/government)
+[View all industries](https://github.com/solutions/industry)
+[View all solutions](https://github.com/solutions)
+- EXPLORE BY TOPIC[AI](https://github.com/resources/articles?topic=ai)[Software Development](https://github.com/resources/articles?topic=software-development)[DevOps](https://github.com/resources/articles?topic=devops)[Security](https://github.com/resources/articles?topic=security)[View all topics](https://github.com/resources/articles)
+- [AI](https://github.com/resources/articles?topic=ai)
+- [Software Development](https://github.com/resources/articles?topic=software-development)
+- [DevOps](https://github.com/resources/articles?topic=devops)
+- [Security](https://github.com/resources/articles?topic=security)
+- [View all topics](https://github.com/resources/articles)
+- EXPLORE BY TYPE[Customer stories](https://github.com/customer-stories)[Events & webinars](https://github.com/resources/events)[Ebooks & reports](https://github.com/resources/whitepapers)[Business insights](https://github.com/solutions/executive-insights)[GitHub Skills](https://skills.github.com)
+- [Customer stories](https://github.com/customer-stories)
+- [Events & webinars](https://github.com/resources/events)
+- [Ebooks & reports](https://github.com/resources/whitepapers)
+- [Business insights](https://github.com/solutions/executive-insights)
+- [GitHub Skills](https://skills.github.com)
+
+## Navigation Menu
+
+- SUPPORT & SERVICES[Documentation](https://docs.github.com)[Customer support](https://support.github.com)[Community forum](https://github.com/orgs/community/discussions)[Trust center](https://github.com/trust-center)[Partners](https://github.com/partners)
+- [Documentation](https://docs.github.com)
+- [Customer support](https://support.github.com)
+- [Community forum](https://github.com/orgs/community/discussions)
+- [Trust center](https://github.com/trust-center)
+- [Partners](https://github.com/partners)
+- [AI](https://github.com/resources/articles?topic=ai)
+- [Software Development](https://github.com/resources/articles?topic=software-development)
+- [DevOps](https://github.com/resources/articles?topic=devops)
+- [Security](https://github.com/resources/articles?topic=security)
+- [View all topics](https://github.com/resources/articles)
+[AI](https://github.com/resources/articles?topic=ai)
+[Software Development](https://github.com/resources/articles?topic=software-development)
+[DevOps](https://github.com/resources/articles?topic=devops)
+[Security](https://github.com/resources/articles?topic=security)
+[View all topics](https://github.com/resources/articles)
+- [Customer stories](https://github.com/customer-stories)
+- [Events & webinars](https://github.com/resources/events)
+- [Ebooks & reports](https://github.com/resources/whitepapers)
+- [Business insights](https://github.com/solutions/executive-insights)
+- [GitHub Skills](https://skills.github.com)
+[Customer stories](https://github.com/customer-stories)
+[Events & webinars](https://github.com/resources/events)
+[Ebooks & reports](https://github.com/resources/whitepapers)
+[Business insights](https://github.com/solutions/executive-insights)
+[GitHub Skills](https://skills.github.com)
+- [Documentation](https://docs.github.com)
+- [Customer support](https://support.github.com)
+- [Community forum](https://github.com/orgs/community/discussions)
+- [Trust center](https://github.com/trust-center)
+- [Partners](https://github.com/partners)
+[Documentation](https://docs.github.com)
+[Customer support](https://support.github.com)
+[Community forum](https://github.com/orgs/community/discussions)
+[Trust center](https://github.com/trust-center)
+[Partners](https://github.com/partners)
+[View all resources](https://github.com/resources)
+- COMMUNITY[GitHub SponsorsFund open source developers](https://github.com/sponsors)
+- [GitHub SponsorsFund open source developers](https://github.com/sponsors)
+- PROGRAMS[Security Lab](https://securitylab.github.com)[Maintainer Community](https://maintainers.github.com)[Accelerator](https://github.com/accelerator)[GitHub Stars](https://stars.github.com)[Archive Program](https://archiveprogram.github.com)
+- [Security Lab](https://securitylab.github.com)
+- [Maintainer Community](https://maintainers.github.com)
+- [Accelerator](https://github.com/accelerator)
+- [GitHub Stars](https://stars.github.com)
+- [Archive Program](https://archiveprogram.github.com)
+- REPOSITORIES[Topics](https://github.com/topics)[Trending](https://github.com/trending)[Collections](https://github.com/collections)
+- [Topics](https://github.com/topics)
+- [Trending](https://github.com/trending)
+- [Collections](https://github.com/collections)
+- [GitHub SponsorsFund open source developers](https://github.com/sponsors)
+[GitHub SponsorsFund open source developers](https://github.com/sponsors)
+- [Security Lab](https://securitylab.github.com)
+- [Maintainer Community](https://maintainers.github.com)
+- [Accelerator](https://github.com/accelerator)
+- [GitHub Stars](https://stars.github.com)
+- [Archive Program](https://archiveprogram.github.com)
+[Security Lab](https://securitylab.github.com)
+[Maintainer Community](https://maintainers.github.com)
+[Accelerator](https://github.com/accelerator)
+[GitHub Stars](https://stars.github.com)
+[Archive Program](https://archiveprogram.github.com)
+- [Topics](https://github.com/topics)
+- [Trending](https://github.com/trending)
+- [Collections](https://github.com/collections)
+[Topics](https://github.com/topics)
+[Trending](https://github.com/trending)
+[Collections](https://github.com/collections)
+- ENTERPRISE SOLUTIONS[Enterprise platformAI-powered developer platform](https://github.com/enterprise)
+- [Enterprise platformAI-powered developer platform](https://github.com/enterprise)
+
+## Navigation Menu
+
+- AVAILABLE ADD-ONS[GitHub Advanced SecurityEnterprise-grade security features](https://github.com/security/advanced-security)[Copilot for BusinessEnterprise-grade AI features](https://github.com/features/copilot/copilot-business)[Premium SupportEnterprise-grade 24/7 support](https://github.com/premium-support)
+- [GitHub Advanced SecurityEnterprise-grade security features](https://github.com/security/advanced-security)
+- [Copilot for BusinessEnterprise-grade AI features](https://github.com/features/copilot/copilot-business)
+- [Premium SupportEnterprise-grade 24/7 support](https://github.com/premium-support)
+- [Enterprise platformAI-powered developer platform](https://github.com/enterprise)
+[Enterprise platformAI-powered developer platform](https://github.com/enterprise)
+- [GitHub Advanced SecurityEnterprise-grade security features](https://github.com/security/advanced-security)
+- [Copilot for BusinessEnterprise-grade AI features](https://github.com/features/copilot/copilot-business)
+- [Premium SupportEnterprise-grade 24/7 support](https://github.com/premium-support)
+[GitHub Advanced SecurityEnterprise-grade security features](https://github.com/security/advanced-security)
+[Copilot for BusinessEnterprise-grade AI features](https://github.com/features/copilot/copilot-business)
+[Premium SupportEnterprise-grade 24/7 support](https://github.com/premium-support)
+[Pricing](https://github.com/pricing)
+
+# Search code, repositories, users, issues, pull requests...
+[Search syntax tips](https://docs.github.com/search-github/github-code-search/understanding-github-code-search-syntax)
+
+# Provide feedback
+We read every piece of feedback, and take your input very seriously.
+
+## Use saved searches to filter your results more quickly
+
+To see all available qualifiers, see our [documentation](https://docs.github.com/search-github/github-code-search/understanding-github-code-search-syntax).
+[Sign in](https://github.com/login?return_to=https%3A%2F%2Fgithub.com%2Fsdyckjq-lab%2Fllm-wiki-skill)
+[Sign up](https://github.com/signup?ref_cta=Sign+up&ref_loc=header+logged+out&ref_page=%2F%3Cuser-name%3E%2F%3Crepo-name%3E&source=header-repo&source_repo=sdyckjq-lab%2Fllm-wiki-skill)
+[Reload](https://github.com/sdyckjq-lab/llm-wiki-skill)
+[Reload](https://github.com/sdyckjq-lab/llm-wiki-skill)
+[Reload](https://github.com/sdyckjq-lab/llm-wiki-skill)
+[sdyckjq-lab](https://github.com/sdyckjq-lab)
+[llm-wiki-skill](https://github.com/sdyckjq-lab/llm-wiki-skill)
+- 
+            [Notifications](https://github.com/login?return_to=%2Fsdyckjq-lab%2Fllm-wiki-skill)    You must be signed in to change notification settings
+
+
+- 
+          [Fork
+    216](https://github.com/login?return_to=%2Fsdyckjq-lab%2Fllm-wiki-skill)
+
+- 
+
+        [Star
+          1.7k](https://github.com/login?return_to=%2Fsdyckjq-lab%2Fllm-wiki-skill)
+
+[Notifications](https://github.com/login?return_to=%2Fsdyckjq-lab%2Fllm-wiki-skill)
+[Fork
+    216](https://github.com/login?return_to=%2Fsdyckjq-lab%2Fllm-wiki-skill)
+[Star
+          1.7k](https://github.com/login?return_to=%2Fsdyckjq-lab%2Fllm-wiki-skill)
+- 
+  [Code](https://github.com/sdyckjq-lab/llm-wiki-skill)
+- 
+  [Issues
+          3](https://github.com/sdyckjq-lab/llm-wiki-skill/issues)
+- 
+  [Pull requests
+          0](https://github.com/sdyckjq-lab/llm-wiki-skill/pulls)
+- 
+  [Actions](https://github.com/sdyckjq-lab/llm-wiki-skill/actions)
+- 
+  [Projects](https://github.com/sdyckjq-lab/llm-wiki-skill/projects)
+- 
+  [Security and quality
+          0](https://github.com/sdyckjq-lab/llm-wiki-skill/security)
+- 
+  [Insights](https://github.com/sdyckjq-lab/llm-wiki-skill/pulse)
+[Code](https://github.com/sdyckjq-lab/llm-wiki-skill)
+[Issues
+          3](https://github.com/sdyckjq-lab/llm-wiki-skill/issues)
+[Pull requests
+          0](https://github.com/sdyckjq-lab/llm-wiki-skill/pulls)
+[Actions](https://github.com/sdyckjq-lab/llm-wiki-skill/actions)
+[Projects](https://github.com/sdyckjq-lab/llm-wiki-skill/projects)
+[Security and quality
+          0](https://github.com/sdyckjq-lab/llm-wiki-skill/security)
+[Insights](https://github.com/sdyckjq-lab/llm-wiki-skill/pulse)
+- 
+
+
+    [Code](https://github.com/sdyckjq-lab/llm-wiki-skill)
+
+
+- 
+
+
+    [Issues](https://github.com/sdyckjq-lab/llm-wiki-skill/issues)
+
+
+- 
+
+
+    [Pull requests](https://github.com/sdyckjq-lab/llm-wiki-skill/pulls)
+
+
+- 
+
+
+    [Actions](https://github.com/sdyckjq-lab/llm-wiki-skill/actions)
+
+
+- 
+
+
+    [Projects](https://github.com/sdyckjq-lab/llm-wiki-skill/projects)
+
+
+- 
+
+
+    [Security and quality](https://github.com/sdyckjq-lab/llm-wiki-skill/security)
+
+
+- 
+
+
+    [Insights](https://github.com/sdyckjq-lab/llm-wiki-skill/pulse)
+
+
+[Code](https://github.com/sdyckjq-lab/llm-wiki-skill)
+[Issues](https://github.com/sdyckjq-lab/llm-wiki-skill/issues)
+[Pull requests](https://github.com/sdyckjq-lab/llm-wiki-skill/pulls)
+[Actions](https://github.com/sdyckjq-lab/llm-wiki-skill/actions)
+[Projects](https://github.com/sdyckjq-lab/llm-wiki-skill/projects)
+[Security and quality](https://github.com/sdyckjq-lab/llm-wiki-skill/security)
+[Insights](https://github.com/sdyckjq-lab/llm-wiki-skill/pulse)
+
+# sdyckjq-lab/llm-wiki-skill
+
+[Branches](https://github.com/sdyckjq-lab/llm-wiki-skill/branches)
+[Tags](https://github.com/sdyckjq-lab/llm-wiki-skill/tags)
+
+## History
+[155 Commits](https://github.com/sdyckjq-lab/llm-wiki-skill/commits/main/)
+[deps](https://github.com/sdyckjq-lab/llm-wiki-skill/tree/main/deps)
+[deps](https://github.com/sdyckjq-lab/llm-wiki-skill/tree/main/deps)
+[docs](https://github.com/sdyckjq-lab/llm-wiki-skill/tree/main/docs)
+[docs](https://github.com/sdyckjq-lab/llm-wiki-skill/tree/main/docs)
+[platforms](https://github.com/sdyckjq-lab/llm-wiki-skill/tree/main/platforms)
+[platforms](https://github.com/sdyckjq-lab/llm-wiki-skill/tree/main/platforms)
+[scripts](https://github.com/sdyckjq-lab/llm-wiki-skill/tree/main/scripts)
+[scripts](https://github.com/sdyckjq-lab/llm-wiki-skill/tree/main/scripts)
+[templates](https://github.com/sdyckjq-lab/llm-wiki-skill/tree/main/templates)
+[templates](https://github.com/sdyckjq-lab/llm-wiki-skill/tree/main/templates)
+[tests](https://github.com/sdyckjq-lab/llm-wiki-skill/tree/main/tests)
+[tests](https://github.com/sdyckjq-lab/llm-wiki-skill/tree/main/tests)
+[.gitignore](https://github.com/sdyckjq-lab/llm-wiki-skill/blob/main/.gitignore)
+[.gitignore](https://github.com/sdyckjq-lab/llm-wiki-skill/blob/main/.gitignore)
+[AGENTS.md](https://github.com/sdyckjq-lab/llm-wiki-skill/blob/main/AGENTS.md)
+[AGENTS.md](https://github.com/sdyckjq-lab/llm-wiki-skill/blob/main/AGENTS.md)
+[CHANGELOG.md](https://github.com/sdyckjq-lab/llm-wiki-skill/blob/main/CHANGELOG.md)
+[CHANGELOG.md](https://github.com/sdyckjq-lab/llm-wiki-skill/blob/main/CHANGELOG.md)
+[CLAUDE.md](https://github.com/sdyckjq-lab/llm-wiki-skill/blob/main/CLAUDE.md)
+[CLAUDE.md](https://github.com/sdyckjq-lab/llm-wiki-skill/blob/main/CLAUDE.md)
+[HERMES.md](https://github.com/sdyckjq-lab/llm-wiki-skill/blob/main/HERMES.md)
+[HERMES.md](https://github.com/sdyckjq-lab/llm-wiki-skill/blob/main/HERMES.md)
+[PLAN.md](https://github.com/sdyckjq-lab/llm-wiki-skill/blob/main/PLAN.md)
+[PLAN.md](https://github.com/sdyckjq-lab/llm-wiki-skill/blob/main/PLAN.md)
+[README.en.md](https://github.com/sdyckjq-lab/llm-wiki-skill/blob/main/README.en.md)
+[README.en.md](https://github.com/sdyckjq-lab/llm-wiki-skill/blob/main/README.en.md)
+[README.md](https://github.com/sdyckjq-lab/llm-wiki-skill/blob/main/README.md)
+[README.md](https://github.com/sdyckjq-lab/llm-wiki-skill/blob/main/README.md)
+[SKILL.md](https://github.com/sdyckjq-lab/llm-wiki-skill/blob/main/SKILL.md)
+[SKILL.md](https://github.com/sdyckjq-lab/llm-wiki-skill/blob/main/SKILL.md)
+[TODOS.md](https://github.com/sdyckjq-lab/llm-wiki-skill/blob/main/TODOS.md)
+[TODOS.md](https://github.com/sdyckjq-lab/llm-wiki-skill/blob/main/TODOS.md)
+[install.ps1](https://github.com/sdyckjq-lab/llm-wiki-skill/blob/main/install.ps1)
+[install.ps1](https://github.com/sdyckjq-lab/llm-wiki-skill/blob/main/install.ps1)
+[install.sh](https://github.com/sdyckjq-lab/llm-wiki-skill/blob/main/install.sh)
+[install.sh](https://github.com/sdyckjq-lab/llm-wiki-skill/blob/main/install.sh)
+[setup.sh](https://github.com/sdyckjq-lab/llm-wiki-skill/blob/main/setup.sh)
+[setup.sh](https://github.com/sdyckjq-lab/llm-wiki-skill/blob/main/setup.sh)
+
+## Repository files navigation
+- [README](https://github.com/sdyckjq-lab/llm-wiki-skill)
+[README](https://github.com/sdyckjq-lab/llm-wiki-skill)
+[English](https://github.com/sdyckjq-lab/llm-wiki-skill/blob/main/README.en.md) | 中文
+
+# llm-wiki
+
+基于 [Andrej Karpathy](https://karpathy.ai/) 的 [llm-wiki 方法论](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f)
+更适合国内宝宝体质的 K 神知识库
+把碎片化的信息变成持续积累、互相链接的知识库
+https://camo.githubusercontent.com/a99f572564743f31feac57721141440e7a062c0a86f16643b4ba9eed7317a769/68747470733a2f2f696d672e736869656c64732e696f2f62616467652f436c61756465254332254237436f6465782543322542374f70656e436c61772543322542374865726d65732d2545352541342539412545352542392542332545352538462542302d3761393661363f7374796c653d666c61742d737175617265266c6162656c436f6c6f723d336133303236https://github.com/sdyckjq-lab/llm-wiki-skill/blob/main/LICENSEhttps://github.com/sdyckjq-lab/llm-wiki-skill/releases []
+
+## 效果预览
+东方编辑部 × 数字山水风交互式知识图谱 — 双击 HTML 文件即可在浏览器中探索。搜索、过滤、节点视觉分层、首屏推荐预览、右侧摘要与正文、社区聚类和小地图定位，全部离线运行，不依赖服务器。
+
+## 30 秒上手
+把仓库链接扔给你正在用的 agent，让它自己完成安装。
+
+```
+# Claude Code bash install.sh --platform claude # Codex bash install.sh --platform codex # OpenClaw bash install.sh --platform openclaw # Hermes bash install.sh --platform hermes
+```
+
+然后说：
+"帮我初始化一个知识库" "帮我消化这篇：<链接>"
+核心区别：知识被编译一次，持续维护，而不是每次查询都从原始文档重新推导。
+
+## 核心亮点
+```
+[[双向链接]]
+```
+
+## 素材来源
+可选提取器需要在安装时显式开启：
+
+```
+bash install.sh --platform claude --with-optional-adapters
+```
+
+## 平台入口
+每个平台有专属入口说明：
+- [Claude Code](https://github.com/sdyckjq-lab/llm-wiki-skill/blob/main/platforms/claude/CLAUDE.md)
+- [Codex](https://github.com/sdyckjq-lab/llm-wiki-skill/blob/main/platforms/codex/AGENTS.md)
+- [OpenClaw](https://github.com/sdyckjq-lab/llm-wiki-skill/blob/main/platforms/openclaw/README.md)
+- [Hermes](https://github.com/sdyckjq-lab/llm-wiki-skill/blob/main/platforms/hermes/README.md)
+- [Obsidian Integration Guide](https://github.com/sdyckjq-lab/llm-wiki-skill/blob/main/docs/obsidian.md)
+[Claude Code](https://github.com/sdyckjq-lab/llm-wiki-skill/blob/main/platforms/claude/CLAUDE.md)
+[Codex](https://github.com/sdyckjq-lab/llm-wiki-skill/blob/main/platforms/codex/AGENTS.md)
+[OpenClaw](https://github.com/sdyckjq-lab/llm-wiki-skill/blob/main/platforms/openclaw/README.md)
+[Hermes](https://github.com/sdyckjq-lab/llm-wiki-skill/blob/main/platforms/hermes/README.md)
+[Obsidian Integration Guide](https://github.com/sdyckjq-lab/llm-wiki-skill/blob/main/docs/obsidian.md)
+- 研究方向引导 — purpose.md 让 agent 在整理和查询时有明确方向
+- 两步式整理 — 先分析后生成，长内容走两步链式思考，短内容简化处理
+- ingest 格式验证 — 脚本自动校验分析结果，模型再笨也不会写出残缺数据
+- 智能素材路由 — 根据 URL 域名自动选择最佳提取方式
+- 核心优先安装 — 默认只准备知识库主线，网页/X/公众号/YouTube/知乎按需显式开启
+- 伴随升级命令 — Claude Code 安装后自带 /llm-wiki-upgrade
+- 素材删除 — 级联删除时自动清理关联页面、断链和缓存
+- 图谱运行时兜底更稳 — helper 同时支持浏览器全局与 CommonJS，旧运行时下的复杂 emoji 截断和离线 HTML 失败回滚都更可靠
+- 查询结果持久化 — 有价值的综合回答可保存回知识库，越用越完整
+- 批量消化 — 给一个文件夹路径，批量处理所有文件
+- 知识库健康检查 — 脚本检测孤立页面、断链、index 一致性；AI 层面检查矛盾和交叉引用
+- ingest 隐私自查 — 首次消化素材时提醒检查手机号、API key 等敏感信息
+- 图谱关系词汇表 — 可选的手动标注词汇，让图谱表达更精确
+- Obsidian 兼容 — 所有内容都是本地 markdown，直接用 Obsidian 打开
+
+```
+purpose.md
+```
+
+
+```
+/llm-wiki-upgrade
+```
+
+### 默认安装位置
+```
+~/.claude/skills/llm-wiki
+```
+
+
+```
+~/.codex/skills/llm-wiki
+```
+
+
+```
+~/.openclaw/skills/llm-wiki
+```
+
+
+```
+~/.hermes/skills/llm-wiki
+```
+
+### 更新
+已安装？进入仓库目录执行：
+
+```
+bash install.sh --upgrade
+```
+
+自动完成：git pull → 检测已安装平台 → 重新复制核心文件 → 已有 hook 不受影响。
+
+```
+git pull
+```
+
+Claude Code 默认安装的，可以直接用 /llm-wiki-upgrade。
+
+```
+/llm-wiki-upgrade
+```
+
+自定义目录：
+
+```
+bash install.sh --upgrade --platform openclaw --target-dir <你的技能目录>/llm-wiki
+```
+
+
+```
+bash install.sh --upgrade --platform hermes --target-dir <你的技能目录>/llm-wiki
+```
+
+### 前置条件
+- 核心：agent 能执行 shell 命令、读写本地文件即可；图谱构建和来源信号覆盖检查需要 jq + node
+- 可选：微信公众号提取需要 uv；网页提取需要 bun 或 npm；需要登录态的内容可开启 Chrome 调试端口 9222
+
+```
+jq
+```
+
+
+```
+node
+```
+
+
+```
+uv
+```
+
+
+```
+bun
+```
+
+
+```
+npm
+```
+
+
+```
+你的知识库/ ├── raw/ # 原始素材（不可变） │ ├── articles/ # 网页文章 │ ├── tweets/ # X/Twitter │ ├── wechat/ # 微信公众号 │ ├── xiaohongshu/ # 小红书 │ ├── zhihu/ # 知乎 │ ├── pdfs/ # PDF │ ├── notes/ # 笔记 │ └── assets/ # 图片等附件 ├── wiki/ # AI 生成的知识库 │ ├── entities/ # 实体页（人物、概念、工具） │ ├── topics/ # 主题页 │ ├── sources/ # 素材摘要 │ ├── comparisons/ # 对比分析 │ ├── synthesis/ # 综合分析 │ │ └── sessions/ # 对话结晶化页面 │ └── queries/ # 保存的查询结果 ├── purpose.md # 研究方向与目标 ├── index.md # 索引 ├── log.md # 操作日志 ├── .wiki-schema.md # 配置 └── .wiki-cache.json # 素材去重缓存
+```
+
+
+```
+你的知识库/ ├── raw/ # 原始素材（不可变） │ ├── articles/ # 网页文章 │ ├── tweets/ # X/Twitter │ ├── wechat/ # 微信公众号 │ ├── xiaohongshu/ # 小红书 │ ├── zhihu/ # 知乎 │ ├── pdfs/ # PDF │ ├── notes/ # 笔记 │ └── assets/ # 图片等附件 ├── wiki/ # AI 生成的知识库 │ ├── entities/ # 实体页（人物、概念、工具） │ ├── topics/ # 主题页 │ ├── sources/ # 素材摘要 │ ├── comparisons/ # 对比分析 │ ├── synthesis/ # 综合分析 │ │ └── sessions/ # 对话结晶化页面 │ └── queries/ # 保存的查询结果 ├── purpose.md # 研究方向与目标 ├── index.md # 索引 ├── log.md # 操作日志 ├── .wiki-schema.md # 配置 └── .wiki-cache.json # 素材去重缓存
+```
+
+这个仓库还是只给 Claude 用吗？ 不是。Claude 只是其中一个入口。同一个链接能被 Claude Code、Codex、OpenClaw、Hermes 安装和使用。
+为什么 Hermes 要看 HERMES.md？ Hermes 会优先加载仓库根的 HERMES.md 作为项目上下文。这个文件只负责 Hermes 的入口与安装说明，核心能力和工作流仍以 SKILL.md 为准。
+
+```
+HERMES.md
+```
+
+
+```
+HERMES.md
+```
+
+
+```
+SKILL.md
+```
+
+Claude Code 里可以直接用命令更新吗？ 可以。默认安装后自带 /llm-wiki-upgrade，更新核心主线。需要网页/X/公众号/YouTube/知乎提取能力时，再加 --with-optional-adapters。
+
+```
+/llm-wiki-upgrade
+```
+
+
+```
+--with-optional-adapters
+```
+
+X/Twitter 提取失败？ 确保已安装可选提取器（--with-optional-adapters）。需要登录态的内容请开启 Chrome 调试端口 9222，或者直接粘贴内容给 agent。
+
+```
+--with-optional-adapters
+```
+
+公众号提取失败？ 需要 uv。安装后重新运行 bash install.sh --platform <你的平台> --with-optional-adapters。
+
+```
+uv
+```
+
+
+```
+bash install.sh --platform <你的平台> --with-optional-adapters
+```
+
+## Windows 用户
+
+Windows PowerShell 5.1（Win10 / Win11 系统自带）默认 console 编码为 GB2312、$OutputEncoding 为 ASCII，Python 子进程 sys.stdout.encoding 默认为 gbk。直接在 PS 5.1 下运行 bash install.sh 会导致中文输出和 hook JSON 出现乱码（[#16](https://github.com/sdyckjq-lab/llm-wiki-skill/issues/16)）。
+
+```
+$OutputEncoding
+```
+
+
+```
+sys.stdout.encoding
+```
+
+
+```
+gbk
+```
+
+
+```
+bash install.sh
+```
+
+方案 A — 使用 install.ps1（推荐）
+
+```
+install.ps1
+```
+
+在仓库根目录下：
+
+```
+powershell -ExecutionPolicy Bypass -File install.ps1 --platform claude powershell -ExecutionPolicy Bypass -File install.ps1 --platform codex --dry-run
+```
+
+install.ps1 会自动把 console / $OutputEncoding / PYTHONIOENCODING 全部设为 UTF-8，再转发到 bash install.sh。
+
+```
+install.ps1
+```
+
+
+```
+$OutputEncoding
+```
+
+
+```
+PYTHONIOENCODING
+```
+
+
+```
+bash install.sh
+```
+
+方案 B — 手动设置 PowerShell 编码
+
+```
+chcp 65001 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 $OutputEncoding = [System.Text.Encoding]::UTF8 $env:PYTHONIOENCODING = 'utf-8' bash install.sh --platform claude
+```
+
+方案 C — 升级到 PowerShell 7+
+PowerShell 7 默认 UTF-8。安装：winget install Microsoft.PowerShell，然后 pwsh 下直接 bash install.sh --platform claude。
+
+```
+winget install Microsoft.PowerShell
+```
+
+
+```
+pwsh
+```
+
+
+```
+bash install.sh --platform claude
+```
+
+### Python 命令
+
+Windows 上 Python 通常安装为 python.exe 而非 python3.exe（Microsoft Store 的 python3 是安装提示 stub，调用会失败）。本项目 scripts/shared-config.sh 已加入自动检测：先尝试 python3，失败回退到 python。所以只要 Python 3.8+ 在 PATH 中（任一命名即可），脚本能正常工作。
+
+```
+python.exe
+```
+
+
+```
+python3.exe
+```
+
+
+```
+python3
+```
+
+
+```
+scripts/shared-config.sh
+```
+
+
+```
+python3
+```
+
+
+```
+python
+```
+
+## 致谢
+本项目复用和集成了以下开源项目：
+- [Andrej Karpathy](https://karpathy.ai/) — [llm-wiki gist](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f)，核心方法论来源
+- [baoyu-url-to-markdown](https://github.com/[JimLiu](https://github.com/JimLiu)/baoyu-skills#baoyu-url-to-markdown) by JimLiu — 网页、X/Twitter 内容提取
+- youtube-transcript — YouTube 字幕提取
+- [wechat-article-to-markdown](https://github.com/jackwener/wechat-article-to-markdown) — 微信公众号文章提取
+[Andrej Karpathy](https://karpathy.ai/)
+[llm-wiki gist](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f)
+[baoyu-url-to-markdown](https://github.com/JimLiu/baoyu-skills#baoyu-url-to-markdown)
+[JimLiu](https://github.com/JimLiu)
+[wechat-article-to-markdown](https://github.com/jackwener/wechat-article-to-markdown)
+
+## License
+MIT
+
+## About
+基于 Karpathy llm-wiki 方法论的个人知识库构建 Skill，支持多平台！
+
+### Resources
+[Readme](https://github.com/sdyckjq-lab/llm-wiki-skill#readme-ov-file)
+
+### Uh oh!
+There was an error while loading. [Please reload this page](https://github.com/sdyckjq-lab/llm-wiki-skill).
+[Activity](https://github.com/sdyckjq-lab/llm-wiki-skill/activity)
+
+### Stars
+[1.7k
+        stars](https://github.com/sdyckjq-lab/llm-wiki-skill/stargazers)
+
+### Watchers
+[5
+        watching](https://github.com/sdyckjq-lab/llm-wiki-skill/watchers)
+
+### Forks
+[216
+        forks](https://github.com/sdyckjq-lab/llm-wiki-skill/forks)
+[Report repository](https://github.com/contact/report-content?content_url=https%3A%2F%2Fgithub.com%2Fsdyckjq-lab%2Fllm-wiki-skill&report=sdyckjq-lab+%28user%29)
+
+## [Releases](https://github.com/sdyckjq-lab/llm-wiki-skill/releases)
+[Releases](https://github.com/sdyckjq-lab/llm-wiki-skill/releases)
+[1
+      tags](https://github.com/sdyckjq-lab/llm-wiki-skill/tags)
+
+## [Packages 0](https://github.com/users/sdyckjq-lab/packages?repo_name=llm-wiki-skill)
+[Packages
+      0](https://github.com/users/sdyckjq-lab/packages?repo_name=llm-wiki-skill)
+
+### Uh oh!
+
+There was an error while loading. [Please reload this page](https://github.com/sdyckjq-lab/llm-wiki-skill).
+
+## [Contributors](https://github.com/sdyckjq-lab/llm-wiki-skill/graphs/contributors)
+
+[Contributors](https://github.com/sdyckjq-lab/llm-wiki-skill/graphs/contributors)
+
+### Uh oh!
+
+There was an error while loading. [Please reload this page](https://github.com/sdyckjq-lab/llm-wiki-skill).
+
+## Languages
+
+- 
+        [Shell
+          46.9%](https://github.com/sdyckjq-lab/llm-wiki-skill/search?l=shell)
+
+- 
+        [JavaScript
+          32.9%](https://github.com/sdyckjq-lab/llm-wiki-skill/search?l=javascript)
+
+- 
+        [HTML
+          19.6%](https://github.com/sdyckjq-lab/llm-wiki-skill/search?l=html)
+
+- 
+        [PowerShell
+          0.6%](https://github.com/sdyckjq-lab/llm-wiki-skill/search?l=powershell)
+
+[Shell
+          46.9%](https://github.com/sdyckjq-lab/llm-wiki-skill/search?l=shell)
+[JavaScript
+          32.9%](https://github.com/sdyckjq-lab/llm-wiki-skill/search?l=javascript)
+[HTML
+          19.6%](https://github.com/sdyckjq-lab/llm-wiki-skill/search?l=html)
+[PowerShell
+          0.6%](https://github.com/sdyckjq-lab/llm-wiki-skill/search?l=powershell)
+
+### Footer navigation
+
+- 
+            [Terms](https://docs.github.com/site-policy/github-terms/github-terms-of-service)
+
+- 
+            [Privacy](https://docs.github.com/site-policy/privacy-policies/github-privacy-statement)
+
+- 
+            [Security](https://github.com/security)
+
+- 
+            [Status](https://www.githubstatus.com/)
+
+- 
+            [Community](https://github.community/)
+
+- 
+            [Docs](https://docs.github.com/)
+
+- 
+            [Contact](https://support.github.com?tags=dotcom-footer)
+
+- 
+
+
+       Manage cookies
+
+
+
+- 
+
+
+      Do not share my personal information
+
+
+
+[Terms](https://docs.github.com/site-policy/github-terms/github-terms-of-service)
+[Privacy](https://docs.github.com/site-policy/privacy-policies/github-privacy-statement)
+[Security](https://github.com/security)
+[Status](https://www.githubstatus.com/)
+[Community](https://github.community/)
+[Docs](https://docs.github.com/)
+[Contact](https://support.github.com?tags=dotcom-footer)
