@@ -48,6 +48,14 @@ let sessionEntityTitles = new Set<string>()
 const PROCESSING_STALE_MS = 30 * 60 * 1000
 /** Heartbeat timer ID — polls processNext every 15s to self-recover from any stuck state. */
 let heartbeatTimer: ReturnType<typeof setInterval> | null = null
+/**
+ * Tracks which source file paths are currently being processed.
+ * For product catalog batches: multiple batch tasks share the same sourcePath.
+ * We run them serially (one batch at a time per file) to prevent concurrent
+ * writes to wiki/overview.md and wiki/index.md.
+ * Different source files still run in parallel (up to MAX_PARALLEL).
+ */
+let activeSourcePaths = new Set<string>()
 
 // ── Persistence ───────────────────────────────────────────────────────────
 
@@ -362,6 +370,7 @@ export function clearQueueState(): void {
   currentProjectPath = ""
   abortControllers = new Map()
   writtenFilesByTask = new Map()
+  activeSourcePaths = new Set()
   sweepAbortController = null
   processedSinceDrain = false
 }
@@ -385,6 +394,7 @@ export async function pauseQueue(): Promise<void> {
   for (const [, ctrl] of abortControllers) ctrl.abort()
   abortControllers.clear()
   writtenFilesByTask.clear()
+  activeSourcePaths.clear()
   activeCount = 0
 
   if (sweepAbortController) {
@@ -616,7 +626,14 @@ async function processNext(projectId: string): Promise<void> {
   if (activeCount >= MAX_PARALLEL) return
   if (currentProjectId !== projectId) return
 
-  const next = queue.find((t) => t.projectId === projectId && t.status === "pending")
+  const next = queue.find(
+    (t) =>
+      t.projectId === projectId &&
+      t.status === "pending" &&
+      // Per-sourcePath serialization: only one batch per source file runs at a time.
+      // Different source files still run concurrently.
+      !activeSourcePaths.has(t.sourcePath),
+  )
   if (!next) {
     // Queue fully drained — trigger review cleanup when all tasks also finish
     if (activeCount === 0) {
@@ -643,6 +660,7 @@ async function processNext(projectId: string): Promise<void> {
 
   // Mark task as processing and increment active count
   activeCount++
+  activeSourcePaths.add(next.sourcePath)
   next.status = "processing"
   next.startedAt = Date.now()
   await saveQueue(pp)
@@ -707,6 +725,7 @@ async function processNext(projectId: string): Promise<void> {
       // Success
       abortControllers.delete(taskId)
       writtenFilesByTask.delete(taskId)
+      activeSourcePaths.delete(next.sourcePath)
       queue = queue.filter((t) => t.id !== taskId)
       processedSinceDrain = true
       await saveQueue(pp)
@@ -716,6 +735,7 @@ async function processNext(projectId: string): Promise<void> {
       if (currentProjectId !== projectId) return
       abortControllers.delete(taskId)
       writtenFilesByTask.delete(taskId)
+      activeSourcePaths.delete(next.sourcePath)
       const message = err instanceof Error ? err.message : String(err)
       next.retryCount++
       next.error = message
