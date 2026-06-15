@@ -446,7 +446,7 @@ export async function runProductCatalogExtraction(
   }
 
   // ── Phase 4: Write main file ───────────────────────────────
-  activity.updateItem(activityId, { detail: `正在生成产品主文件...` })
+  activity.updateItem(activityId, { detail: `正在生成产品主文件 + 模块文件...` })
   const catalogDir = `${projectPath}/wiki/product_catalog`
   await createDirectory(catalogDir)
 
@@ -470,8 +470,65 @@ export async function runProductCatalogExtraction(
     log.error("failed to write main file", { error: String(err) })
   }
 
+  // ── Phase 5: Write individual module files for long fields ──
+  const baseFieldNames = new Set(BASE_FIELDS.map(f => f.fieldName))
+  const longFields = allFields.filter(f => f.valueType === "long")
+
+  for (const f of longFields) {
+    const m = mergedFields.get(f.fieldName)
+    if (!m || m.values.length === 0) continue
+
+    // Build module file content
+    const moduleLines: string[] = []
+    moduleLines.push("---")
+    moduleLines.push(`title: "${category}-${productName}-${f.fieldName}"`)
+    moduleLines.push(`knowledge_domain: product_catalog`)
+    moduleLines.push(`insurance_category: "${category}"`)
+    moduleLines.push(`product_name: "${productName}"`)
+    moduleLines.push(`field_name: "${f.fieldName}"`)
+    moduleLines.push(`field_type: long`)
+    moduleLines.push(`status: candidate`)
+    moduleLines.push(`created_by: auto-extract`)
+    moduleLines.push(`source_sections: ${m.sectionIndices.length}`)
+    moduleLines.push("---")
+    moduleLines.push("")
+    moduleLines.push(`# ${f.fieldName}`)
+    moduleLines.push("")
+
+    if (m.values.length === 1) {
+      moduleLines.push(m.values[0])
+    } else {
+      for (let i = 0; i < m.values.length; i++) {
+        if (i > 0) {
+          moduleLines.push("")
+          moduleLines.push("---")
+          moduleLines.push(`<!-- 以下内容来自文档第 ${m.sectionIndices[i] + 1} 部分 -->`)
+          moduleLines.push("")
+        }
+        moduleLines.push(m.values[i])
+      }
+    }
+
+    const moduleFileName = `${category}-${productName}-${f.fieldName}.md`
+    const modulePath = `${catalogDir}/${moduleFileName}`
+    const moduleRelative = `wiki/product_catalog/${moduleFileName}`
+
+    try {
+      await writeFile(modulePath, moduleLines.join("\n"))
+      writtenPaths.push(moduleRelative)
+    } catch (err) {
+      log.error("failed to write module file", { path: moduleRelative, error: String(err) })
+    }
+  }
+
+  log.info("all files written", {
+    total: writtenPaths.length,
+    mainFile: mainRelative,
+    moduleFiles: writtenPaths.length - 1,
+  })
+
   activity.updateItem(activityId, {
-    detail: `完成：${filledCount}/${allFields.length} 个字段已填充，${writtenPaths.length} 个文件已写入。`,
+    detail: `完成：${filledCount}/${allFields.length} 个字段，${writtenPaths.length} 个文件已写入（1 主文件 + ${writtenPaths.length - 1} 模块文件）。`,
   })
 
   return writtenPaths
