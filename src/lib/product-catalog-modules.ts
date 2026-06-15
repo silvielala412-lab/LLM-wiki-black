@@ -1,4 +1,4 @@
-/**
+﻿/**
  * product-catalog-modules.ts
  *
  * 险种产品知识库模块定义。
@@ -457,27 +457,29 @@ export function calcModuleCompleteness(
 /**
  * Given a source file name, compute the list of module batches to extract.
  *
- * Strategy:
- * 1. Use inferModulesFromSourceFileName to find which modules this file likely covers.
- * 2. Split that list into chunks of `batchSize` modules.
- * 3. Each batch becomes one focused LLM ingest job (via folderContext batch encoding).
+ * Batch size guidelines (auto-selected based on filename):
+ * - \u6761\u6b3e/\u8bf4\u660e\u4e66/\u624b\u518c (comprehensive docs): 4 modules/batch \u2192 ~7 tasks for medical
+ * - \u8d39\u7387/\u6838\u4fdd/\u7406\u8d54 (specialist docs): 3 modules/batch \u2192 precise focus
  *
- * Why batching?
- * - A single LLM call can't reliably generate 30+ structured module files at once.
- * - Focused 2-module calls produce complete, correctly-named, high-quality output.
- * - Source summary page (wiki/sources/*.md) is generated only in batch 0.
- *
- * @returns Array of module name lists, e.g. [["产品基础信息","投保年龄"], ["疾病等待期","犹豫期"], ...]
+ * Source summary (wiki/sources/) is generated only in batch 0.
  */
 export function getModuleBatchesForFile(
   sourceFileName: string,
   category: InsuranceCategoryType,
-  batchSize = 2,
+  batchSize?: number,
 ): string[][] {
+  const name = sourceFileName.toLowerCase()
+  // Auto-select batch size based on document type
+  const effectiveBatchSize = batchSize ?? (
+    (name.includes("\u6761\u6b3e") || name.includes("clause") || name.includes("\u8bf4\u660e\u4e66") || name.includes("\u624b\u518c"))
+      ? 4  // Comprehensive docs: 4/batch \u2192 ~7 tasks instead of 14
+      : 3  // Specialist docs: 3/batch
+  )
+
   const candidateModules = inferModulesFromSourceFileName(sourceFileName, category)
   const allModuleNames = PRODUCT_CATALOG_MODULES[category].map(m => m.moduleName)
 
-  // Use the inferred modules, but fall back to required modules if too few
+  // Use the inferred modules, fall back to required-only if infer returns nothing
   let targetModules = candidateModules.length > 0 ? candidateModules : allModuleNames.filter(n =>
     PRODUCT_CATALOG_MODULES[category].find(m => m.moduleName === n)?.required
   )
@@ -487,8 +489,8 @@ export function getModuleBatchesForFile(
 
   // Split into batches
   const batches: string[][] = []
-  for (let i = 0; i < targetModules.length; i += batchSize) {
-    batches.push(targetModules.slice(i, i + batchSize))
+  for (let i = 0; i < targetModules.length; i += effectiveBatchSize) {
+    batches.push(targetModules.slice(i, i + effectiveBatchSize))
   }
   return batches.length > 0 ? batches : [targetModules]
 }

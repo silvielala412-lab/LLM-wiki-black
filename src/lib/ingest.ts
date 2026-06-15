@@ -286,8 +286,12 @@ function _getUploaderUsername(): string {
 
 const OCR_IMAGE_EXTS = new Set(["png", "jpg", "jpeg", "webp", "gif", "bmp", "tiff", "tif"])
 const DIRECT_SOURCE_CHAR_LIMIT = 50000
-const LONG_SOURCE_DIGEST_LIMIT = 48000
-const LONG_SOURCE_MERGE_BATCH_CHARS = 30000
+/** Max chars of the merged digest fed into the generation prompt.
+ *  Higher = more coverage of long PDFs at the cost of more context tokens.
+ *  48K was too low for 100+ page insurance PDFs; raised to 120K. */
+const LONG_SOURCE_DIGEST_LIMIT = 120000
+/** Max chars per batch in hierarchical digest merging. */
+const LONG_SOURCE_MERGE_BATCH_CHARS = 60000
 const OCR_DETAIL_SECTION_MARKER = "<!-- LLM_WIKI_OCR_DETAIL_START -->"
 const OCR_DETAIL_SECTION_END_MARKER = "<!-- LLM_WIKI_OCR_DETAIL_END -->"
 const SCHEMA_CANDIDATE_AUDIT_MARKER = "<!-- LLM_WIKI_SCHEMA_CANDIDATE_AUDIT_START -->"
@@ -2953,7 +2957,7 @@ async function prepareSourceForIngest(
           { role: "user", content: chunkHeader },
         ],
         signal,
-        { temperature: 0.05, max_tokens: 1800 },
+        { temperature: 0.05, max_tokens: 3500 },
         activityId,
         `Long document chunk ${i + 1}/${chunks.length}`,
       )
