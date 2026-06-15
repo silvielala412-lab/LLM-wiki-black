@@ -41,6 +41,14 @@ import {
 } from "@/lib/entity-normalizer"
 import { resolveIncomingKnowledgePage } from "@/lib/knowledge-resolution"
 import { buildServiceItemTitle, findServiceLineVersion, SERVICE_HIERARCHY } from "@/lib/insurance-schema-registry"
+import {
+  type InsuranceCategoryType,
+  INSURANCE_CATEGORIES,
+  PRODUCT_CATALOG_MODULES,
+  buildProductModuleTitle,
+  inferModulesFromSourceFileName,
+  getRequiredModules,
+} from "@/lib/product-catalog-modules"
 import type { MultimodalConfig } from "@/stores/wiki-store"
 
 /**
@@ -68,6 +76,90 @@ export function extractServiceLineCtxFromPath(
   if (!ctx) return null
   // Use canonical version name (resolves aliases like 易核版→尊享易核版)
   return { lineName, versionName: ctx.canonicalVersionName, seriesName: ctx.series, scenarioName: ctx.scenario }
+}
+
+/**
+ * Parse product catalog context from folderContext string.
+ *
+ * Expected format: "product_catalog > {category} > {productName}"
+ * Example: "product_catalog > 医疗险 > 安心百万医疗险2026版"
+ *
+ * Returns null if not a product catalog context.
+ */
+export function parseProductCatalogCtxFromFolderContext(
+  folderContext: string | undefined,
+): { category: InsuranceCategoryType; productName: string } | null {
+  if (!folderContext) return null
+  const parts = folderContext.split(">").map((p) => p.trim())
+  if (parts.length < 3) return null
+  if (parts[0] !== "product_catalog") return null
+  const category = parts[1] as InsuranceCategoryType
+  if (!INSURANCE_CATEGORIES.includes(category)) return null
+  const productName = parts[2]
+  if (!productName) return null
+  return { category, productName }
+}
+
+/**
+ * Build the extraction directive injected into the LLM prompt for product catalog documents.
+ * Tells the LLM exactly which wiki files to create and what content to put in each.
+ */
+function buildProductCatalogExtractionDirective(
+  category: InsuranceCategoryType,
+  productName: string,
+  sourceFileName: string,
+): string {
+  const modules = PRODUCT_CATALOG_MODULES[category]
+  const requiredModules = getRequiredModules(category)
+  const inferredModules = inferModulesFromSourceFileName(sourceFileName, category)
+  const hintedModules = new Set(inferredModules)
+
+  // Build the list of target files
+  const allTargetFiles = modules.map((m) => {
+    const title = buildProductModuleTitle(category, productName, m.moduleName)
+    const isInferred = hintedModules.has(m.moduleName)
+    const isRequired = requiredModules.includes(m.moduleName)
+    const priority = isRequired ? "[必填]" : isInferred ? "[推断相关]" : "[选填]"
+    return `  ${priority} wiki/product_catalog/${title}.md  → entity_type: ${m.entityType}`
+  })
+
+  return [
+    `## 险种产品知识库抽取指令 (PRODUCT CATALOG EXTRACTION — MANDATORY)`,
+    ``,
+    `本文档为保险险种产品文档，必须按以下规范抽取知识模块：`,
+    ``,
+    `- **险种类别：** ${category}`,
+    `- **产品名称：** ${productName}`,
+    `- **源文件：** ${sourceFileName}`,
+    ``,
+    `### 强制路径规则`,
+    `所有产品知识实体文件 MUST 写入 \`wiki/product_catalog/\` 目录（NOT wiki/entities/）。`,
+    `文件命名格式：\`wiki/product_catalog/${category}-${productName}-{模块名}.md\``,
+    ``,
+    `### 本次文档可能覆盖的模块（按优先级）`,
+    allTargetFiles.join("\n"),
+    ``,
+    `### 抽取规范`,
+    `1. 每个模块独立成一个 FILE block，路径为上表中的 \`wiki/product_catalog/...\` 路径`,
+    `2. 每个模块文件的 frontmatter 必须包含：`,
+    `   - \`entity_type\`: 见上表对应值`,
+    `   - \`knowledge_domain: product_catalog\``,
+    `   - \`product_name: "${productName}"\``,
+    `   - \`insurance_category: "${category}"\``,
+    `   - \`dedup_key: "${category}-${productName}-{模块名}"\``,
+    `   - \`confidence\`: 1.0 如内容来自原文明确表述；0.7 如由上下文推断`,
+    `   - \`inferred_fields\`: 列出所有由推断得出的字段名（非原文直接引用）`,
+    `3. 如果某模块在本文档中找不到相关内容，跳过该模块（不生成空文件）`,
+    `4. 如果某 [必填] 模块在文档中找不到内容，在 REVIEW 块中标注为 missing-page`,
+    `5. 还需生成一个 wiki/sources/{sourceBaseName}.md 原文摘要页（使用 type: source）`,
+    ``,
+    `### 各模块体结构要求`,
+    `每个模块文件 body 必须包含：`,
+    `- **一句话摘要**（针对该模块的核心信息）`,
+    `- **原文依据**（直接引用原文句子，不少于 2 条）`,
+    `- **结构化内容**（表格或列表，展示字段值）`,
+    `- **待补全信息**（该模块中文档未提供的字段，需人工补充）`,
+  ].join("\n")
 }
 
 import type { ChunkingConfig } from "@/types/wiki"
@@ -3207,7 +3299,15 @@ async function autoIngestImpl(
         "",
         `**File:** ${fileName}`,
         folderContext ? `**Folder context:** ${folderContext}` : "",
-        serviceLineCtx
+        // Product catalog extraction directive (higher priority than service line context)
+        (() => {
+          const productCtx = parseProductCatalogCtxFromFolderContext(folderContext)
+          if (productCtx) {
+            return buildProductCatalogExtractionDirective(productCtx.category, productCtx.productName, fileName)
+          }
+          return null
+        })(),
+        serviceLineCtx && !parseProductCatalogCtxFromFolderContext(folderContext)
           ? [
               `**Service hierarchy context (v2):** 系列=${serviceLineCtx.seriesName} | 场景=${serviceLineCtx.scenarioName} | 服务线=${serviceLineCtx.lineName} | 版本=${serviceLineCtx.versionName}`,
               `**Entity naming rule:** All service_item entities extracted from this file MUST be titled "${serviceLineCtx.lineName}-${serviceLineCtx.versionName}-{服务项名称}", e.g. "${buildServiceItemTitle(serviceLineCtx.lineName, serviceLineCtx.versionName, "在线问诊")}"`,
@@ -3250,7 +3350,22 @@ async function autoIngestImpl(
       role: "user",
       content: [
         `Source document to process: **${fileName}**`,
-        serviceLineCtx
+        // Product catalog: re-inject the module directive into generation prompt too
+        (() => {
+          const productCtx = parseProductCatalogCtxFromFolderContext(folderContext)
+          if (productCtx) {
+            return [
+              buildProductCatalogExtractionDirective(productCtx.category, productCtx.productName, fileName),
+              ``,
+              `## 输出路径规则 (STRICT)`,
+              `- 所有产品模块文件路径必须以 \`wiki/product_catalog/\` 开头`,
+              `- 原文摘要页路径：\`wiki/sources/${fileName.replace(/\.[^.]+$/, "")}.md\``,
+              `- 禁止写入 wiki/entities/ 目录`,
+            ].join("\n")
+          }
+          return null
+        })(),
+        serviceLineCtx && !parseProductCatalogCtxFromFolderContext(folderContext)
           ? [
               `**Service hierarchy context (v2):** ${serviceLineCtx.lineName}-${serviceLineCtx.versionName}`,
               `**Entity naming rule:** service_item page titles = "${serviceLineCtx.lineName}-${serviceLineCtx.versionName}-{服务项名称}"`,
@@ -3877,6 +3992,35 @@ function rerouteServiceEntityPath(relativePath: string, content: string): string
   return `wiki/entities/${lineName}/${versionName}/${fileName}`
 }
 
+/**
+ * Post-process product catalog entity paths:
+ * If the LLM emitted wiki/entities/XXX.md but the content has
+ * knowledge_domain: product_catalog, redirect to wiki/product_catalog/XXX.md.
+ * Also enforces the naming rule: {category}-{productName}-{moduleName}.md
+ */
+function rerouteProductCatalogEntityPath(relativePath: string, content: string): string {
+  // Already in product_catalog dir — keep as-is
+  if (relativePath.startsWith("wiki/product_catalog/")) return relativePath
+
+  // Only reroute if frontmatter declares product_catalog domain
+  const fmMatch = content.match(/^---\n([\s\S]*?)\n---/)
+  if (!fmMatch) return relativePath
+  const fm = fmMatch[1]
+
+  const domainMatch = fm.match(/^(?:knowledge_domain|domain):\s*["']?([^"'\n]+?)["']?\s*$/m)
+  if (!domainMatch) return relativePath
+  const domain = domainMatch[1].trim()
+  if (domain !== "product_catalog") return relativePath
+
+  // Extract title from frontmatter to build the correct filename
+  const titleMatch = fm.match(/^title:\s*["']?([^"'\n]+?)["']?\s*$/m)
+  if (!titleMatch) return relativePath
+  const title = titleMatch[1].trim().replace(/[\/\\:*?"<>|]/g, "").trim()
+  if (!title) return relativePath
+
+  return `wiki/product_catalog/${title}.md`
+}
+
 async function writeFileBlocks(
   projectPath: string,
   text: string,
@@ -3908,8 +4052,11 @@ async function writeFileBlocks(
       existingEntities,
       projectPath,
     )
-    // Correct flat entity paths to the hierarchy directory based on frontmatter
-    const relativePath = rerouteServiceEntityPath(normalised.path, normalised.content)
+    // Correct flat entity paths: first try product_catalog reroute, then service hierarchy reroute
+    const afterProductCatalog = rerouteProductCatalogEntityPath(normalised.path, normalised.content)
+    const relativePath = afterProductCatalog !== normalised.path
+      ? afterProductCatalog
+      : rerouteServiceEntityPath(normalised.path, normalised.content)
     let content = shouldNormalizeKnowledgePage(relativePath)
       ? cleanupKnowledgeFrontmatter(normalizeSchemaFrontmatter(normalised.content, {
           relativePath,
@@ -4005,7 +4152,11 @@ async function writeFileBlocks(
         await writeFile(fullPath, toWrite)
       }
       writtenPaths.push(relativePath)
-      if (relativePath.startsWith("wiki/entities/") || relativePath.startsWith("wiki/concepts/")) {
+      if (
+        relativePath.startsWith("wiki/entities/") ||
+        relativePath.startsWith("wiki/concepts/") ||
+        relativePath.startsWith("wiki/product_catalog/")
+      ) {
         existingEntities.push(buildExistingEntityIndexItem(projectPath, relativePath, content))
       }
     } catch (err) {

@@ -131,6 +131,7 @@ function inferEntityType(frontmatter: string, relativePath?: string): KnowledgeE
   if (path.includes("/concepts/")) return "concept"
   if (path.includes("/entities/")) return "entity"
   if (path.includes("/products/")) return "product"
+  if (path.includes("/product_catalog/")) return "product"
   if (path.includes("/customers/")) return "persona"
   if (path.includes("/methods/")) return "selling_scenario"
   return "general"

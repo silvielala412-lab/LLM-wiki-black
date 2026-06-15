@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react"
-import { Plus, FileText, RefreshCw, BookOpen, Trash2, Folder, ChevronRight, ChevronDown, Layers, Upload, GitMerge, LayoutList } from "lucide-react"
+import { Plus, FileText, RefreshCw, BookOpen, Trash2, Folder, ChevronRight, ChevronDown, Layers, Upload, GitMerge, LayoutList, ShieldCheck } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
 import { ScrollArea } from "@/components/ui/scroll-area"
@@ -25,6 +25,15 @@ import {
 } from "@/lib/sources-tree-delete"
 import { SERVICE_HIERARCHY } from "@/lib/insurance-schema-registry"
 import type { ServiceHierarchySeries } from "@/lib/insurance-schema-registry"
+import {
+  INSURANCE_CATEGORIES,
+  PRODUCT_CATALOG_MODULES,
+  type InsuranceCategoryType,
+  buildProductModuleTitle,
+  getRequiredModules,
+  calcModuleCompleteness,
+  parseProductModuleTitle,
+} from "@/lib/product-catalog-modules"
 import { getLogger } from "@/lib/logger"
 
 const log = getLogger("upload")
@@ -43,8 +52,8 @@ export function SourcesView() {
   const [importStatus, setImportStatus] = useState<string | null>(null)
   const [importError, setImportError] = useState<string | null>(null)
   const [ingestingPath, setIngestingPath] = useState<string | null>(null)
-  /** "files" = classic flat file tree; "hierarchy" = 5-level service hierarchy upload */
-  const [viewMode, setViewMode] = useState<"files" | "hierarchy">("files")
+  /** "files" = classic flat file tree; "hierarchy" = 5-level service hierarchy upload; "products" = insurance product catalog upload */
+  const [viewMode, setViewMode] = useState<"files" | "hierarchy" | "products">("files")
   /**
    * Path of the source-tree node currently in "click again to
    * confirm delete" state. Lifted up here (rather than living
@@ -157,6 +166,69 @@ export function SourcesView() {
         log.error("upload failed", { dest: destDir, error: extractErrMsg(err) })
         setImportError(`上传失败: ${extractErrMsg(err)}`)
         console.error("[handleVersionUpload] upload error:", err)
+      } finally {
+        setImporting(false)
+      }
+    }
+    input.click()
+  }
+
+  /**
+   * Upload files for a specific insurance product (product catalog domain).
+   * Destination: raw/sources/产品/{category}/{productName}/
+   * folderContext: "product_catalog > {category} > {productName}"
+   * The ingest pipeline detects this folderContext and routes to product catalog extraction.
+   */
+  async function handleProductUpload(category: InsuranceCategoryType, productName: string) {
+    if (!project || !productName.trim()) return
+    const input = document.createElement("input")
+    input.type = "file"
+    input.multiple = true
+    input.accept = ".pdf,.md,.mdx,.txt,.docx,.xlsx,.png,.jpg,.jpeg"
+    input.onchange = async () => {
+      const files = Array.from(input.files ?? [])
+      if (!files.length) return
+      setImporting(true)
+      setImportError(null)
+      const pp = normalizePath(project.path)
+      const destDir = `${pp}/raw/sources/产品/${category}/${productName.trim()}`
+      setImportStatus(`正在上传到 ${category} > ${productName}...`)
+      try {
+        log.info("product upload start", { dest: `产品/${category}/${productName}`, files: files.length })
+        const { uploadFiles } = await import("@/commands/fs")
+        const results = await uploadFiles(files, destDir)
+        const importedPaths: string[] = results
+          .filter((r): r is { path: string; name: string; size: number } => "path" in r)
+          .map((r) => r.path)
+        const errorCount = results.filter((r) => "error" in r).length
+        log.info("product upload done", { dest: destDir, success: importedPaths.length, errors: errorCount })
+        setImportStatus(
+          errorCount > 0
+            ? `上传完成：${importedPaths.length} 成功，${errorCount} 失败`
+            : `✓ ${category} > ${productName}：${importedPaths.length} 个文件已上传`
+        )
+        await loadSources()
+        const canIngest = !!(llmConfig.apiKey || llmConfig.provider === "ollama" || llmConfig.provider === "custom")
+        if (canIngest && importedPaths.length > 0) {
+          setImportStatus(`正在排队解析 ${importedPaths.length} 个文件...`)
+          const folderContext = `product_catalog > ${category} > ${productName.trim()}`
+          const tasks = importedPaths.map((absPath) => ({
+            sourcePath: absPath.startsWith(pp + "/") ? absPath.slice(pp.length + 1) : absPath,
+            folderContext,
+          }))
+          log.info("product enqueue batch", { project: project.id, count: tasks.length, context: folderContext })
+          enqueueBatch(project.id, tasks).catch((err) => {
+            const msg = err instanceof Error ? err.message : String(err)
+            log.error("product enqueue failed", { error: msg })
+            setImportError(`⚠️ 排队失败: ${msg}`)
+          })
+        } else if (!canIngest) {
+          setImportError("⚠️ LLM 未配置，文件已上传但无法自动解析。")
+        }
+        setTimeout(() => setImportStatus(null), 5000)
+      } catch (err) {
+        log.error("product upload failed", { dest: destDir, error: extractErrMsg(err) })
+        setImportError(`上传失败: ${extractErrMsg(err)}`)
       } finally {
         setImporting(false)
       }
@@ -723,6 +795,14 @@ export function SourcesView() {
           >
             <Layers className="h-4 w-4" />
           </Button>
+          <Button
+            variant={viewMode === "products" ? "secondary" : "ghost"}
+            size="icon"
+            title="险种产品上传"
+            onClick={() => setViewMode("products")}
+          >
+            <ShieldCheck className="h-4 w-4" />
+          </Button>
           <Button variant="ghost" size="icon" onClick={loadSources} title="Refresh">
             <RefreshCw className="h-4 w-4" />
           </Button>
@@ -783,6 +863,14 @@ export function SourcesView() {
           <ServiceHierarchyPanel
             sources={sources}
             onVersionUpload={handleVersionUpload}
+            onOpen={handleOpenSource}
+            onIngest={handleIngest}
+            importing={importing}
+          />
+        ) : viewMode === "products" ? (
+          <ProductCatalogPanel
+            sources={sources}
+            onProductUpload={handleProductUpload}
             onOpen={handleOpenSource}
             onIngest={handleIngest}
             importing={importing}
@@ -1340,6 +1428,230 @@ function ServiceHierarchyPanel({
           </div>
         )
       })}
+    </div>
+  )
+}
+
+// ─── Product Catalog Panel ────────────────────────────────────────────────────
+// Renders the insurance product catalog upload UI.
+// Users select: 险种类别 → 产品名称 → 上传文件
+// Files go to: raw/sources/产品/{category}/{productName}/
+// folderContext: "product_catalog > {category} > {productName}"
+// Ingest pipeline extracts to: wiki/product_catalog/{category}-{productName}-{module}.md
+
+function ProductCatalogPanel({
+  sources,
+  onProductUpload,
+  onOpen,
+  onIngest,
+  importing,
+}: {
+  sources: FileNode[]
+  onProductUpload: (category: InsuranceCategoryType, productName: string) => void
+  onOpen: (node: FileNode) => void
+  onIngest: (node: FileNode) => void
+  importing: boolean
+}) {
+  const [selectedCategory, setSelectedCategory] = useState<InsuranceCategoryType>(INSURANCE_CATEGORIES[0])
+  const [productName, setProductName] = useState("")
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({})
+
+  const toggle = (key: string) =>
+    setCollapsed((prev) => ({ ...prev, [key]: !prev[key] }))
+
+  function findProductFiles(category: InsuranceCategoryType, product: string): FileNode[] {
+    function walk(nodes: FileNode[]): FileNode[] {
+      for (const node of nodes) {
+        if (node.is_dir && node.children) {
+          const parts = node.path.replace(/\\/g, "/").split("/")
+          const lastThree = parts.slice(-3)
+          if (lastThree[0] === "产品" && lastThree[1] === category && lastThree[2] === product) {
+            return node.children.filter((c) => !c.is_dir)
+          }
+          const found = walk(node.children)
+          if (found.length > 0) return found
+        }
+      }
+      return []
+    }
+    return walk(sources)
+  }
+
+  function findCategoryProducts(category: InsuranceCategoryType): string[] {
+    const products: string[] = []
+    function walk(nodes: FileNode[]) {
+      for (const node of nodes) {
+        if (node.is_dir && node.children) {
+          const parts = node.path.replace(/\\/g, "/").split("/")
+          const lastTwo = parts.slice(-2)
+          if (lastTwo[0] === category) {
+            products.push(node.name)
+          }
+          walk(node.children)
+        }
+      }
+    }
+    walk(sources)
+    return [...new Set(products)]
+  }
+
+  const existingProducts = findCategoryProducts(selectedCategory)
+
+  return (
+    <div className="p-2 space-y-3">
+      {/* Header hint */}
+      <div className="px-2 py-1.5 text-[11px] text-muted-foreground bg-muted/40 rounded-md">
+        <span className="font-medium text-foreground/70">险种产品知识库上传</span>
+        　选择险种后上传产品文档，系统按模块自动抽取到
+        <code className="mx-1 text-[10px] bg-muted px-1 rounded">wiki/product_catalog/</code>
+      </div>
+
+      {/* Category selector */}
+      <div className="px-2 space-y-2">
+        <div className="text-[11px] font-medium text-muted-foreground">险种类别</div>
+        <div className="flex flex-wrap gap-1">
+          {INSURANCE_CATEGORIES.map((cat) => (
+            <button
+              key={cat}
+              onClick={() => setSelectedCategory(cat)}
+              className={`px-2 py-0.5 rounded text-[11px] border transition-colors ${
+                selectedCategory === cat
+                  ? "bg-blue-600 text-white border-blue-600"
+                  : "border-border text-muted-foreground hover:border-blue-400 hover:text-foreground"
+              }`}
+            >
+              {cat}
+            </button>
+          ))}
+        </div>
+
+        {/* Product name input + upload */}
+        <div className="flex gap-1.5 items-center">
+          <input
+            type="text"
+            value={productName}
+            onChange={(e) => setProductName(e.target.value)}
+            placeholder="产品名称，如：安心百万医疗险2026版"
+            className="flex-1 min-w-0 rounded border border-border bg-background px-2 py-1 text-[12px] outline-none focus:border-blue-400 focus:ring-1 focus:ring-blue-400/30 placeholder:text-muted-foreground/50"
+          />
+          <Button
+            size="sm"
+            disabled={importing || !productName.trim()}
+            onClick={() => onProductUpload(selectedCategory, productName)}
+            className="shrink-0"
+          >
+            <Upload className="mr-1 h-3.5 w-3.5" />
+            上传文件
+          </Button>
+        </div>
+
+        {/* Module count hint */}
+        {productName.trim() && (
+          <div className="rounded border border-dashed border-muted-foreground/20 bg-muted/20 px-2 py-1.5 text-[10px] text-muted-foreground/70 space-y-0.5">
+            <div className="font-medium text-muted-foreground mb-1">
+              将自动抽取 {PRODUCT_CATALOG_MODULES[selectedCategory].filter(m => m.required).length} 个必填模块 /
+              共 {PRODUCT_CATALOG_MODULES[selectedCategory].length} 个模块
+            </div>
+            {PRODUCT_CATALOG_MODULES[selectedCategory].filter(m => m.required).map(m => (
+              <div key={m.moduleName} className="flex items-center gap-1">
+                <span className="w-1.5 h-1.5 rounded-full bg-orange-400 shrink-0" />
+                <span>{m.moduleName}</span>
+                <span className="text-muted-foreground/40 ml-1">→ {m.entityType}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* Existing products list */}
+      {existingProducts.length > 0 && (
+        <div className="px-2 space-y-1">
+          <div className="text-[11px] font-medium text-muted-foreground">
+            已有产品（{selectedCategory}）
+          </div>
+          {existingProducts.map((product) => {
+            const productKey = `product-${selectedCategory}-${product}`
+            const isCollapsed = collapsed[productKey] ?? true
+            const files = findProductFiles(selectedCategory, product)
+
+            return (
+              <div key={productKey} className="rounded-md border border-border bg-background">
+                <div className="flex items-center gap-1.5 px-2 py-1.5 group">
+                  <button
+                    onClick={() => toggle(productKey)}
+                    className="flex flex-1 items-center gap-1.5 text-sm text-left min-w-0"
+                  >
+                    {isCollapsed
+                      ? <ChevronRight className="h-3 w-3 shrink-0 text-muted-foreground" />
+                      : <ChevronDown className="h-3 w-3 shrink-0 text-muted-foreground" />}
+                    <span className="truncate font-medium text-[12px]">{product}</span>
+                    <span className="ml-auto text-[10px] text-muted-foreground/50 shrink-0">
+                      {files.length} 文件
+                    </span>
+                  </button>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-6 w-6 shrink-0 opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-foreground"
+                    title={`继续上传 ${product} 的文档`}
+                    disabled={importing}
+                    onClick={() => onProductUpload(selectedCategory, product)}
+                  >
+                    <Upload className="h-3 w-3" />
+                  </Button>
+                </div>
+
+                {!isCollapsed && files.length > 0 && (
+                  <div className="border-t px-2 py-1 space-y-0.5">
+                    {files.map((file) => (
+                      <div
+                        key={file.path}
+                        className="flex items-center gap-1 rounded px-1 py-0.5 text-[11px] text-muted-foreground hover:bg-accent hover:text-accent-foreground group"
+                      >
+                        <FileText className="h-3 w-3 shrink-0" />
+                        <button
+                          className="flex-1 truncate text-left"
+                          onClick={() => onOpen(file)}
+                        >
+                          {file.name}
+                        </button>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="h-5 w-5 shrink-0 opacity-0 group-hover:opacity-100"
+                          title="重新解析"
+                          onClick={() => onIngest(file)}
+                        >
+                          <BookOpen className="h-3 w-3" />
+                        </Button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {!isCollapsed && files.length === 0 && (
+                  <div
+                    className="border-t mx-2 my-1 flex items-center gap-1.5 rounded border border-dashed border-muted-foreground/20 px-2 py-1.5 text-[11px] text-muted-foreground/50 cursor-pointer hover:border-muted-foreground/40"
+                    onClick={() => onProductUpload(selectedCategory, product)}
+                  >
+                    <Upload className="h-3 w-3" />
+                    上传 {product} 的产品文档
+                  </div>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      )}
+
+      {/* Empty state */}
+      {existingProducts.length === 0 && (
+        <div className="px-4 py-6 text-center text-[12px] text-muted-foreground/60">
+          <ShieldCheck className="h-8 w-8 mx-auto mb-2 text-muted-foreground/30" />
+          <p>还没有 {selectedCategory} 的产品</p>
+          <p className="text-[11px] mt-0.5">输入产品名称后上传文档开始构建</p>
+        </div>
+      )}
     </div>
   )
 }
