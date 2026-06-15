@@ -1,4 +1,4 @@
-﻿import { useState, useEffect, useCallback, useRef } from "react"
+import { useState, useEffect, useCallback, useRef } from "react"
 import { Plus, FileText, RefreshCw, BookOpen, Trash2, Folder, ChevronRight, ChevronDown, Layers, Upload, GitMerge, LayoutList, ShieldCheck } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
@@ -33,7 +33,6 @@ import {
   getRequiredModules,
   calcModuleCompleteness,
   parseProductModuleTitle,
-  getModuleBatchesForFile,
   encodeProductCatalogFolderContext,
 } from "@/lib/product-catalog-modules"
 import { getLogger } from "@/lib/logger"
@@ -212,19 +211,15 @@ export function SourcesView() {
         await loadSources()
         const canIngest = !!(llmConfig.apiKey || llmConfig.provider === "ollama" || llmConfig.provider === "custom")
         if (canIngest && importedPaths.length > 0) {
-          // Module-batch: each file -> N tasks (2 modules per task)
-          // Prevents one LLM call generating 30+ files with broken naming.
+          // Single task per file — the new section-scan extractor handles
+          // splitting and parallel extraction internally. No more 7-14 batch tasks.
           const tasks_pc: Array<{ sourcePath: string; folderContext: string }> = []
           for (const absPath of importedPaths) {
             const sourcePath = absPath.startsWith(pp + "/") ? absPath.slice(pp.length + 1) : absPath
-            const fileNameOnly = sourcePath.split("/").pop() ?? sourcePath
-            const batches = getModuleBatchesForFile(fileNameOnly, category, 2)
-            for (let batchIdx = 0; batchIdx < batches.length; batchIdx++) {
-              tasks_pc.push({
-                sourcePath,
-                folderContext: encodeProductCatalogFolderContext(category, productName.trim(), batches[batchIdx], batchIdx),
-              })
-            }
+            tasks_pc.push({
+              sourcePath,
+              folderContext: encodeProductCatalogFolderContext(category, productName.trim(), [], 0),
+            })
           }
           log.info("product enqueue batch", { project: project.id, files: importedPaths.length, tasks: tasks_pc.length })
           enqueueBatch(project.id, tasks_pc).catch((err) => {

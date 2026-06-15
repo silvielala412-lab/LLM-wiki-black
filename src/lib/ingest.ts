@@ -3331,10 +3331,43 @@ async function autoIngestImpl(
     return cachedFiles
   }
 
+  // ── Product Catalog fast-path ─────────────────────────────────
+  // Product catalog extraction uses a completely different pipeline:
+  // section-scan + merge (see product-catalog-extractor.ts).
+  // Bypass the generic analysis→generation→writeFileBlocks pipeline entirely.
+  const productCtxEarly = parseProductCatalogCtxFromFolderContext(folderContext)
+  if (productCtxEarly) {
+    const { runProductCatalogExtraction } = await import("@/lib/product-catalog-extractor")
+    activity.updateItem(activityId, {
+      detail: `Product catalog: starting section-scan extraction...`,
+    })
+    const writtenPaths = await runProductCatalogExtraction(
+      pp,
+      sourceContent,
+      fileName,
+      productCtxEarly.category as InsuranceCategoryType,
+      productCtxEarly.productName,
+      llmConfig,
+      activityId,
+      signal,
+    )
+    // Save cache so re-imports are skipped
+    if (writtenPaths.length > 0) {
+      await saveIngestCache(pp, fileName, effectiveCacheContent, writtenPaths)
+    }
+    activity.updateItem(activityId, {
+      status: "done",
+      detail: `Product catalog: ${writtenPaths.length} files written`,
+      filesWritten: writtenPaths,
+    })
+    return writtenPaths
+  }
+
   // ── Step 0.5: Extract embedded images ─────────────────────────
   // Pulls every embedded image out of PDF / PPTX / DOCX into
   // `wiki/media/<source-slug>/`. We DON'T inject the markdown
   // references into sourceContent here — without VLM captions
+
   // (Phase 3a) the alt text is empty, which gives the LLM no
   // semantic signal to preserve them. The LLM tends to silently
   // strip empty-alt images when summarizing.
