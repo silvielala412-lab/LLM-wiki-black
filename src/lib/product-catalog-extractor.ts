@@ -100,6 +100,10 @@ const MODULE_KEY_FIELDS: Record<string, string[]> = {
   "重疾就医绿通": ["服务内容", "适用条件", "申请方式"],
   "异地就医医院限制": ["认可医院级别", "特殊限制", "昂贵医院范围"],
   "分年龄保费费率表": ["保费单位", "费率表数据", "计划说明"],
+  // 疾病释义
+  "重大疾病释义": ["覆盖疾病种数", "主要疾病列表（前5种）", "诊断标准依据"],
+  "中症疾病释义": ["覆盖疾病种数", "主要疾病列表（前5种）", "赔付比例"],
+  "轻度疾病释义": ["覆盖疾病种数", "主要疾病列表（前5种）", "赔付比例"],
 }
 
 // ── Prompt (module-based, not field-based) ─────────────────────────────────
@@ -348,6 +352,12 @@ function buildModuleFile(
 }
 
 // ── Main product summary file ─────────────────────────────────────────────
+// Generates the master entity file with:
+//   - Frontmatter with all base fields
+//   - Section 1: 基础信息 table (short base fields)
+//   - Section 2: {险种}专属信息 table (short category fields)
+//   - Section 3+: long fields that were extracted (inline content)
+//   - Section N: 模块索引 (which modules were written as separate files)
 
 function buildMainFile(
   mergedModules: Map<string, MergedModule>,
@@ -357,6 +367,8 @@ function buildMainFile(
   allModules: ProductModule[],
 ): string {
   const lines: string[] = []
+
+  // ── Frontmatter ────────────────────────────────────────────
   lines.push("---")
   lines.push(`title: "${category}-${productName}"`)
   lines.push(`knowledge_domain: product_catalog`)
@@ -371,7 +383,86 @@ function buildMainFile(
   lines.push(`# ${productName}`)
   lines.push("")
 
-  // Summary of all modules
+  // ── Gather extracted data from modules ──────────────────────
+  // We pull short-field values from the "产品基础信息" module (which has the summary table)
+  // and build the structured tables from PRODUCT_FIELDS definition + extracted content
+  const allFields = PRODUCT_FIELDS[category] ?? []
+  const baseFieldNames = new Set(BASE_FIELDS.map(f => f.fieldName))
+
+  // Build a lookup: fieldName → extracted text (first line from matching module)
+  // We use the "产品基础信息" module content as the source of short field values
+  const basicInfoModule = mergedModules.get("产品基础信息")
+  const shortFieldLookup = new Map<string, string>()
+  if (basicInfoModule && basicInfoModule.found) {
+    // Parse "## 关键字段" table rows from the module content
+    for (const content of basicInfoModule.contents) {
+      const tableRows = content.match(/\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|/g) ?? []
+      for (const row of tableRows) {
+        const cols = row.split("|").map(c => c.trim()).filter(Boolean)
+        if (cols.length >= 2 && cols[0] !== "字段" && cols[0] !== "---") {
+          shortFieldLookup.set(cols[0], cols[1])
+        }
+      }
+    }
+  }
+
+  // ── Section 1: 基础信息 table ────────────────────────────────
+  const shortBaseFields = allFields.filter(f => f.valueType === "short" && baseFieldNames.has(f.fieldName))
+  lines.push("## 基础信息")
+  lines.push("")
+  lines.push("| 字段 | 值 |")
+  lines.push("|---|---|")
+  for (const f of shortBaseFields) {
+    const val = shortFieldLookup.get(f.fieldName) ?? "（待填写）"
+    lines.push(`| ${f.fieldName} | ${val.replace(/\n/g, " ").replace(/\|/g, "\\|")} |`)
+  }
+  lines.push("")
+
+  // ── Section 2: 险种专属信息 table ────────────────────────────
+  const shortCatFields = allFields.filter(f => f.valueType === "short" && !baseFieldNames.has(f.fieldName))
+  if (shortCatFields.length > 0) {
+    lines.push(`## ${category}专属信息`)
+    lines.push("")
+    lines.push("| 字段 | 值 |")
+    lines.push("|---|---|")
+    for (const f of shortCatFields) {
+      const val = shortFieldLookup.get(f.fieldName) ?? "（待填写）"
+      lines.push(`| ${f.fieldName} | ${val.replace(/\n/g, " ").replace(/\|/g, "\\|")} |`)
+    }
+    lines.push("")
+  }
+
+  // ── Section 3+: long fields inline ──────────────────────────
+  // Fields like 产品简介、产品特色、保单权益 are rendered inline in the main file
+  // because they're short enough to include directly. Long clause texts (责任免除 etc)
+  // are referenced by link to their dedicated module file.
+  const inlineLongFields = ["产品简介", "产品特色", "保单权益"]
+  for (const fieldName of inlineLongFields) {
+    const m = mergedModules.get(fieldName)
+    if (!m || !m.found) continue
+    lines.push(`## ${fieldName}`)
+    lines.push("")
+    lines.push(m.contents.join("\n\n---\n\n"))
+    lines.push("")
+  }
+
+  // ── Section: 疾病释义 (if found) ────────────────────────────
+  const diseaseFields = ["重大疾病释义", "中症疾病释义", "轻度疾病释义"]
+  const hasDiseaseContent = diseaseFields.some(name => mergedModules.get(name)?.found)
+  if (hasDiseaseContent) {
+    lines.push("## 疾病释义")
+    lines.push("")
+    for (const fieldName of diseaseFields) {
+      const m = mergedModules.get(fieldName)
+      if (!m || !m.found) continue
+      lines.push(`### ${fieldName}`)
+      lines.push("")
+      lines.push(m.contents.join("\n\n---\n\n"))
+      lines.push("")
+    }
+  }
+
+  // ── Section: 模块索引 ─────────────────────────────────────────
   const found = allModules.filter(m => mergedModules.get(m.moduleName)?.found)
   const missing = allModules.filter(m => !mergedModules.get(m.moduleName)?.found)
 
@@ -380,7 +471,7 @@ function buildMainFile(
   for (const m of found) {
     const merged = mergedModules.get(m.moduleName)!
     const totalChars = merged.contents.reduce((s, c) => s + c.length, 0)
-    lines.push(`- ✅ **${m.moduleName}** (${totalChars} 字, ${merged.sectionIndices.length} 个章节)`)
+    lines.push(`- ✅ **${m.moduleName}** — ${totalChars} 字 · ${merged.sectionIndices.length} 个章节 → [\`${category}-${productName}-${m.moduleName}.md\`]`)
   }
   lines.push("")
 
@@ -388,23 +479,10 @@ function buildMainFile(
     lines.push("## 待补全模块")
     lines.push("")
     for (const m of missing) {
-      lines.push(`- [ ] ${m.moduleName} (${m.required ? "必填" : "选填"})`)
+      lines.push(`- [ ] **${m.moduleName}** (${m.required ? "必填" : "选填"})`)
     }
     lines.push("")
   }
-
-  // Inline short summaries for key fields (first line of each found module)
-  lines.push("## 关键信息速览")
-  lines.push("")
-  lines.push("| 模块 | 摘要 |")
-  lines.push("|---|---|")
-  for (const m of found) {
-    const merged = mergedModules.get(m.moduleName)!
-    const firstLine = merged.contents[0].split("\n").find(l => l.trim())?.trim() ?? ""
-    const summary = firstLine.length > 80 ? firstLine.slice(0, 80) + "…" : firstLine
-    lines.push(`| ${m.moduleName} | ${summary.replace(/\|/g, "\\|")} |`)
-  }
-  lines.push("")
 
   return lines.join("\n")
 }

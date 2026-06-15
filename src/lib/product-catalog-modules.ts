@@ -95,6 +95,10 @@ export const BASE_FIELDS: ProductField[] = [
   { fieldName: "犹豫期及合同解除（退保）", source: "产品条款", valueType: "long", extractable: true },
   { fieldName: "通用责任免除", source: "产品条款", valueType: "long", extractable: true },
   { fieldName: "专属健康告知", source: "健康告知/投保须知", valueType: "long", extractable: true },
+  // 疾病释义（有相关条款的险种填写）
+  { fieldName: "重大疾病释义", source: "产品条款", valueType: "long", extractable: true, description: "重大疾病定义及诊断标准" },
+  { fieldName: "中症疾病释义", source: "产品条款", valueType: "long", extractable: true, description: "中度疾病定义及诊断标准" },
+  { fieldName: "轻度疾病释义", source: "产品条款", valueType: "long", extractable: true, description: "轻度/轻症疾病定义及诊断标准" },
 ]
 
 /** 医疗险专属字段 — 对齐 Excel "医疗险" sheet */
@@ -399,6 +403,29 @@ const BASE_MODULES: ProductModule[] = [
     moduleName: "分年龄保费费率表",
     entityType: "rate_table",
     sourceDocHints: ["费率表", "费率数据"],
+    required: false,
+    isBaseModule: true,
+  },
+
+  // 十二、疾病释义（有相关条款时填写，主要针对重疾险/含重疾责任的医疗险）
+  {
+    moduleName: "重大疾病释义",
+    entityType: "critical_illness_definition",
+    sourceDocHints: ["产品条款", "疾病定义"],
+    required: false,
+    isBaseModule: true,
+  },
+  {
+    moduleName: "中症疾病释义",
+    entityType: "moderate_illness_definition",
+    sourceDocHints: ["产品条款", "疾病定义"],
+    required: false,
+    isBaseModule: true,
+  },
+  {
+    moduleName: "轻度疾病释义",
+    entityType: "mild_illness_definition",
+    sourceDocHints: ["产品条款", "疾病定义"],
     required: false,
     isBaseModule: true,
   },
