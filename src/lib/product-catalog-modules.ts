@@ -553,3 +553,59 @@ export function calcModuleCompleteness(
   const covered = required.filter(m => existingModules.includes(m)).length
   return covered / required.length
 }
+
+/**
+ * Given a source file name, compute the list of module batches to extract.
+ *
+ * Strategy:
+ * 1. Use inferModulesFromSourceFileName to find which modules this file likely covers.
+ * 2. Split that list into chunks of `batchSize` modules.
+ * 3. Each batch becomes one focused LLM ingest job (via folderContext batch encoding).
+ *
+ * Why batching?
+ * - A single LLM call can't reliably generate 30+ structured module files at once.
+ * - Focused 2-module calls produce complete, correctly-named, high-quality output.
+ * - Source summary page (wiki/sources/*.md) is generated only in batch 0.
+ *
+ * @returns Array of module name lists, e.g. [["产品基础信息","投保年龄"], ["疾病等待期","犹豫期"], ...]
+ */
+export function getModuleBatchesForFile(
+  sourceFileName: string,
+  category: InsuranceCategoryType,
+  batchSize = 2,
+): string[][] {
+  const candidateModules = inferModulesFromSourceFileName(sourceFileName, category)
+  const allModuleNames = PRODUCT_CATALOG_MODULES[category].map(m => m.moduleName)
+
+  // Use the inferred modules, but fall back to required modules if too few
+  let targetModules = candidateModules.length > 0 ? candidateModules : allModuleNames.filter(n =>
+    PRODUCT_CATALOG_MODULES[category].find(m => m.moduleName === n)?.required
+  )
+
+  // Deduplicate while preserving order
+  targetModules = [...new Set(targetModules)]
+
+  // Split into batches
+  const batches: string[][] = []
+  for (let i = 0; i < targetModules.length; i += batchSize) {
+    batches.push(targetModules.slice(i, i + batchSize))
+  }
+  return batches.length > 0 ? batches : [targetModules]
+}
+
+/**
+ * Encode product catalog context + batch into a folderContext string.
+ * Format: "product_catalog > {category} > {productName} > batch:{n}:{mod1},{mod2}"
+ *
+ * The batch encoding is backwards-compatible: if no batch segment is found,
+ * parseProductCatalogCtxFromFolderContext returns batchModules: null (means "all modules").
+ */
+export function encodeProductCatalogFolderContext(
+  category: InsuranceCategoryType,
+  productName: string,
+  batchModules: string[],
+  batchIndex: number,
+): string {
+  const encoded = batchModules.join(",")
+  return `product_catalog > ${category} > ${productName} > batch:${batchIndex}:${encoded}`
+}

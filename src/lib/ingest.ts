@@ -48,6 +48,8 @@ import {
   buildProductModuleTitle,
   inferModulesFromSourceFileName,
   getRequiredModules,
+  encodeProductCatalogFolderContext,
+  getModuleBatchesForFile,
 } from "@/lib/product-catalog-modules"
 import type { MultimodalConfig } from "@/stores/wiki-store"
 
@@ -81,14 +83,16 @@ export function extractServiceLineCtxFromPath(
 /**
  * Parse product catalog context from folderContext string.
  *
- * Expected format: "product_catalog > {category} > {productName}"
- * Example: "product_catalog > 医疗险 > 安心百万医疗险2026版"
+ * Supported formats:
+ *   "product_catalog > {category} > {productName}"
+ *   "product_catalog > {category} > {productName} > batch:{n}:{mod1},{mod2}"
  *
  * Returns null if not a product catalog context.
+ * When a batch segment is present, returns batchModules = [mod1, mod2].
  */
 export function parseProductCatalogCtxFromFolderContext(
   folderContext: string | undefined,
-): { category: InsuranceCategoryType; productName: string } | null {
+): { category: InsuranceCategoryType; productName: string; batchIndex?: number; batchModules?: string[] } | null {
   if (!folderContext) return null
   const parts = folderContext.split(">").map((p) => p.trim())
   if (parts.length < 3) return null
@@ -97,25 +101,50 @@ export function parseProductCatalogCtxFromFolderContext(
   if (!INSURANCE_CATEGORIES.includes(category)) return null
   const productName = parts[2]
   if (!productName) return null
-  return { category, productName }
+
+  // Optional batch segment: "batch:{n}:{mod1},{mod2}"
+  let batchIndex: number | undefined
+  let batchModules: string[] | undefined
+  if (parts[3]) {
+    const bm = parts[3].match(/^batch:(\d+):(.+)$/)
+    if (bm) {
+      batchIndex = parseInt(bm[1], 10)
+      batchModules = bm[2].split(",").map(s => s.trim()).filter(Boolean)
+    }
+  }
+
+  return { category, productName, batchIndex, batchModules }
 }
 
 /**
  * Build the extraction directive injected into the LLM prompt for product catalog documents.
  * Tells the LLM exactly which wiki files to create and what content to put in each.
+ *
+ * @param batchModules When provided (batch mode), restrict extraction to ONLY these modules.
+ * @param batchIndex   The current batch number. Source summary page generated only on batch 0.
  */
 function buildProductCatalogExtractionDirective(
   category: InsuranceCategoryType,
   productName: string,
   sourceFileName: string,
+  batchModules?: string[],
+  batchIndex?: number,
 ): string {
-  const modules = PRODUCT_CATALOG_MODULES[category]
+  const allModules = PRODUCT_CATALOG_MODULES[category]
   const requiredModules = getRequiredModules(category)
   const inferredModules = inferModulesFromSourceFileName(sourceFileName, category)
   const hintedModules = new Set(inferredModules)
 
+  // In batch mode: only show the modules for this batch
+  const targetModules = batchModules && batchModules.length > 0
+    ? allModules.filter(m => batchModules.includes(m.moduleName))
+    : allModules
+
+  const isBatchMode = !!(batchModules && batchModules.length > 0)
+  const isFirstBatch = batchIndex === undefined || batchIndex === 0
+
   // Build the list of target files
-  const allTargetFiles = modules.map((m) => {
+  const allTargetFiles = targetModules.map((m) => {
     const title = buildProductModuleTitle(category, productName, m.moduleName)
     const isInferred = hintedModules.has(m.moduleName)
     const isRequired = requiredModules.includes(m.moduleName)
@@ -126,17 +155,20 @@ function buildProductCatalogExtractionDirective(
   return [
     `## 险种产品知识库抽取指令 (PRODUCT CATALOG EXTRACTION — MANDATORY)`,
     ``,
-    `本文档为保险险种产品文档，必须按以下规范抽取知识模块：`,
+    isBatchMode
+      ? `本次提取为批次 ${(batchIndex ?? 0) + 1}，只抽取以下 ${targetModules.length} 个模块，请勿生成其他模块文件。`
+      : `本文档为保险险种产品文档，必须按以下规范抽取知识模块：`,
     ``,
     `- **险种类别：** ${category}`,
     `- **产品名称：** ${productName}`,
     `- **源文件：** ${sourceFileName}`,
+    isBatchMode ? `- **本批模块：** ${batchModules!.join("、")}` : "",
     ``,
     `### 强制路径规则`,
     `所有产品知识实体文件 MUST 写入 \`wiki/product_catalog/\` 目录（NOT wiki/entities/）。`,
     `文件命名格式：\`wiki/product_catalog/${category}-${productName}-{模块名}.md\``,
     ``,
-    `### 本次文档可能覆盖的模块（按优先级）`,
+    `### 本次要生成的模块文件（仅限这些）`,
     allTargetFiles.join("\n"),
     ``,
     `### 抽取规范`,
@@ -151,7 +183,9 @@ function buildProductCatalogExtractionDirective(
     `   - \`inferred_fields\`: 列出所有由推断得出的字段名（非原文直接引用）`,
     `3. 如果某模块在本文档中找不到相关内容，跳过该模块（不生成空文件）`,
     `4. 如果某 [必填] 模块在文档中找不到内容，在 REVIEW 块中标注为 missing-page`,
-    `5. 还需生成一个 wiki/sources/{sourceBaseName}.md 原文摘要页（使用 type: source）`,
+    isFirstBatch
+      ? `5. 还需生成一个 wiki/sources/${sourceFileName.replace(/\.[^.]+$/, "")}.md 原文摘要页（type: source）`
+      : `5. 本批次 **无需** 重新生成 wiki/sources/ 摘要页（已在批次0生成）`,
     ``,
     `### 各模块体结构要求`,
     `每个模块文件 body 必须包含：`,
@@ -164,40 +198,53 @@ function buildProductCatalogExtractionDirective(
 
 /**
  * Hard override system prompt prefix injected into buildGenerationPrompt when the
- * source is a product catalog document. Replaces the generic "wiki maintainer" role
- * and bans all wiki/entities/ / wiki/concepts/ output.
+ * source is a product catalog document.
  *
- * Design: placed at the VERY START of the system prompt array so it wins the
- * "first position" + "last position" priority rules for instruction following.
+ * @param batchModules When provided (batch mode), restrict to ONLY these 2-3 modules.
+ * @param batchIndex   Current batch number (0-based). Source page only generated on batch 0.
  */
 function buildProductCatalogGenerationOverride(
   category: InsuranceCategoryType,
   productName: string,
   sourceFileName: string,
+  batchModules?: string[],
+  batchIndex?: number,
 ): string {
-  const modules = PRODUCT_CATALOG_MODULES[category]
+  const allModules = PRODUCT_CATALOG_MODULES[category]
   const requiredModules = getRequiredModules(category)
   const sourceBaseName = sourceFileName.replace(/\.[^.]+$/, "")
+  const isFirstBatch = batchIndex === undefined || batchIndex === 0
+  const isBatchMode = !!(batchModules && batchModules.length > 0)
 
-  const moduleTable = modules.map((m) => {
+  // In batch mode: only show the target modules for this batch
+  const targetModules = isBatchMode
+    ? allModules.filter(m => batchModules!.includes(m.moduleName))
+    : allModules
+
+  const moduleTable = targetModules.map((m) => {
     const flag = requiredModules.includes(m.moduleName) ? "[必填]" : "[选填]"
     const path = `wiki/product_catalog/${category}-${productName}-${m.moduleName}.md`
     return `  ${flag} ${path}  (entity_type: ${m.entityType})`
   }).join("\n")
 
   return [
-    `## ⚠️ PRODUCT CATALOG MODE — SPECIAL EXTRACTION RULES (OVERRIDES ALL DEFAULTS)`,
+    `## ⚠️ PRODUCT CATALOG MODE${isBatchMode ? ` — BATCH ${(batchIndex ?? 0) + 1}` : ""} (OVERRIDES ALL DEFAULTS)`,
     ``,
-    `You are a product knowledge compiler for an insurance knowledge base. This source is a product document.`,
+    isBatchMode
+      ? `You are a focused product knowledge compiler. This batch extracts ONLY ${targetModules.length} specific modules from the source document.`
+      : `You are a product knowledge compiler for an insurance knowledge base.`,
     ``,
-    `### ABSOLUTE PATH RULES (violations cause the page to be silently discarded)`,
+    `### ABSOLUTE PATH RULES`,
     `- ✅ ALLOWED: wiki/product_catalog/${category}-${productName}-{模块名}.md`,
-    `- ✅ ALLOWED: wiki/sources/${sourceBaseName}.md  (one source summary page)`,
+    isFirstBatch
+      ? `- ✅ ALLOWED: wiki/sources/${sourceBaseName}.md  (source summary — generate once)`
+      : `- ❌ DO NOT regenerate wiki/sources/${sourceBaseName}.md  (already done in batch 0)`,
     `- ❌ FORBIDDEN: wiki/entities/ — do not write ANY files here`,
     `- ❌ FORBIDDEN: wiki/concepts/ — do not write ANY files here`,
-    `- ❌ FORBIDDEN: Creating individual entity pages for field values like "交费方式" or "等待期"`,
+    `- ❌ FORBIDDEN: per-field entity pages ("交费方式", "等待期" are ATTRIBUTES, not pages)`,
+    isBatchMode ? `- ❌ DO NOT generate modules other than: ${batchModules!.join("、")}` : "",
     ``,
-    `### TARGET MODULE FILES (create only the ones for which the document has evidence)`,
+    `### TARGET MODULE FILES FOR THIS ${isBatchMode ? "BATCH" : "DOCUMENT"} (ONLY THESE)`,
     moduleTable,
     ``,
     `### MANDATORY FRONTMATTER FIELDS FOR EVERY MODULE FILE`,
@@ -209,21 +256,17 @@ function buildProductCatalogGenerationOverride(
     `confidence: 1.0 for explicitly stated facts; 0.7 for inferred`,
     `inferred_fields: [list of fields NOT directly stated in source text]`,
     ``,
-    `### WHAT TO PUT IN EACH MODULE (not separate entity pages)`,
-    `All extracted facts from this document MUST go INTO the relevant module file body and attributes.`,
-    `Do NOT create a separate entity page for "交费方式", "等待期", "保额" etc.`,
-    `Those are FIELDS (attributes) inside a module file, not standalone knowledge pages.`,
+    `### MODULE BODY STRUCTURE (every module file must contain)`,
+    `## 一句话摘要\n(one-sentence summary of this module's key facts)`,
+    `## 原文依据\n(direct quotes from the source document, minimum 2)`,
+    `## 结构化内容\n(table or list of field values)`,
+    `## 待补全信息\n(fields not found in this document — need manual fill)`,
     ``,
-    `Example correct output:`,
-    `---FILE: wiki/product_catalog/${category}-${productName}-产品基础信息.md---`,
-    `---  (frontmatter with all required fields) ---`,
-    `## 一句话摘要`,
-    `...`,
-    `## 基础参数`,
-    `| 字段 | 值 |`,
-    `|---|---|`,
-    `| 交费方式 | 一次性支付 |`,
-    `| 等待期 | 90天 |`,
+    `Example:`,
+    `---FILE: wiki/product_catalog/${category}-${productName}-${targetModules[0]?.moduleName ?? "产品基础信息"}.md---`,
+    `| 字段 | 值 | 置信度 |`,
+    `|---|---|---|`,
+    `| 交费方式 | 一次性支付 | 1.0 |`,
     `---END FILE---`,
   ].join("\n")
 }
@@ -3422,17 +3465,17 @@ async function autoIngestImpl(
       role: "user",
       content: [
         `Source document to process: **${fileName}**`,
-        // Product catalog: re-inject the module directive into generation prompt too
+        // Product catalog: re-inject the module directive into the user message (reinforcement)
         (() => {
-          const productCtx = parseProductCatalogCtxFromFolderContext(folderContext)
-          if (productCtx) {
+          if (productCtxForIngest) {
             return [
-              buildProductCatalogExtractionDirective(productCtx.category, productCtx.productName, fileName),
-              ``,
-              `## 输出路径规则 (STRICT)`,
-              `- 所有产品模块文件路径必须以 \`wiki/product_catalog/\` 开头`,
-              `- 原文摘要页路径：\`wiki/sources/${fileName.replace(/\.[^.]+$/, "")}.md\``,
-              `- 禁止写入 wiki/entities/ 目录`,
+              buildProductCatalogExtractionDirective(
+                productCtxForIngest.category,
+                productCtxForIngest.productName,
+                fileName,
+                productCtxForIngest.batchModules,
+                productCtxForIngest.batchIndex,
+              ),
             ].join("\n")
           }
           return null
@@ -4868,7 +4911,7 @@ export function buildGenerationPrompt(
   uploaderUsername = "unknown",
   preparedSource?: PreparedIngestSource,
   serviceLineCtx?: { lineName: string; versionName: string } | null,
-  productCatalogCtx?: { category: InsuranceCategoryType; productName: string } | null,
+  productCatalogCtx?: { category: InsuranceCategoryType; productName: string; batchModules?: string[]; batchIndex?: number } | null,
 ): string {
   // Use original filename (without extension) as the source summary page name
   const sourceBaseName = sourceFileName.replace(/\.[^.]+$/, "")
@@ -4879,7 +4922,13 @@ export function buildGenerationPrompt(
   // section. This must come BEFORE all other instructions in the system
   // prompt so it wins the "most recent instruction" priority tie-breaker.
   const productCatalogOverride = productCatalogCtx
-    ? buildProductCatalogGenerationOverride(productCatalogCtx.category, productCatalogCtx.productName, sourceFileName)
+    ? buildProductCatalogGenerationOverride(
+        productCatalogCtx.category,
+        productCatalogCtx.productName,
+        sourceFileName,
+        productCatalogCtx.batchModules,
+        productCatalogCtx.batchIndex,
+      )
     : null
 
   return [
