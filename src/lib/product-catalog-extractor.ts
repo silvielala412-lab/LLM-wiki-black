@@ -19,6 +19,7 @@ import {
   type ModuleGroup,
   PRODUCT_CATALOG_MODULES,
   type ProductModule,
+  PRODUCT_FIELDS,
   BASE_FIELDS,
 } from "@/lib/product-catalog-modules"
 
@@ -506,36 +507,52 @@ function buildMainFile(
     }
   }
 
+  // Fuzzy match: MODULE_KEY_FIELDS uses names like "犹豫期天数" but PRODUCT_FIELDS
+  // has "犹豫期". Bridge the gap by matching extracted field names that contain
+  // a schema field name as a substring.
+  const schemaFields = PRODUCT_FIELDS[category] ?? []
+  for (const sf of schemaFields) {
+    if (sf.valueType !== "short") continue
+    if (shortFieldLookup.has(sf.fieldName) && shortFieldLookup.get(sf.fieldName) !== "未明确") continue
+    // Try to find a match in shortFieldLookup where the extracted name contains this schema name
+    for (const [extractedName, extractedValue] of shortFieldLookup) {
+      if (extractedValue === "未明确") continue
+      if (extractedName.includes(sf.fieldName) || sf.fieldName.includes(extractedName)) {
+        shortFieldLookup.set(sf.fieldName, extractedValue)
+        break
+      }
+    }
+  }
 
-  // ── Section 1: 基础信息 table (dynamic — only fields with values) ───
+
+
+  // ── Section 1: 基础信息 table (固定 schema，业务必填字段) ─────────
+  const allFields = PRODUCT_FIELDS[category] ?? []
+  const baseFieldNames = new Set(BASE_FIELDS.map(f => f.fieldName))
+  const shortBaseFields = allFields.filter(f => f.valueType === "short" && baseFieldNames.has(f.fieldName))
   lines.push("## 基础信息")
   lines.push("")
   lines.push("| 字段 | 值 |")
   lines.push("|---|---|")
-  // Output all fields that have a real value (not 未明确), ordered: base fields first, then others
-  const outputtedFields = new Set<string>()
-  // First pass: known base fields in order
-  for (const f of BASE_FIELDS) {
-    const val = shortFieldLookup.get(f.fieldName)
-    if (val && val !== "未明确") {
-      lines.push(`| ${f.fieldName} | ${val.replace(/\n/g, " ").replace(/\|/g, "\\|")} |`)
-      outputtedFields.add(f.fieldName)
-    }
-  }
-  // Second pass: any other fields from modules (category-specific, dynamically discovered)
-  for (const [field, val] of shortFieldLookup) {
-    if (outputtedFields.has(field)) continue
-    if (val === "未明确") continue
-    lines.push(`| ${field} | ${val.replace(/\n/g, " ").replace(/\|/g, "\\|")} |`)
-    outputtedFields.add(field)
-  }
-  // Third pass: base fields that were 未明确 (show them as placeholders)
-  for (const f of BASE_FIELDS) {
-    if (outputtedFields.has(f.fieldName)) continue
+  for (const f of shortBaseFields) {
     const val = shortFieldLookup.get(f.fieldName) ?? "未明确"
-    lines.push(`| ${f.fieldName} | ${val} |`)
+    lines.push(`| ${f.fieldName} | ${val.replace(/\n/g, " ").replace(/\|/g, "\\|")} |`)
   }
   lines.push("")
+
+  // ── Section 2: 险种专属信息 table ────────────────────────────
+  const shortCatFields = allFields.filter(f => f.valueType === "short" && !baseFieldNames.has(f.fieldName))
+  if (shortCatFields.length > 0) {
+    lines.push(`## ${category}专属信息`)
+    lines.push("")
+    lines.push("| 字段 | 值 |")
+    lines.push("|---|---|")
+    for (const f of shortCatFields) {
+      const val = shortFieldLookup.get(f.fieldName) ?? "未明确"
+      lines.push(`| ${f.fieldName} | ${val.replace(/\n/g, " ").replace(/\|/g, "\\|")} |`)
+    }
+    lines.push("")
+  }
 
 
   // ── Section 3+: long fields inline ──────────────────────────
