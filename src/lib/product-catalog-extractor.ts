@@ -618,8 +618,8 @@ function buildMainFile(
 
 // 每批并发发送给 LLM 的 section 数量。
 // 设太高会导致内网模型过载/超时，设太低会拖慢总耗时。
-// 当前值 4 = 每批 4 个 section 同时调用 LLM，等全部返回后发下一批。
-const MAX_SECTION_PARALLEL = 4
+// 当前值 8 = 每批 8 个 section 同时调用 LLM，等全部返回后发下一批。
+const MAX_SECTION_PARALLEL = 8
 
 export async function runProductCatalogExtraction(
   projectPath: string,
