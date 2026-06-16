@@ -11,7 +11,6 @@ import { chunkMarkdown, type Chunk } from "@/lib/text-chunker"
 import { streamChat } from "@/lib/llm-client"
 import { createDirectory, writeFile, readFile, listDirectory } from "@/commands/fs"
 import { normalizePath } from "@/lib/path-utils"
-import type { FileNode } from "@/types/wiki"
 import { getLogger } from "@/lib/logger"
 import { useActivityStore } from "@/stores/activity-store"
 import type { LlmConfig } from "@/stores/wiki-store"
@@ -1009,9 +1008,9 @@ async function refineModuleFiles(
   const catalogDir = `${pp}/wiki/product_catalog`
   const prefix = `${category}-${productName}-`
 
-  let files: FileNode[] = []
+  let files: Array<{ name: string; path: string; is_dir: boolean }> = []
   try {
-    const tree = await listDirectory(catalogDir)
+    const tree = (await listDirectory(catalogDir)) as Array<{ name: string; path: string; is_dir: boolean }>
     files = tree.filter(f => !f.is_dir && f.name.startsWith(prefix) && f.name.endsWith(".md"))
   } catch {
     return { totalModules: 0, refined: 0, fieldsUpdated: 0, skipped: 0 }
@@ -1057,9 +1056,9 @@ export async function refineAllProductModules(
   const catalogDir = `${pp}/wiki/product_catalog`
   const activity = useActivityStore.getState()
 
-  let allFiles: FileNode[] = []
+  let allFiles: Array<{ name: string; path: string; is_dir: boolean }> = []
   try {
-    const tree = await listDirectory(catalogDir)
+    const tree = (await listDirectory(catalogDir)) as Array<{ name: string; path: string; is_dir: boolean }>
     allFiles = tree.filter(f => !f.is_dir && f.name.endsWith(".md") && f.name.includes("-"))
   } catch {
     return { totalModules: 0, refined: 0, fieldsUpdated: 0, skipped: 0 }

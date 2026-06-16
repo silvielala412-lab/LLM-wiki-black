@@ -848,12 +848,14 @@ export function SourcesView() {
                 概念
               </Button>
               <Button
+                type="button"
                 size="sm" variant="outline" title="精炼模块：对已有模块的原文做二次LLM提取，补充缺失的关键字段"
                 disabled={importing}
                 onClick={async () => {
                   if (!project) return
                   setImporting(true)
                   setImportStatus("正在精炼模块关键字段...")
+                  setImportError(null)
                   try {
                     const { refineAllProductModules } = await import("@/lib/product-catalog-extractor")
                     const { useWikiStore } = await import("@/stores/wiki-store")
@@ -870,6 +872,7 @@ export function SourcesView() {
                     setImportStatus(`✓ 精炼完成：${result.refined}/${result.totalModules} 个模块更新，补充 ${result.fieldsUpdated} 个字段`)
                     await loadSources()
                   } catch (err) {
+                    console.error("Refine failed:", err)
                     setImportError(`精炼失败: ${err instanceof Error ? err.message : String(err)}`)
                   } finally {
                     setImporting(false)
