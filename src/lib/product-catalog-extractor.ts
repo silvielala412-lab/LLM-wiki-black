@@ -45,13 +45,17 @@ interface SectionResult {
 }
 
 // ── Section splitting ─────────────────────────────────────────────────────
+// 将 OCR 全文按标题结构切分成多个「文本块」(sections)。
+// ⚠️ sections ≠ 页数。一个 39 页的 PDF 经 OCR 后约 47000 字，
+// 按 targetChars=25000 切分后通常得到 ~55-65 个 sections。
+// 每个 section 约 700-900 字（带 500 字重叠）。
 
 export function splitIntoSections(sourceContent: string): Chunk[] {
   return chunkMarkdown(sourceContent, {
-    targetChars: 25000,
-    maxChars: 40000,
-    minChars: 3000,
-    overlapChars: 500,
+    targetChars: 25000,   // 目标每块字符数
+    maxChars: 40000,      // 单块最大字符数
+    minChars: 3000,       // 单块最小字符数（过小则合并上块）
+    overlapChars: 500,    // 相邻块重叠字符数（防止跨界信息丢失）
   })
 }
 
@@ -612,6 +616,9 @@ function buildMainFile(
 
 // ── Top-level orchestrator ────────────────────────────────────────────────
 
+// 每批并发发送给 LLM 的 section 数量。
+// 设太高会导致内网模型过载/超时，设太低会拖慢总耗时。
+// 当前值 4 = 每批 4 个 section 同时调用 LLM，等全部返回后发下一批。
 const MAX_SECTION_PARALLEL = 4
 
 export async function runProductCatalogExtraction(
@@ -636,14 +643,21 @@ export async function runProductCatalogExtraction(
   }
 
   // ── Phase 1: Pre-process + Split ───────────────────────────
+  // 清洗 OCR 文本（去除代码围栏、重复页眉等），然后按标题结构切分成 sections。
   activity.updateItem(activityId, { detail: "正在预处理文本并切分章节..." })
   const cleanedContent = preprocessOcrText(sourceContent, productName)
   const sections = splitIntoSections(cleanedContent)
-  log.info("document split", { file: fileName, sections: sections.length, originalChars: sourceContent.length, cleanedChars: cleanedContent.length })
+  log.info("文本切分完成", {
+    file: fileName,
+    sections: sections.length,                      // 切块数（非页数）
+    originalChars: sourceContent.length,             // OCR 原文字符数
+    cleanedChars: cleanedContent.length,             // 清洗后字符数
+    avgCharsPerSection: Math.round(cleanedContent.length / Math.max(sections.length, 1)),
+  })
   if (sections.length === 0) return []
 
   activity.updateItem(activityId, {
-    detail: `切分为 ${sections.length} 个章节，按组分轮抽取 ${allModules.length} 个模块...`,
+    detail: `切分为 ${sections.length} 个文本块（非页数），按 ${GROUP_ORDER.length} 组分轮抽取 ${allModules.length} 个模块...`,
   })
 
   // ── Phase 2: Group-Round Extraction ────────────────────────────────────
@@ -736,11 +750,18 @@ export async function runProductCatalogExtraction(
     }
   }
 
-  log.info("extraction rounds complete", {
-    totalCalls,
-    totalSections: sections.length,
-    groups: GROUP_ORDER.length,
-    savedCalls: sections.length * GROUP_ORDER.length - totalCalls,
+  // totalCalls     = 实际发送给 LLM 的请求总数
+  // savedCalls     = 被关键词路由跳过的请求数（节省的调用）
+  // maxPossible    = 如果不做路由的最大请求数 = sections × groups
+  const maxPossibleCalls = sections.length * GROUP_ORDER.length
+  log.info("抽取轮次完成", {
+    totalCalls,                                     // 实际 LLM 调用次数
+    totalSections: sections.length,                  // 文本块数（非页数）
+    groups: GROUP_ORDER.length,                      // 模块组数
+    maxPossibleCalls,                                // 不做路由的最大调用数
+    savedCalls: maxPossibleCalls - totalCalls,        // 关键词路由节省的调用数
+    savingRate: `${Math.round((1 - totalCalls / maxPossibleCalls) * 100)}%`,
+    concurrency: MAX_SECTION_PARALLEL,               // 每批并发数
   })
 
 
