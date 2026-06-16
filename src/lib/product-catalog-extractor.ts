@@ -657,7 +657,7 @@ export async function runProductCatalogExtraction(
   if (sections.length === 0) return []
 
   activity.updateItem(activityId, {
-    detail: `切分为 ${sections.length} 个文本块（非页数），按 ${GROUP_ORDER.length} 组分轮抽取 ${allModules.length} 个模块...`,
+    detail: `切分为 ${sections.length} 个文本块（非页数），按 7 组分轮抽取 ${allModules.length} 个模块...`,
   })
 
   // ── Phase 2: Group-Round Extraction ────────────────────────────────────
