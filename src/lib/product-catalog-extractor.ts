@@ -19,7 +19,6 @@ import {
   type ModuleGroup,
   PRODUCT_CATALOG_MODULES,
   type ProductModule,
-  PRODUCT_FIELDS,
   BASE_FIELDS,
 } from "@/lib/product-catalog-modules"
 
@@ -59,7 +58,7 @@ export function splitIntoSections(sourceContent: string): Chunk[] {
 
 // Maps module name → list of key fields that should appear in the summary table
 const MODULE_KEY_FIELDS: Record<string, string[]> = {
-  "产品基础信息": ["险种名称", "险种简称", "产品类别", "产品类型", "主附加险", "保障期间", "交费方式", "交费期限", "保险期限", "发行公司"],
+  "产品基础信息": ["险种名称", "险种简称", "险种代码", "备案号", "产品类别", "产品类型", "主附加险", "保障期间", "交费方式", "交费期限", "保险期限", "发行公司"],
   "投保年龄": ["最低投保年龄", "最高投保年龄", "续保年龄上限", "特殊情形说明"],
   "投保职业": ["可投职业类别", "拒保职业类别", "职业分类标准"],
   "投保人群": ["目标人群", "投保人与被保人关系要求", "特殊限制"],
@@ -478,10 +477,7 @@ function buildMainFile(
   lines.push("")
 
   // ── Gather extracted data from modules ──────────────────────
-  // We pull short-field values from the "产品基础信息" module (which has the summary table)
-  // and build the structured tables from PRODUCT_FIELDS definition + extracted content
-  const allFields = PRODUCT_FIELDS[category] ?? []
-  const baseFieldNames = new Set(BASE_FIELDS.map(f => f.fieldName))
+  // Pull short-field values from all modules using best-value merge logic
 
   // Build a lookup: fieldName → best extracted value
   // Uses the same best-value logic as mergeFragmentContents: take first non-"未明确" value
@@ -511,31 +507,36 @@ function buildMainFile(
   }
 
 
-  // ── Section 1: 基础信息 table ────────────────────────────────
-  const shortBaseFields = allFields.filter(f => f.valueType === "short" && baseFieldNames.has(f.fieldName))
+  // ── Section 1: 基础信息 table (dynamic — only fields with values) ───
   lines.push("## 基础信息")
   lines.push("")
   lines.push("| 字段 | 值 |")
   lines.push("|---|---|")
-  for (const f of shortBaseFields) {
-    const val = shortFieldLookup.get(f.fieldName) ?? "（待填写）"
-    lines.push(`| ${f.fieldName} | ${val.replace(/\n/g, " ").replace(/\|/g, "\\|")} |`)
+  // Output all fields that have a real value (not 未明确), ordered: base fields first, then others
+  const outputtedFields = new Set<string>()
+  // First pass: known base fields in order
+  for (const f of BASE_FIELDS) {
+    const val = shortFieldLookup.get(f.fieldName)
+    if (val && val !== "未明确") {
+      lines.push(`| ${f.fieldName} | ${val.replace(/\n/g, " ").replace(/\|/g, "\\|")} |`)
+      outputtedFields.add(f.fieldName)
+    }
+  }
+  // Second pass: any other fields from modules (category-specific, dynamically discovered)
+  for (const [field, val] of shortFieldLookup) {
+    if (outputtedFields.has(field)) continue
+    if (val === "未明确") continue
+    lines.push(`| ${field} | ${val.replace(/\n/g, " ").replace(/\|/g, "\\|")} |`)
+    outputtedFields.add(field)
+  }
+  // Third pass: base fields that were 未明确 (show them as placeholders)
+  for (const f of BASE_FIELDS) {
+    if (outputtedFields.has(f.fieldName)) continue
+    const val = shortFieldLookup.get(f.fieldName) ?? "未明确"
+    lines.push(`| ${f.fieldName} | ${val} |`)
   }
   lines.push("")
 
-  // ── Section 2: 险种专属信息 table ────────────────────────────
-  const shortCatFields = allFields.filter(f => f.valueType === "short" && !baseFieldNames.has(f.fieldName))
-  if (shortCatFields.length > 0) {
-    lines.push(`## ${category}专属信息`)
-    lines.push("")
-    lines.push("| 字段 | 值 |")
-    lines.push("|---|---|")
-    for (const f of shortCatFields) {
-      const val = shortFieldLookup.get(f.fieldName) ?? "（待填写）"
-      lines.push(`| ${f.fieldName} | ${val.replace(/\n/g, " ").replace(/\|/g, "\\|")} |`)
-    }
-    lines.push("")
-  }
 
   // ── Section 3+: long fields inline ──────────────────────────
   // Fields like 产品简介、产品特色、保单权益 are rendered inline in the main file
