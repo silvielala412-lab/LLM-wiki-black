@@ -863,9 +863,10 @@ export function SourcesView() {
                     const { useActivityStore } = await import("@/stores/activity-store")
                     const actId = useActivityStore.getState().addItem({
                       type: "ingest",
-                      label: "精炼模块关键字段",
+                      title: "精炼模块关键字段",
                       detail: "正在启动...",
                       status: "running",
+                      filesWritten: [],
                     })
                     const result = await refineAllProductModules(project.path, llmConfig, actId)
                     useActivityStore.getState().updateItem(actId, { status: "done" })
