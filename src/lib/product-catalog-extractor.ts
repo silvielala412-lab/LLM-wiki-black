@@ -564,18 +564,26 @@ export async function runProductCatalogExtraction(
       detail: `[${groupKey}] 抽取 ${groupModules.length} 个模块，共 ${sections.length} 个章节并发...`,
     })
 
-    // All chunks concurrently for this group
-    const roundPromises = sections.map((section, idx) =>
-      extractFromSection(
-        section.text, idx, section.headingPath,
-        sections.length, groupModules,
-        category, productName, llmConfig, activityId, signal,
-        isDiseaseGroup ? { max_tokens: 16000 } : undefined,
+    // Process chunks in batches to avoid overwhelming the internal model.
+    // MAX_SECTION_PARALLEL controls how many sections run concurrently within this group.
+    for (let i = 0; i < sections.length; i += MAX_SECTION_PARALLEL) {
+      if (signal?.aborted) break
+      const batch = sections.slice(i, i + MAX_SECTION_PARALLEL)
+      activity.updateItem(activityId, {
+        detail: `[${groupKey}] 章节 ${Math.min(i + MAX_SECTION_PARALLEL, sections.length)}/${sections.length}，模块数 ${groupModules.length}...`,
+      })
+      const batchPromises = batch.map((section, offset) =>
+        extractFromSection(
+          section.text, i + offset, section.headingPath,
+          sections.length, groupModules,
+          category, productName, llmConfig, activityId, signal,
+          isDiseaseGroup ? { temperature: 0.1, max_tokens: 16000 } : undefined,
+        )
       )
-    )
-    const roundResults = await Promise.allSettled(roundPromises)
-    for (const r of roundResults) {
-      if (r.status === "fulfilled") sectionResults.push(r.value)
+      const batchResults = await Promise.allSettled(batchPromises)
+      for (const r of batchResults) {
+        if (r.status === "fulfilled") sectionResults.push(r.value)
+      }
     }
   }
 
