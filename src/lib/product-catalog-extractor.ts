@@ -9,7 +9,9 @@
 
 import { chunkMarkdown, type Chunk } from "@/lib/text-chunker"
 import { streamChat } from "@/lib/llm-client"
-import { createDirectory, writeFile } from "@/commands/fs"
+import { createDirectory, writeFile, readFile, listDirectory } from "@/commands/fs"
+import { normalizePath } from "@/lib/path-utils"
+import type { FileNode } from "@/types/wiki"
 import { getLogger } from "@/lib/logger"
 import { useActivityStore } from "@/stores/activity-store"
 import type { LlmConfig } from "@/stores/wiki-store"
@@ -848,9 +850,251 @@ export async function runProductCatalogExtraction(
     log.warn("failed to save OCR source text", { error: String(err) })
   }
 
+  // ── Phase 5: Module Refinement ────────────────────────────────────────
+  // 对每个模块的「详细条款原文」做二次精炼，补充关键字段中的「未明确」值。
+  activity.updateItem(activityId, { detail: "Phase 5: 正在精炼模块关键字段..." })
+  try {
+    const refineResult = await refineModuleFiles(
+      projectPath, category, productName, llmConfig, activityId, signal,
+    )
+    log.info("模块精炼完成", refineResult)
+  } catch (err) {
+    log.warn("模块精炼失败，不影响已有结果", { error: String(err) })
+  }
+
   activity.updateItem(activityId, {
     detail: `完成：${foundModules.length}/${allModules.length} 个模块，${writtenPaths.length} 个文件。`,
   })
 
   return writtenPaths
+}
+
+// ════════════════════════════════════════════════════════════════
+// Phase 5 — Module Refinement (二次精炼)
+//
+// 对每个模块文件的「详细条款原文」做聚焦式 LLM 调用，
+// 补充首次抽取中遗漏（标记为「未明确」）的关键字段。
+// 并发数 10，每次只发几百字原文 + 字段列表。
+// ════════════════════════════════════════════════════════════════
+
+const REFINE_PARALLEL = 10
+
+interface RefineResult {
+  totalModules: number
+  refined: number
+  fieldsUpdated: number
+  skipped: number
+}
+
+/**
+ * 从模块 md 文件中提取「详细条款原文」部分。
+ */
+function extractSourceText(content: string): string {
+  const match = content.match(/## 详细条款原文\s*\n([\s\S]*?)$/)
+  return match ? match[1].trim() : ""
+}
+
+/**
+ * 对单个模块文件做精炼：读原文 -> LLM 抽关键字段 -> 合并回文件。
+ * 返回更新的字段数（0 = 无更新）。
+ */
+async function refineSingleModule(
+  filePath: string,
+  llmConfig: LlmConfig,
+  signal?: AbortSignal,
+): Promise<number> {
+  const content = await readFile(filePath)
+
+  // Parse frontmatter
+  const fmMatch = content.match(/^---\n([\s\S]*?)\n---/)
+  if (!fmMatch) return 0
+  const fm = fmMatch[1]
+  const moduleNameMatch = fm.match(/^module_name:\s*"?([^"\n]+?)"?\s*$/m)
+  if (!moduleNameMatch) return 0
+  const moduleName = moduleNameMatch[1].trim()
+
+  // Get key fields definition for this module
+  const keyFields = MODULE_KEY_FIELDS[moduleName]
+  if (!keyFields || keyFields.length === 0) return 0
+
+  // Check if there are any "未明确" fields to fill
+  const existingFields = parseKeyFieldsTable(content)
+  const needsRefinement = existingFields.some(([, v]) => v === "未明确")
+  if (!needsRefinement) return 0
+
+  // Extract source text
+  const sourceText = extractSourceText(content)
+  if (!sourceText || sourceText.length < 20) return 0
+
+  // Build focused prompt
+  const fieldList = keyFields.map(f => `- ${f}`).join("\n")
+  const prompt = `你是保险条款分析专家。请从以下原文中提取关键字段。
+
+## 需要提取的字段
+${fieldList}
+
+## 原文
+${sourceText.substring(0, 8000)}
+
+## 输出要求
+请输出 Markdown 表格，格式如下：
+| 字段 | 值 |
+|---|---|
+| 字段名 | 提取到的值 |
+
+规则：
+- 只输出在原文中明确找到的字段
+- 如果原文没有提到某字段，不要输出该行
+- 不要输出"未明确"，只输出有实际值的行
+- 值要简洁准确`
+
+  // Call LLM
+  let response = ""
+  try {
+    const stream = streamChat({
+      model: llmConfig.model ?? "internal",
+      messages: [{ role: "user", content: prompt }],
+      temperature: 0.1,
+      max_tokens: 2000,
+    })
+    for await (const chunk of stream) {
+      if (signal?.aborted) break
+      if (chunk.type === "text") response += chunk.text
+    }
+  } catch {
+    return 0
+  }
+
+  if (!response || signal?.aborted) return 0
+
+  // Parse response for new field values
+  const newFields = parseKeyFieldsTable(response)
+  if (newFields.length === 0) return 0
+
+  // Merge: only fill in fields that were "未明确"
+  let updatedCount = 0
+  let updatedContent = content
+
+  for (const [field, newValue] of newFields) {
+    if (newValue === "未明确" || !newValue) continue
+    // Find the existing row with "未明确" and replace
+    const escapedField = field.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+    const rowPattern = `| ${field} | 未明确 |`
+    if (updatedContent.includes(rowPattern)) {
+      updatedContent = updatedContent.replace(rowPattern, `| ${field} | ${newValue} |`)
+      updatedCount++
+    }
+  }
+
+  if (updatedCount > 0) {
+    await writeFile(filePath, updatedContent)
+  }
+
+  return updatedCount
+}
+
+/**
+ * 对指定产品的所有模块文件做精炼。
+ * 在 runProductCatalogExtraction 的 Phase 5 中自动调用。
+ */
+async function refineModuleFiles(
+  projectPath: string,
+  category: string,
+  productName: string,
+  llmConfig: LlmConfig,
+  activityId: string,
+  signal?: AbortSignal,
+): Promise<RefineResult> {
+  const pp = normalizePath(projectPath)
+  const catalogDir = `${pp}/wiki/product_catalog`
+  const prefix = `${category}-${productName}-`
+
+  let files: FileNode[] = []
+  try {
+    const tree = await listDirectory(catalogDir)
+    files = tree.filter(f => !f.is_dir && f.name.startsWith(prefix) && f.name.endsWith(".md"))
+  } catch {
+    return { totalModules: 0, refined: 0, fieldsUpdated: 0, skipped: 0 }
+  }
+
+  const activity = useActivityStore.getState()
+  let refined = 0, fieldsUpdated = 0, skipped = 0
+
+  for (let i = 0; i < files.length; i += REFINE_PARALLEL) {
+    if (signal?.aborted) break
+    const batch = files.slice(i, i + REFINE_PARALLEL)
+    activity.updateItem(activityId, {
+      detail: `精炼 ${Math.min(i + REFINE_PARALLEL, files.length)}/${files.length} 个模块...`,
+    })
+
+    const results = await Promise.allSettled(
+      batch.map(f => refineSingleModule(f.path, llmConfig, signal))
+    )
+
+    for (const r of results) {
+      if (r.status === "fulfilled") {
+        if (r.value > 0) { refined++; fieldsUpdated += r.value }
+        else { skipped++ }
+      } else { skipped++ }
+    }
+  }
+
+  return { totalModules: files.length, refined, fieldsUpdated, skipped }
+}
+
+/**
+ * 独立入口：对项目中所有产品的所有模块做精炼。
+ * 用于 UI 按钮触发（不需要重新上传 PDF）。
+ * 并发 10，每个模块 1 次 LLM 调用。
+ */
+export async function refineAllProductModules(
+  projectPath: string,
+  llmConfig: LlmConfig,
+  activityId: string,
+  signal?: AbortSignal,
+): Promise<RefineResult> {
+  const pp = normalizePath(projectPath)
+  const catalogDir = `${pp}/wiki/product_catalog`
+  const activity = useActivityStore.getState()
+
+  let allFiles: FileNode[] = []
+  try {
+    const tree = await listDirectory(catalogDir)
+    allFiles = tree.filter(f => !f.is_dir && f.name.endsWith(".md") && f.name.includes("-"))
+  } catch {
+    return { totalModules: 0, refined: 0, fieldsUpdated: 0, skipped: 0 }
+  }
+
+  log.info("开始批量精炼", { totalModules: allFiles.length })
+  activity.updateItem(activityId, {
+    detail: `正在精炼 ${allFiles.length} 个模块文件...`,
+  })
+
+  let refined = 0, fieldsUpdated = 0, skipped = 0
+
+  for (let i = 0; i < allFiles.length; i += REFINE_PARALLEL) {
+    if (signal?.aborted) break
+    const batch = allFiles.slice(i, i + REFINE_PARALLEL)
+    activity.updateItem(activityId, {
+      detail: `精炼模块 ${Math.min(i + REFINE_PARALLEL, allFiles.length)}/${allFiles.length}...`,
+    })
+
+    const results = await Promise.allSettled(
+      batch.map(f => refineSingleModule(f.path, llmConfig, signal))
+    )
+
+    for (const r of results) {
+      if (r.status === "fulfilled") {
+        if (r.value > 0) { refined++; fieldsUpdated += r.value }
+        else { skipped++ }
+      } else { skipped++ }
+    }
+  }
+
+  log.info("批量精炼完成", { totalModules: allFiles.length, refined, fieldsUpdated, skipped })
+  activity.updateItem(activityId, {
+    detail: `精炼完成：${refined}/${allFiles.length} 个模块更新，共补充 ${fieldsUpdated} 个字段。`,
+  })
+
+  return { totalModules: allFiles.length, refined, fieldsUpdated, skipped }
 }
