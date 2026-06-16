@@ -574,7 +574,7 @@ async function onQueueDrained(projectId: string, projectPath: string): Promise<v
   try {
     const { runConceptAggregator } = await import("@/lib/concept-aggregator")
     const caResult = await runConceptAggregator(projectPath)
-    if (caResult.conceptsCreated + caResult.conceptsUpdated + caResult.entitiesUpdated > 0) {
+    if (caResult.serviceConceptsCreated + caResult.serviceConceptsUpdated + caResult.productConceptsCreated + caResult.productConceptsUpdated + caResult.entitiesUpdated > 0) {
       log.info("drain: concept aggregator done", caResult)
     }
   } catch (err) {

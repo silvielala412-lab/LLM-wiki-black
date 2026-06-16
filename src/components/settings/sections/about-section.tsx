@@ -34,7 +34,8 @@ export function AboutSection() {
       setRebuildResult("Step 1/2: 概念聚合（规则匹配，无需 LLM）...")
       const caResult = await runConceptAggregator(normPath)
       setRebuildResult(
-        `Step 1 完成：新建概念页 ${caResult.conceptsCreated}，更新 ${caResult.conceptsUpdated}，` +
+        `Step 1 完成：服务概念页 +${caResult.serviceConceptsCreated}/~${caResult.serviceConceptsUpdated}，` +
+        `产品概念页 +${caResult.productConceptsCreated}/~${caResult.productConceptsUpdated}，` +
         `实体 related 写入 ${caResult.entitiesUpdated} 条。Step 2/2: 扫描实体目录...`
       )
 
@@ -53,7 +54,8 @@ export function AboutSection() {
       if (rebuildAbortRef.current?.signal.aborted) { setRebuildState("idle"); setRebuildResult("已取消"); return }
       setRebuildState("done")
       setRebuildResult(
-        `完成！概念页 +${caResult.conceptsCreated}/~${caResult.conceptsUpdated}，` +
+        `完成！服务概念 +${caResult.serviceConceptsCreated}/~${caResult.serviceConceptsUpdated}，` +
+        `产品概念 +${caResult.productConceptsCreated}/~${caResult.productConceptsUpdated}，` +
         `实体 related 写入 ${caResult.entitiesUpdated} 条，` +
         `LLM 关系边写入 ${result.written} 条，舍弃 ${result.discarded}` +
         (result.errors.length > 0 ? `，${result.errors.length} 错误` : "") +

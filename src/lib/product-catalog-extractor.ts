@@ -13,6 +13,7 @@ import { createDirectory, writeFile } from "@/commands/fs"
 import { getLogger } from "@/lib/logger"
 import { useActivityStore } from "@/stores/activity-store"
 import type { LlmConfig } from "@/stores/wiki-store"
+import { preprocessOcrText } from "@/lib/ocr-text-repair"
 import {
   type InsuranceCategoryType,
   PRODUCT_CATALOG_MODULES,
@@ -512,10 +513,11 @@ export async function runProductCatalogExtraction(
     return []
   }
 
-  // ── Phase 1: Split ─────────────────────────────────────────
-  activity.updateItem(activityId, { detail: "正在按章节切分文档..." })
-  const sections = splitIntoSections(sourceContent)
-  log.info("document split", { file: fileName, sections: sections.length })
+  // ── Phase 1: Pre-process + Split ───────────────────────────
+  activity.updateItem(activityId, { detail: "正在预处理文本并切分章节..." })
+  const cleanedContent = preprocessOcrText(sourceContent, productName)
+  const sections = splitIntoSections(cleanedContent)
+  log.info("document split", { file: fileName, sections: sections.length, originalChars: sourceContent.length, cleanedChars: cleanedContent.length })
   if (sections.length === 0) return []
 
   activity.updateItem(activityId, {
