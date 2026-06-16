@@ -483,22 +483,33 @@ function buildMainFile(
   const allFields = PRODUCT_FIELDS[category] ?? []
   const baseFieldNames = new Set(BASE_FIELDS.map(f => f.fieldName))
 
-  // Build a lookup: fieldName → extracted text (first line from matching module)
-  // We use the "产品基础信息" module content as the source of short field values
+  // Build a lookup: fieldName → best extracted value
+  // Uses the same best-value logic as mergeFragmentContents: take first non-"未明确" value
   const basicInfoModule = mergedModules.get("产品基础信息")
   const shortFieldLookup = new Map<string, string>()
   if (basicInfoModule && basicInfoModule.found) {
-    // Parse "## 关键字段" table rows from the module content
     for (const content of basicInfoModule.contents) {
-      const tableRows = content.match(/\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|/g) ?? []
-      for (const row of tableRows) {
-        const cols = row.split("|").map(c => c.trim()).filter(Boolean)
-        if (cols.length >= 2 && cols[0] !== "字段" && cols[0] !== "---") {
-          shortFieldLookup.set(cols[0], cols[1])
+      const fields = parseKeyFieldsTable(content)
+      for (const [field, value] of fields) {
+        if (!shortFieldLookup.has(field) || (shortFieldLookup.get(field) === "未明确" && value !== "未明确")) {
+          shortFieldLookup.set(field, value)
         }
       }
     }
   }
+  // Also pull from ALL other modules' key fields (cross-module field aggregation)
+  for (const [, m] of mergedModules) {
+    if (!m.found) continue
+    for (const content of m.contents) {
+      const fields = parseKeyFieldsTable(content)
+      for (const [field, value] of fields) {
+        if (value !== "未明确" && (!shortFieldLookup.has(field) || shortFieldLookup.get(field) === "未明确")) {
+          shortFieldLookup.set(field, value)
+        }
+      }
+    }
+  }
+
 
   // ── Section 1: 基础信息 table ────────────────────────────────
   const shortBaseFields = allFields.filter(f => f.valueType === "short" && baseFieldNames.has(f.fieldName))
@@ -636,6 +647,20 @@ export async function runProductCatalogExtraction(
     "disease_definition",
   ]
 
+  // ── Content routing: keyword sets per group ──────────────────
+  // Only send sections to a group if the section text contains
+  // relevant keywords. This avoids wasting LLM calls on sections
+  // with no relevant content for that group.
+  const GROUP_KEYWORDS: Record<ModuleGroup, RegExp | null> = {
+    basic_info: /险种|产品|保险期|交费|保障期|投保|承保|年龄|简称|代码|主险|附加|公司|计划/,
+    coverage: null,  // coverage scans ALL sections (main content, most widely distributed)
+    cost_rules: /免赔|费率|保费|费用|赔付|比例|限额|给付|计算|上浮|社保/,
+    exclusion_uw: /免除|免责|除外|既往|告知|核保|拒保|加费|延期|健康/,
+    claim_service: /理赔|报案|材料|垫付|绿通|就医|服务|赔付|给付|申请/,
+    contract_admin: /退保|复效|变更|受益人|投保人|解除|犹豫|终止|中止/,
+    disease_definition: /疾病|释义|定义|恶性|肿瘤|心肌|脑|重大|中症|轻度|轻症/,
+  }
+
   // Build group → modules map for this category
   const groupMap = new Map<string, ProductModule[]>()
   for (const g of GROUP_ORDER) {
@@ -644,6 +669,7 @@ export async function runProductCatalogExtraction(
   }
 
   const sectionResults: SectionResult[] = []
+  let totalCalls = 0
 
   for (const groupKey of GROUP_ORDER) {
     if (signal?.aborted) break
@@ -651,32 +677,54 @@ export async function runProductCatalogExtraction(
     if (!groupModules || groupModules.length === 0) continue
 
     const isDiseaseGroup = groupKey === "disease_definition"
+    const keywordFilter = GROUP_KEYWORDS[groupKey]
+
+    // Filter sections by keyword relevance for this group
+    const relevantSections = keywordFilter
+      ? sections
+          .map((s, idx) => ({ ...s, originalIndex: idx }))
+          .filter(s => keywordFilter.test(s.text))
+      : sections.map((s, idx) => ({ ...s, originalIndex: idx }))
+
+    if (relevantSections.length === 0) {
+      log.info("group skipped (no relevant sections)", { group: groupKey })
+      continue
+    }
+
     activity.updateItem(activityId, {
-      detail: `[${groupKey}] 抽取 ${groupModules.length} 个模块，共 ${sections.length} 个章节并发...`,
+      detail: `[${groupKey}] ${relevantSections.length}/${sections.length} 个相关章节，${groupModules.length} 个模块...`,
     })
 
     // Process chunks in batches to avoid overwhelming the internal model.
-    // MAX_SECTION_PARALLEL controls how many sections run concurrently within this group.
-    for (let i = 0; i < sections.length; i += MAX_SECTION_PARALLEL) {
+    for (let i = 0; i < relevantSections.length; i += MAX_SECTION_PARALLEL) {
       if (signal?.aborted) break
-      const batch = sections.slice(i, i + MAX_SECTION_PARALLEL)
+      const batch = relevantSections.slice(i, i + MAX_SECTION_PARALLEL)
       activity.updateItem(activityId, {
-        detail: `[${groupKey}] 章节 ${Math.min(i + MAX_SECTION_PARALLEL, sections.length)}/${sections.length}，模块数 ${groupModules.length}...`,
+        detail: `[${groupKey}] 章节 ${Math.min(i + MAX_SECTION_PARALLEL, relevantSections.length)}/${relevantSections.length}（总${sections.length}），模块数 ${groupModules.length}...`,
       })
-      const batchPromises = batch.map((section, offset) =>
+      const batchPromises = batch.map((section) =>
         extractFromSection(
-          section.text, i + offset, section.headingPath,
+          section.text, section.originalIndex, section.headingPath,
           sections.length, groupModules,
           category, productName, llmConfig, activityId, signal,
           isDiseaseGroup ? { temperature: 0.1, max_tokens: 16000 } : undefined,
         )
       )
+      totalCalls += batch.length
       const batchResults = await Promise.allSettled(batchPromises)
       for (const r of batchResults) {
         if (r.status === "fulfilled") sectionResults.push(r.value)
       }
     }
   }
+
+  log.info("extraction rounds complete", {
+    totalCalls,
+    totalSections: sections.length,
+    groups: GROUP_ORDER.length,
+    savedCalls: sections.length * GROUP_ORDER.length - totalCalls,
+  })
+
 
   // ── Phase 3: Merge ─────────────────────────────────────────
   activity.updateItem(activityId, { detail: "正在跨章节合并..." })
