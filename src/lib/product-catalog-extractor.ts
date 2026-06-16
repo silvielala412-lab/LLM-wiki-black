@@ -16,6 +16,7 @@ import type { LlmConfig } from "@/stores/wiki-store"
 import { preprocessOcrText } from "@/lib/ocr-text-repair"
 import {
   type InsuranceCategoryType,
+  type ModuleGroup,
   PRODUCT_CATALOG_MODULES,
   type ProductModule,
   PRODUCT_FIELDS,
@@ -238,6 +239,7 @@ async function extractFromSection(
   llmConfig: LlmConfig,
   activityId: string,
   signal?: AbortSignal,
+  llmOverrides?: Parameters<typeof streamChat>[4],
 ): Promise<SectionResult> {
   const prompt = buildPrompt(modules, category, productName, sectionIndex, totalSections)
   const activity = useActivityStore.getState()
@@ -257,7 +259,7 @@ async function extractFromSection(
           "", sectionText,
         ].filter(Boolean).join("\n"),
       },
-    ], signal, { temperature: 0.1, max_tokens: 16000 })
+    ], signal, llmOverrides ?? { temperature: 0.1, max_tokens: 16000 })
   } catch (err) {
     log.warn("section failed", { section: sectionIndex, error: String(err) })
     return { sectionIndex, fragments: [] }
@@ -521,28 +523,60 @@ export async function runProductCatalogExtraction(
   if (sections.length === 0) return []
 
   activity.updateItem(activityId, {
-    detail: `切分为 ${sections.length} 个章节，开始并行抽取 ${allModules.length} 个模块...`,
+    detail: `切分为 ${sections.length} 个章节，按组分轮抽取 ${allModules.length} 个模块...`,
   })
 
-  // ── Phase 2: Parallel extraction ───────────────────────────
+  // ── Phase 2: Group-Round Extraction ────────────────────────────────────
+  // Modules are split into semantic groups. Each round processes ONE group
+  // across ALL chunks concurrently. This gives the LLM focused attention
+  // (5-8 modules per call) while each chunk still sees the full group context.
+  // Rounds run sequentially; chunks within a round run in parallel.
+  // ──────────────────────────────────────────────────────────────────────
+
+  // Group ordering: basic_info first (most likely to be in first section),
+  // disease_definition last (longest content, gets extra token budget).
+  const GROUP_ORDER: ModuleGroup[] = [
+    "basic_info",
+    "coverage",
+    "cost_rules",
+    "exclusion_uw",
+    "claim_service",
+    "contract_admin",
+    "disease_definition",
+  ]
+
+  // Build group → modules map for this category
+  const groupMap = new Map<string, ProductModule[]>()
+  for (const g of GROUP_ORDER) {
+    const members = allModules.filter(m => m.group === g)
+    if (members.length > 0) groupMap.set(g, members)
+  }
+
   const sectionResults: SectionResult[] = []
-  for (let i = 0; i < sections.length; i += MAX_SECTION_PARALLEL) {
+
+  for (const groupKey of GROUP_ORDER) {
     if (signal?.aborted) break
-    const batch = sections.slice(i, i + MAX_SECTION_PARALLEL)
-    const promises = batch.map((section, offset) =>
+    const groupModules = groupMap.get(groupKey)
+    if (!groupModules || groupModules.length === 0) continue
+
+    const isDiseaseGroup = groupKey === "disease_definition"
+    activity.updateItem(activityId, {
+      detail: `[${groupKey}] 抽取 ${groupModules.length} 个模块，共 ${sections.length} 个章节并发...`,
+    })
+
+    // All chunks concurrently for this group
+    const roundPromises = sections.map((section, idx) =>
       extractFromSection(
-        section.text, i + offset, section.headingPath,
-        sections.length, allModules,
+        section.text, idx, section.headingPath,
+        sections.length, groupModules,
         category, productName, llmConfig, activityId, signal,
-      ),
+        isDiseaseGroup ? { max_tokens: 16000 } : undefined,
+      )
     )
-    const results = await Promise.allSettled(promises)
-    for (const r of results) {
+    const roundResults = await Promise.allSettled(roundPromises)
+    for (const r of roundResults) {
       if (r.status === "fulfilled") sectionResults.push(r.value)
     }
-    activity.updateItem(activityId, {
-      detail: `已抽取 ${Math.min(i + MAX_SECTION_PARALLEL, sections.length)}/${sections.length} 个章节...`,
-    })
   }
 
   // ── Phase 3: Merge ─────────────────────────────────────────

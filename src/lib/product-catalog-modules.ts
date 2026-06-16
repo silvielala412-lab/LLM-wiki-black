@@ -1,4 +1,4 @@
-/**
+﻿/**
  * product-catalog-modules.ts
  *
  * 险种产品知识库模块定义。
@@ -32,7 +32,17 @@ export const INSURANCE_CATEGORIES: InsuranceCategoryType[] = [
 
 // ── 模块定义 ─────────────────────────────────────────────────────────────────
 
-/** 单个知识模块的元数据 (legacy, kept for backward compat) */
+/** 模块所属抽取组 — 决定该模块在第几轮被处理 */
+export type ModuleGroup =
+  | "basic_info"          // A: 基础信息（产品基本字段、投保约束、等待期）
+  | "coverage"            // B: 保险责任（保障给付、保障内容）
+  | "cost_rules"          // C: 费用规则（免赔额、费率、续保、赔付比例）
+  | "exclusion_uw"        // D: 免责与核保（责任免除、健康告知、核保结论）
+  | "claim_service"       // E: 理赔与增值服务（理赔材料、垫付、绿通）
+  | "contract_admin"      // F: 合同管理（退保、复效、受益人变更）
+  | "disease_definition"  // G: 疾病释义（重大/中症/轻度疾病定义，通常内容很长）
+
+/** 单个知识模块的元数据 */
 export interface ProductModule {
   /** 模块名，用于文件名生成（如「保障责任」）*/
   moduleName: string
@@ -44,6 +54,8 @@ export interface ProductModule {
   required: boolean
   /** 此模块是否属于险种基础信息（所有险种都有的） */
   isBaseModule: boolean
+  /** 抽取组：决定该模块在哪一轮（Round）被处理 */
+  group: ModuleGroup
 }
 
 // ── 业务字段定义 (对齐 Excel: 产品知识库字段标签维度) ─────────────────────────
@@ -231,29 +243,129 @@ export function getExtractableFields(category: InsuranceCategoryType): ProductFi
 /** 所有险种共有的基础模块 */
 const BASE_MODULES: ProductModule[] = [
   // 一、产品基础信息
-  {
-    moduleName: "产品基础信息",
-    entityType: "product_overview",
-    sourceDocHints: ["产品说明书", "产品简介", "投保须知"],
-    required: true,
-    isBaseModule: true,
-  },
+  { moduleName: "产品基础信息",    entityType: "product_overview",                      sourceDocHints: ["产品说明书","产品简介","投保须知"],  required: true,  isBaseModule: true,  group: "basic_info" },
 
   // 二、投保基础约束
-  {
-    moduleName: "投保年龄",
-    entityType: "underwriting_age_rule",
-    sourceDocHints: ["产品条款", "投保须知", "产品说明书"],
-    required: true,
-    isBaseModule: true,
-  },
-  {
-    moduleName: "投保职业",
-    entityType: "underwriting_occupation_rule",
-    sourceDocHints: ["核保数据", "产品条款", "投保须知"],
-    required: false,
-    isBaseModule: true,
-  },
+  { moduleName: "投保年龄",        entityType: "underwriting_age_rule",                 sourceDocHints: ["产品条款","投保须知","产品说明书"],  required: true,  isBaseModule: true,  group: "basic_info" },
+  { moduleName: "投保职业",        entityType: "underwriting_occupation_rule",           sourceDocHints: ["核保数据","产品条款","投保须知"],   required: false, isBaseModule: true,  group: "exclusion_uw" },
+  { moduleName: "投保人群",        entityType: "underwriting_target_group",             sourceDocHints: ["产品说明书","投保须知"],            required: false, isBaseModule: true,  group: "basic_info" },
+  { moduleName: "未成年人保额限制", entityType: "underwriting_minor_sum_insured_limit",  sourceDocHints: ["产品条款","投保须知","核保数据"],   required: false, isBaseModule: true,  group: "basic_info" },
+  { moduleName: "孕妇投保限制",    entityType: "underwriting_pregnant_restriction",      sourceDocHints: ["产品条款","投保须知","核保数据"],   required: false, isBaseModule: true,  group: "basic_info" },
+
+  // 三、核保相关
+  { moduleName: "专属健康告知",    entityType: "health_disclosure",                     sourceDocHints: ["健康告知","投保须知","核保材料"],   required: true,  isBaseModule: true,  group: "exclusion_uw" },
+  { moduleName: "标体承保",        entityType: "underwriting_decision_standard",         sourceDocHints: ["核保数据","核保手册"],             required: false, isBaseModule: true,  group: "exclusion_uw" },
+  { moduleName: "加费承保",        entityType: "underwriting_decision_surcharge",        sourceDocHints: ["核保数据","核保手册"],             required: false, isBaseModule: true,  group: "exclusion_uw" },
+  { moduleName: "除外承保",        entityType: "underwriting_decision_exclusion",        sourceDocHints: ["核保数据","核保手册"],             required: false, isBaseModule: true,  group: "exclusion_uw" },
+  { moduleName: "延期承保",        entityType: "underwriting_decision_postpone",         sourceDocHints: ["核保数据","核保手册"],             required: false, isBaseModule: true,  group: "exclusion_uw" },
+  { moduleName: "拒保判定",        entityType: "underwriting_decision_decline",          sourceDocHints: ["核保数据","核保手册","健康告知"],  required: false, isBaseModule: true,  group: "exclusion_uw" },
+
+  // 四、时间周期约束
+  { moduleName: "疾病等待期",      entityType: "waiting_period_rule",                   sourceDocHints: ["产品条款","投保须知"],             required: true,  isBaseModule: true,  group: "basic_info" },
+  { moduleName: "犹豫期",          entityType: "free_look_period_rule",                 sourceDocHints: ["产品条款","投保须知","产品说明书"], required: true,  isBaseModule: true,  group: "basic_info" },
+
+  // 七、免责约束
+  { moduleName: "通用责任免除",    entityType: "general_exclusion_rule",                sourceDocHints: ["产品条款"],                        required: true,  isBaseModule: true,  group: "exclusion_uw" },
+  { moduleName: "既往症免责",      entityType: "preexisting_condition_exclusion",        sourceDocHints: ["产品条款"],                        required: false, isBaseModule: true,  group: "exclusion_uw" },
+
+  // 八、保单保全变更
+  { moduleName: "投保人变更",      entityType: "policy_change_policyholder",            sourceDocHints: ["产品条款","产品说明书"],            required: false, isBaseModule: true,  group: "contract_admin" },
+  { moduleName: "受益人变更",      entityType: "policy_change_beneficiary",             sourceDocHints: ["产品条款","产品说明书"],            required: false, isBaseModule: true,  group: "contract_admin" },
+  { moduleName: "退保",            entityType: "policy_surrender",                      sourceDocHints: ["产品条款","产品说明书"],            required: false, isBaseModule: true,  group: "contract_admin" },
+  { moduleName: "保单复效",        entityType: "policy_reinstatement",                  sourceDocHints: ["产品条款"],                        required: false, isBaseModule: true,  group: "contract_admin" },
+
+  // 九、理赔（通用部分）
+  { moduleName: "理赔报案",        entityType: "claim_reporting",                       sourceDocHints: ["服务与理赔指南","产品条款","理赔材料"], required: true,  isBaseModule: true, group: "claim_service" },
+  { moduleName: "常见拒赔原因",    entityType: "claim_denial_reasons",                  sourceDocHints: ["服务与理赔指南","产品条款"],        required: false, isBaseModule: true,  group: "claim_service" },
+
+  // 十一、量化数据
+  { moduleName: "分年龄保费费率表", entityType: "rate_table",                            sourceDocHints: ["费率表","费率数据"],               required: false, isBaseModule: true,  group: "cost_rules" },
+
+  // 十二、疾病释义
+  { moduleName: "重大疾病释义",    entityType: "critical_illness_definition",           sourceDocHints: ["产品条款","疾病定义"],             required: false, isBaseModule: true,  group: "disease_definition" },
+  { moduleName: "中症疾病释义",    entityType: "moderate_illness_definition",           sourceDocHints: ["产品条款","疾病定义"],             required: false, isBaseModule: true,  group: "disease_definition" },
+  { moduleName: "轻度疾病释义",    entityType: "mild_illness_definition",               sourceDocHints: ["产品条款","疾病定义"],             required: false, isBaseModule: true,  group: "disease_definition" },
+]
+
+
+/** 医疗险（含意外医疗险）专属模块 */
+const MEDICAL_MODULES: ProductModule[] = [
+  { moduleName: "一般住院医疗",     entityType: "coverage_general_hospitalization",      sourceDocHints: ["产品条款"], required: true,  isBaseModule: false, group: "coverage" },
+  { moduleName: "特殊门诊医疗",     entityType: "coverage_special_outpatient",           sourceDocHints: ["产品条款"], required: false, isBaseModule: false, group: "coverage" },
+  { moduleName: "住院前后门急诊",   entityType: "coverage_pre_post_hospitalization",      sourceDocHints: ["产品条款"], required: false, isBaseModule: false, group: "coverage" },
+  { moduleName: "门诊手术医疗",     entityType: "coverage_outpatient_surgery",           sourceDocHints: ["产品条款"], required: false, isBaseModule: false, group: "coverage" },
+  { moduleName: "重大疾病医疗",     entityType: "coverage_critical_illness_medical",     sourceDocHints: ["产品条款"], required: false, isBaseModule: false, group: "coverage" },
+  { moduleName: "院外特定药品",     entityType: "coverage_outpatient_drugs",             sourceDocHints: ["产品条款"], required: false, isBaseModule: false, group: "coverage" },
+  { moduleName: "质子重离子医疗",   entityType: "coverage_proton_therapy",               sourceDocHints: ["产品条款"], required: false, isBaseModule: false, group: "coverage" },
+  { moduleName: "恶性肿瘤赴日医疗", entityType: "coverage_japan_cancer_treatment",       sourceDocHints: ["产品条款"], required: false, isBaseModule: false, group: "coverage" },
+  { moduleName: "年度免赔额",       entityType: "deductible_rule",                       sourceDocHints: ["产品条款","产品说明书"], required: true,  isBaseModule: false, group: "cost_rules" },
+  { moduleName: "有社保费率",       entityType: "premium_rate_with_social_insurance",    sourceDocHints: ["费率表","产品说明书"],   required: false, isBaseModule: false, group: "cost_rules" },
+  { moduleName: "无社保费率上浮",   entityType: "premium_rate_without_social_insurance", sourceDocHints: ["费率表","产品说明书"],   required: false, isBaseModule: false, group: "cost_rules" },
+  { moduleName: "6年保证续保",      entityType: "guaranteed_renewal_rule",               sourceDocHints: ["产品条款","产品说明书"], required: false, isBaseModule: false, group: "cost_rules" },
+  { moduleName: "住院理赔材料",     entityType: "claim_documents_hospitalization",       sourceDocHints: ["服务与理赔指南","理赔材料清单"], required: false, isBaseModule: false, group: "claim_service" },
+  { moduleName: "重疾理赔材料",     entityType: "claim_documents_critical",              sourceDocHints: ["服务与理赔指南","理赔材料清单"], required: false, isBaseModule: false, group: "claim_service" },
+  { moduleName: "社保后赔付比例",   entityType: "reimbursement_rate_with_social",        sourceDocHints: ["产品条款","产品说明书"], required: false, isBaseModule: false, group: "cost_rules" },
+  { moduleName: "无社保赔付比例",   entityType: "reimbursement_rate_without_social",     sourceDocHints: ["产品条款","产品说明书"], required: false, isBaseModule: false, group: "cost_rules" },
+  { moduleName: "第三方报销分摊",   entityType: "third_party_coordination_rule",         sourceDocHints: ["产品条款"],             required: false, isBaseModule: false, group: "cost_rules" },
+  { moduleName: "住院垫付",         entityType: "value_added_cashless_hospitalization",  sourceDocHints: ["服务与理赔指南","产品说明书"], required: false, isBaseModule: false, group: "claim_service" },
+  { moduleName: "重疾就医绿通",     entityType: "value_added_green_channel",             sourceDocHints: ["服务与理赔指南","产品说明书"], required: false, isBaseModule: false, group: "claim_service" },
+  { moduleName: "异地就医医院限制", entityType: "hospital_scope_rule",                  sourceDocHints: ["产品条款","服务与理赔指南"],   required: false, isBaseModule: false, group: "claim_service" },
+]
+
+
+/** 重疾险专属模块 */
+const CRITICAL_ILLNESS_MODULES: ProductModule[] = [
+  { moduleName: "重大疾病保险金",   entityType: "coverage_critical_illness_benefit",    sourceDocHints: ["产品条款"], required: true,  isBaseModule: false, group: "coverage" },
+  { moduleName: "轻症保险金",       entityType: "coverage_mild_illness_benefit",         sourceDocHints: ["产品条款"], required: false, isBaseModule: false, group: "coverage" },
+  { moduleName: "中症保险金",       entityType: "coverage_moderate_illness_benefit",     sourceDocHints: ["产品条款"], required: false, isBaseModule: false, group: "coverage" },
+  { moduleName: "重疾分组",         entityType: "critical_illness_grouping",             sourceDocHints: ["产品条款"], required: false, isBaseModule: false, group: "coverage" },
+  { moduleName: "重疾多次赔付",     entityType: "critical_illness_multiple_claims",      sourceDocHints: ["产品条款"], required: false, isBaseModule: false, group: "coverage" },
+  { moduleName: "特定重疾额外赔付", entityType: "critical_illness_special_benefit",      sourceDocHints: ["产品条款"], required: false, isBaseModule: false, group: "coverage" },
+  { moduleName: "身故保险金",       entityType: "coverage_death_benefit",               sourceDocHints: ["产品条款"], required: false, isBaseModule: false, group: "coverage" },
+  { moduleName: "被保人保费豁免",   entityType: "premium_waiver_insured",               sourceDocHints: ["产品条款"], required: false, isBaseModule: false, group: "coverage" },
+  { moduleName: "投保人保费豁免",   entityType: "premium_waiver_policyholder",          sourceDocHints: ["产品条款"], required: false, isBaseModule: false, group: "coverage" },
+  { moduleName: "保费调整",         entityType: "premium_adjustment_rule",              sourceDocHints: ["产品条款","产品说明书"], required: false, isBaseModule: false, group: "cost_rules" },
+  { moduleName: "加保",             entityType: "policy_additional_purchase",           sourceDocHints: ["产品条款","产品说明书"], required: false, isBaseModule: false, group: "contract_admin" },
+  { moduleName: "减保",             entityType: "policy_reduction",                     sourceDocHints: ["产品条款","产品说明书"], required: false, isBaseModule: false, group: "contract_admin" },
+  { moduleName: "保单贷款",         entityType: "policy_loan",                          sourceDocHints: ["产品条款","产品说明书"], required: false, isBaseModule: false, group: "contract_admin" },
+  { moduleName: "重疾理赔材料",     entityType: "claim_documents_critical",             sourceDocHints: ["服务与理赔指南"], required: false, isBaseModule: false, group: "claim_service" },
+  { moduleName: "身故理赔材料",     entityType: "claim_documents_death",                sourceDocHints: ["服务与理赔指南"], required: false, isBaseModule: false, group: "claim_service" },
+  { moduleName: "年度现金价值表",   entityType: "cash_value_table",                     sourceDocHints: ["产品条款","现金价值表"], required: false, isBaseModule: false, group: "cost_rules" },
+]
+
+/** 意外险专属模块 */
+const ACCIDENT_MODULES: ProductModule[] = [
+  { moduleName: "意外身故",         entityType: "coverage_accidental_death",            sourceDocHints: ["产品条款"], required: true,  isBaseModule: false, group: "coverage" },
+  { moduleName: "意外伤残",         entityType: "coverage_accidental_disability",        sourceDocHints: ["产品条款"], required: true,  isBaseModule: false, group: "coverage" },
+  { moduleName: "意外医疗",         entityType: "coverage_accidental_medical",           sourceDocHints: ["产品条款"], required: false, isBaseModule: false, group: "coverage" },
+  { moduleName: "交通意外额外赔付", entityType: "coverage_traffic_accident_extra",       sourceDocHints: ["产品条款"], required: false, isBaseModule: false, group: "coverage" },
+  { moduleName: "意外身故理赔材料", entityType: "claim_documents_accidental_death",      sourceDocHints: ["服务与理赔指南"], required: false, isBaseModule: false, group: "claim_service" },
+  { moduleName: "意外医疗理赔材料", entityType: "claim_documents_accidental_medical",    sourceDocHints: ["服务与理赔指南"], required: false, isBaseModule: false, group: "claim_service" },
+]
+
+/** 寿险专属模块 */
+const LIFE_INSURANCE_MODULES: ProductModule[] = [
+  { moduleName: "身故保险金",       entityType: "coverage_death_benefit",               sourceDocHints: ["产品条款"], required: true,  isBaseModule: false, group: "coverage" },
+  { moduleName: "减保",             entityType: "policy_reduction",                     sourceDocHints: ["产品条款","产品说明书"], required: false, isBaseModule: false, group: "contract_admin" },
+  { moduleName: "保单贷款",         entityType: "policy_loan",                          sourceDocHints: ["产品条款","产品说明书"], required: false, isBaseModule: false, group: "contract_admin" },
+  { moduleName: "身故理赔材料",     entityType: "claim_documents_death",                sourceDocHints: ["服务与理赔指南"], required: false, isBaseModule: false, group: "claim_service" },
+  { moduleName: "年度现金价值表",   entityType: "cash_value_table",                     sourceDocHints: ["产品条款","现金价值表"], required: false, isBaseModule: false, group: "cost_rules" },
+]
+
+/** 年金险专属模块 */
+const ANNUITY_MODULES: ProductModule[] = [
+  { moduleName: "年金给付规则",   entityType: "annuity_payment_rule",        sourceDocHints: ["产品条款","产品说明书"], required: true,  isBaseModule: false, group: "coverage" },
+  { moduleName: "领取期间",       entityType: "annuity_payout_period",       sourceDocHints: ["产品条款"],             required: true,  isBaseModule: false, group: "coverage" },
+  { moduleName: "万能账户规则",   entityType: "universal_account_rule",      sourceDocHints: ["产品条款","产品说明书"], required: false, isBaseModule: false, group: "coverage" },
+  { moduleName: "保证利率",       entityType: "guaranteed_interest_rate",    sourceDocHints: ["产品条款","产品说明书"], required: false, isBaseModule: false, group: "cost_rules" },
+  { moduleName: "初始费用",       entityType: "initial_fee_rule",            sourceDocHints: ["产品说明书"],           required: false, isBaseModule: false, group: "cost_rules" },
+  { moduleName: "领取手续费",     entityType: "withdrawal_fee_rule",         sourceDocHints: ["产品说明书"],           required: false, isBaseModule: false, group: "cost_rules" },
+  { moduleName: "保单贷款",       entityType: "policy_loan",                 sourceDocHints: ["产品条款","产品说明书"], required: false, isBaseModule: false, group: "contract_admin" },
+  { moduleName: "减保",           entityType: "policy_reduction",            sourceDocHints: ["产品条款","产品说明书"], required: false, isBaseModule: false, group: "contract_admin" },
+  { moduleName: "年度现金价值表", entityType: "cash_value_table",            sourceDocHints: ["产品条款","现金价值表"], required: false, isBaseModule: false, group: "cost_rules" },
+  { moduleName: "领取明细示例",   entityType: "annuity_illustration",        sourceDocHints: ["产品说明书","产品问答"], required: false, isBaseModule: false, group: "coverage" },
+]
+
   {
     moduleName: "投保人群",
     entityType: "underwriting_target_group",
@@ -429,101 +541,6 @@ const BASE_MODULES: ProductModule[] = [
     required: false,
     isBaseModule: true,
   },
-]
-
-/** 医疗险（含意外医疗险）专属模块 */
-const MEDICAL_MODULES: ProductModule[] = [
-  // 五、保障责任
-  { moduleName: "一般住院医疗",     entityType: "coverage_general_hospitalization",      sourceDocHints: ["产品条款"], required: true,  isBaseModule: false },
-  { moduleName: "特殊门诊医疗",     entityType: "coverage_special_outpatient",           sourceDocHints: ["产品条款"], required: false, isBaseModule: false },
-  { moduleName: "住院前后门急诊",   entityType: "coverage_pre_post_hospitalization",      sourceDocHints: ["产品条款"], required: false, isBaseModule: false },
-  { moduleName: "门诊手术医疗",     entityType: "coverage_outpatient_surgery",           sourceDocHints: ["产品条款"], required: false, isBaseModule: false },
-  { moduleName: "重大疾病医疗",     entityType: "coverage_critical_illness_medical",     sourceDocHints: ["产品条款"], required: false, isBaseModule: false },
-  { moduleName: "院外特定药品",     entityType: "coverage_outpatient_drugs",             sourceDocHints: ["产品条款"], required: false, isBaseModule: false },
-  { moduleName: "质子重离子医疗",   entityType: "coverage_proton_therapy",               sourceDocHints: ["产品条款"], required: false, isBaseModule: false },
-  { moduleName: "恶性肿瘤赴日医疗", entityType: "coverage_japan_cancer_treatment",       sourceDocHints: ["产品条款"], required: false, isBaseModule: false },
-
-  // 六、费用与续保约束
-  { moduleName: "年度免赔额",       entityType: "deductible_rule",                       sourceDocHints: ["产品条款", "产品说明书"], required: true,  isBaseModule: false },
-  { moduleName: "有社保费率",       entityType: "premium_rate_with_social_insurance",    sourceDocHints: ["费率表", "产品说明书"],   required: false, isBaseModule: false },
-  { moduleName: "无社保费率上浮",   entityType: "premium_rate_without_social_insurance", sourceDocHints: ["费率表", "产品说明书"],   required: false, isBaseModule: false },
-  { moduleName: "6年保证续保",      entityType: "guaranteed_renewal_rule",               sourceDocHints: ["产品条款", "产品说明书"], required: false, isBaseModule: false },
-
-  // 九、理赔（医疗专属）
-  { moduleName: "住院理赔材料",     entityType: "claim_documents_hospitalization",       sourceDocHints: ["服务与理赔指南", "理赔材料清单"], required: false, isBaseModule: false },
-  { moduleName: "重疾理赔材料",     entityType: "claim_documents_critical",              sourceDocHints: ["服务与理赔指南", "理赔材料清单"], required: false, isBaseModule: false },
-  { moduleName: "社保后赔付比例",   entityType: "reimbursement_rate_with_social",        sourceDocHints: ["产品条款", "产品说明书"], required: false, isBaseModule: false },
-  { moduleName: "无社保赔付比例",   entityType: "reimbursement_rate_without_social",     sourceDocHints: ["产品条款", "产品说明书"], required: false, isBaseModule: false },
-  { moduleName: "第三方报销分摊",   entityType: "third_party_coordination_rule",         sourceDocHints: ["产品条款"],              required: false, isBaseModule: false },
-
-  // 十、增值医疗服务
-  { moduleName: "住院垫付",         entityType: "value_added_cashless_hospitalization",  sourceDocHints: ["服务与理赔指南", "产品说明书"], required: false, isBaseModule: false },
-  { moduleName: "重疾就医绿通",     entityType: "value_added_green_channel",             sourceDocHints: ["服务与理赔指南", "产品说明书"], required: false, isBaseModule: false },
-  { moduleName: "异地就医医院限制", entityType: "hospital_scope_rule",                  sourceDocHints: ["产品条款", "服务与理赔指南"],    required: false, isBaseModule: false },
-]
-
-/** 重疾险专属模块 */
-const CRITICAL_ILLNESS_MODULES: ProductModule[] = [
-  // 五、保障责任（重疾专属）
-  { moduleName: "重大疾病保险金",   entityType: "coverage_critical_illness_benefit",    sourceDocHints: ["产品条款"], required: true,  isBaseModule: false },
-  { moduleName: "轻症保险金",       entityType: "coverage_mild_illness_benefit",         sourceDocHints: ["产品条款"], required: false, isBaseModule: false },
-  { moduleName: "中症保险金",       entityType: "coverage_moderate_illness_benefit",     sourceDocHints: ["产品条款"], required: false, isBaseModule: false },
-  { moduleName: "重疾分组",         entityType: "critical_illness_grouping",             sourceDocHints: ["产品条款"], required: false, isBaseModule: false },
-  { moduleName: "重疾多次赔付",     entityType: "critical_illness_multiple_claims",      sourceDocHints: ["产品条款"], required: false, isBaseModule: false },
-  { moduleName: "特定重疾额外赔付", entityType: "critical_illness_special_benefit",      sourceDocHints: ["产品条款"], required: false, isBaseModule: false },
-  { moduleName: "身故保险金",       entityType: "coverage_death_benefit",               sourceDocHints: ["产品条款"], required: false, isBaseModule: false },
-  { moduleName: "被保人保费豁免",   entityType: "premium_waiver_insured",               sourceDocHints: ["产品条款"], required: false, isBaseModule: false },
-  { moduleName: "投保人保费豁免",   entityType: "premium_waiver_policyholder",          sourceDocHints: ["产品条款"], required: false, isBaseModule: false },
-  // 费率
-  { moduleName: "保费调整",         entityType: "premium_adjustment_rule",              sourceDocHints: ["产品条款", "产品说明书"], required: false, isBaseModule: false },
-  // 保全（重疾险特有）
-  { moduleName: "加保",             entityType: "policy_additional_purchase",           sourceDocHints: ["产品条款", "产品说明书"], required: false, isBaseModule: false },
-  { moduleName: "减保",             entityType: "policy_reduction",                     sourceDocHints: ["产品条款", "产品说明书"], required: false, isBaseModule: false },
-  { moduleName: "保单贷款",         entityType: "policy_loan",                          sourceDocHints: ["产品条款", "产品说明书"], required: false, isBaseModule: false },
-  // 理赔（重疾专属）
-  { moduleName: "重疾理赔材料",     entityType: "claim_documents_critical",             sourceDocHints: ["服务与理赔指南"], required: false, isBaseModule: false },
-  { moduleName: "身故理赔材料",     entityType: "claim_documents_death",                sourceDocHints: ["服务与理赔指南"], required: false, isBaseModule: false },
-  // 数据表
-  { moduleName: "年度现金价值表",   entityType: "cash_value_table",                     sourceDocHints: ["产品条款", "现金价值表"], required: false, isBaseModule: false },
-]
-
-/** 意外险专属模块 */
-const ACCIDENT_MODULES: ProductModule[] = [
-  // 保障责任
-  { moduleName: "意外身故",         entityType: "coverage_accidental_death",            sourceDocHints: ["产品条款"], required: true,  isBaseModule: false },
-  { moduleName: "意外伤残",         entityType: "coverage_accidental_disability",        sourceDocHints: ["产品条款"], required: true,  isBaseModule: false },
-  { moduleName: "意外医疗",         entityType: "coverage_accidental_medical",           sourceDocHints: ["产品条款"], required: false, isBaseModule: false },
-  { moduleName: "交通意外额外赔付", entityType: "coverage_traffic_accident_extra",       sourceDocHints: ["产品条款"], required: false, isBaseModule: false },
-  // 理赔（意外险专属）
-  { moduleName: "意外身故理赔材料", entityType: "claim_documents_accidental_death",      sourceDocHints: ["服务与理赔指南"], required: false, isBaseModule: false },
-  { moduleName: "意外医疗理赔材料", entityType: "claim_documents_accidental_medical",    sourceDocHints: ["服务与理赔指南"], required: false, isBaseModule: false },
-]
-
-/** 寿险专属模块 */
-const LIFE_INSURANCE_MODULES: ProductModule[] = [
-  // 保障责任
-  { moduleName: "身故保险金",       entityType: "coverage_death_benefit",               sourceDocHints: ["产品条款"], required: true,  isBaseModule: false },
-  // 保全（寿险特有）
-  { moduleName: "减保",             entityType: "policy_reduction",                     sourceDocHints: ["产品条款", "产品说明书"], required: false, isBaseModule: false },
-  { moduleName: "保单贷款",         entityType: "policy_loan",                          sourceDocHints: ["产品条款", "产品说明书"], required: false, isBaseModule: false },
-  // 理赔
-  { moduleName: "身故理赔材料",     entityType: "claim_documents_death",                sourceDocHints: ["服务与理赔指南"], required: false, isBaseModule: false },
-  // 数据表
-  { moduleName: "年度现金价值表",   entityType: "cash_value_table",                     sourceDocHints: ["产品条款", "现金价值表"], required: false, isBaseModule: false },
-]
-
-/** 年金险专属模块 */
-const ANNUITY_MODULES: ProductModule[] = [
-  { moduleName: "年金给付规则", entityType: "annuity_payment_rule", sourceDocHints: ["产品条款", "产品说明书"], required: true, isBaseModule: false },
-  { moduleName: "领取期间", entityType: "annuity_payout_period", sourceDocHints: ["产品条款"], required: true, isBaseModule: false },
-  { moduleName: "万能账户规则", entityType: "universal_account_rule", sourceDocHints: ["产品条款", "产品说明书"], required: false, isBaseModule: false },
-  { moduleName: "保证利率", entityType: "guaranteed_interest_rate", sourceDocHints: ["产品条款", "产品说明书"], required: false, isBaseModule: false },
-  { moduleName: "初始费用", entityType: "initial_fee_rule", sourceDocHints: ["产品说明书"], required: false, isBaseModule: false },
-  { moduleName: "领取手续费", entityType: "withdrawal_fee_rule", sourceDocHints: ["产品说明书"], required: false, isBaseModule: false },
-  { moduleName: "保单贷款", entityType: "policy_loan", sourceDocHints: ["产品条款", "产品说明书"], required: false, isBaseModule: false },
-  { moduleName: "减保", entityType: "policy_reduction", sourceDocHints: ["产品条款", "产品说明书"], required: false, isBaseModule: false },
-  { moduleName: "年度现金价值表", entityType: "cash_value_table", sourceDocHints: ["产品条款", "现金价值表"], required: false, isBaseModule: false },
-  { moduleName: "领取明细示例", entityType: "annuity_illustration", sourceDocHints: ["产品说明书", "产品问答"], required: false, isBaseModule: false },
 ]
 
 // ── 全量模块注册表 ────────────────────────────────────────────────────────────
