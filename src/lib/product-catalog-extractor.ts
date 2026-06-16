@@ -912,9 +912,16 @@ async function refineSingleModule(
   if (!moduleNameMatch) return 0
   const moduleName = moduleNameMatch[1].trim()
 
-  // Get key fields definition for this module
-  const keyFields = MODULE_KEY_FIELDS[moduleName]
-  if (!keyFields || keyFields.length === 0) return 0
+  // Get key fields definition for this module.
+  // If MODULE_KEY_FIELDS doesn't define this module, fall back to
+  // the field names already in the module's key fields table.
+  let keyFields = MODULE_KEY_FIELDS[moduleName]
+  if (!keyFields || keyFields.length === 0) {
+    // Dynamically discover field names from the existing table
+    const existingPairs = parseKeyFieldsTable(content)
+    if (existingPairs.length === 0) return 0
+    keyFields = existingPairs.map(([name]) => name)
+  }
 
   // Check if there are any "未明确" fields to fill
   const existingFields = parseKeyFieldsTable(content)
