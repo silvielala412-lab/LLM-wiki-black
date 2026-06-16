@@ -313,6 +313,107 @@ function mergeModules(
   return merged
 }
 
+// ── Field-level best-value merge helpers ──────────────────────────────────
+
+/**
+ * Parse a Markdown table from a fragment's "## 关键字段" section.
+ * Returns Map<fieldName, value>.
+ */
+function parseKeyFieldsTable(markdown: string): Map<string, string> {
+  const fields = new Map<string, string>()
+  // Find the "## 关键字段" section
+  const keyFieldsMatch = markdown.match(/## 关键字段[\s\S]*?(?=\n## |\n---|\n$|$)/)
+  if (!keyFieldsMatch) return fields
+
+  const tableBlock = keyFieldsMatch[0]
+  // Parse each table row: | fieldName | value |
+  const rowRegex = /^\|\s*(.+?)\s*\|\s*(.+?)\s*\|$/gm
+  let row: RegExpExecArray | null
+  while ((row = rowRegex.exec(tableBlock)) !== null) {
+    const field = row[1].trim()
+    const value = row[2].trim()
+    // Skip header separators and header row
+    if (field === "---" || field === "字段" || field.startsWith("--")) continue
+    fields.set(field, value)
+  }
+  return fields
+}
+
+/**
+ * Extract the "## 详细条款原文" (or "## 详细原文") section from a fragment.
+ */
+function extractDetailContent(markdown: string): string {
+  const match = markdown.match(/## 详细(?:条款)?原文\s*\n([\s\S]*)$/)
+  return match ? match[1].trim() : ""
+}
+
+/**
+ * Merge multiple fragments' key-fields tables:
+ * for each field, take the first non-"未明确" value.
+ * Returns a single merged Markdown table + concatenated detail content.
+ */
+function mergeFragmentContents(contents: string[], sectionIndices: number[]): string {
+  // 1. Collect all field tables and merge
+  const mergedFields = new Map<string, string>()
+  const fieldOrder: string[] = []
+
+  for (const content of contents) {
+    const fields = parseKeyFieldsTable(content)
+    for (const [field, value] of fields) {
+      if (!mergedFields.has(field)) {
+        mergedFields.set(field, value)
+        fieldOrder.push(field)
+      } else if (mergedFields.get(field) === "未明确" && value !== "未明确") {
+        // Upgrade from "未明确" to a real value
+        mergedFields.set(field, value)
+      }
+    }
+  }
+
+  // 2. Collect unique detail contents
+  const detailParts: { text: string; sectionIndex: number }[] = []
+  const seenDetails = new Set<string>()
+
+  for (let i = 0; i < contents.length; i++) {
+    const detail = extractDetailContent(contents[i])
+    if (!detail) continue
+    const normalized = detail.replace(/\s+/g, " ").trim()
+    if (seenDetails.has(normalized)) continue
+    seenDetails.add(normalized)
+    detailParts.push({ text: detail, sectionIndex: sectionIndices[i] })
+  }
+
+  // 3. Build output
+  const lines: string[] = []
+
+  if (fieldOrder.length > 0) {
+    lines.push("## 关键字段")
+    lines.push("")
+    lines.push("| 字段 | 值 |")
+    lines.push("|---|---|")
+    for (const field of fieldOrder) {
+      lines.push(`| ${field} | ${mergedFields.get(field) ?? "未明确"} |`)
+    }
+    lines.push("")
+  }
+
+  if (detailParts.length > 0) {
+    lines.push("## 详细条款原文")
+    lines.push("")
+    for (let i = 0; i < detailParts.length; i++) {
+      if (i > 0) {
+        lines.push("")
+        lines.push("---")
+        lines.push(`<!-- 以下内容来自文档第 ${detailParts[i].sectionIndex + 1} 部分 -->`)
+        lines.push("")
+      }
+      lines.push(detailParts[i].text)
+    }
+  }
+
+  return lines.join("\n")
+}
+
 // ── Module .md file builder ───────────────────────────────────────────────
 
 function buildModuleFile(
@@ -337,22 +438,12 @@ function buildModuleFile(
   lines.push(`# ${m.moduleName}`)
   lines.push("")
 
-  if (m.contents.length === 1) {
-    lines.push(m.contents[0])
-  } else {
-    for (let i = 0; i < m.contents.length; i++) {
-      if (i > 0) {
-        lines.push("")
-        lines.push("---")
-        lines.push(`<!-- 以下内容来自文档第 ${m.sectionIndices[i] + 1} 部分 -->`)
-        lines.push("")
-      }
-      lines.push(m.contents[i])
-    }
-  }
+  // Use field-level merge instead of raw concatenation
+  lines.push(mergeFragmentContents(m.contents, m.sectionIndices))
 
   return lines.join("\n")
 }
+
 
 // ── Main product summary file ─────────────────────────────────────────────
 // Generates the master entity file with:
@@ -640,6 +731,35 @@ export async function runProductCatalogExtraction(
   }
 
   log.info("all files written", { total: writtenPaths.length })
+
+  // 4c: Save OCR source text for reference
+  try {
+    const sourceDir = `${projectPath}/wiki/source_text`
+    await createDirectory(sourceDir)
+    const ocrFileName = `${category}-${productName}-OCR原文.md`
+    const ocrPath = `${sourceDir}/${ocrFileName}`
+    const ocrLines: string[] = [
+      "---",
+      `title: "${category}-${productName}-OCR原文"`,
+      `knowledge_domain: source_text`,
+      `insurance_category: "${category}"`,
+      `product_name: "${productName}"`,
+      `source_file: "${fileName}"`,
+      `total_chars: ${cleanedContent.length}`,
+      `total_sections: ${sections.length}`,
+      `created_by: auto-extract`,
+      "---",
+      "",
+      `# ${productName} OCR 原文`,
+      "",
+      cleanedContent,
+    ]
+    await writeFile(ocrPath, ocrLines.join("\n"))
+    writtenPaths.push(`wiki/source_text/${ocrFileName}`)
+    log.info("OCR source text saved", { path: ocrPath, chars: cleanedContent.length })
+  } catch (err) {
+    log.warn("failed to save OCR source text", { error: String(err) })
+  }
 
   activity.updateItem(activityId, {
     detail: `完成：${foundModules.length}/${allModules.length} 个模块，${writtenPaths.length} 个文件。`,
