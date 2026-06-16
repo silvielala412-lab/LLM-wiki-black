@@ -28,8 +28,24 @@ const TABLE_OCR_PROMPT = [
   "3. 对长表格，不要只输出示例行；必须从第一行连续输出到最后一行。",
   "4. 保持标题、页码、注释、表头、换行和列顺序。",
   "5. 看不清的单元格用 [无法识别] 标注，不要猜测。",
-  "6. 输出纯文本或 Markdown 表格，不要添加解释性前言。",
+  "6. 直接输出原始文本内容，表格用 Markdown 表格格式。",
+  "7. 【严禁】用代码块（```）包裹输出内容，直接输出裸文本，不要加任何代码块标记。",
 ].join("\n")
+
+/**
+ * Strip any leading/trailing ```markdown or ``` fences that vision models
+ * sometimes add despite the prompt forbidding them.
+ */
+function stripCodeFences(text: string): string {
+  // Remove leading ```markdown or ``` (with optional language tag)
+  let cleaned = text.replace(/^```[a-zA-Z]*\n?/m, "").replace(/```\s*$/m, "").trim()
+  // Also handle the case where the whole output is wrapped
+  if (cleaned.startsWith("```")) {
+    cleaned = cleaned.replace(/^```[a-zA-Z]*\n?/, "").replace(/```\s*$/, "").trim()
+  }
+  return cleaned
+}
+
 
 export interface ImagePagePayload {
   type: "image_pages"
@@ -156,7 +172,7 @@ async function ocrPage(
     throw new Error(`page OCR timed out after ${Math.round(OCR_PAGE_TIMEOUT_MS / 1000)}s`)
   }
 
-  return text.trim()
+  return stripCodeFences(text.trim())
 }
 
 export async function ocrImageBytes(
@@ -198,7 +214,7 @@ export async function ocrImageBytes(
     throw new Error(`image OCR timed out after ${Math.round(OCR_PAGE_TIMEOUT_MS / 1000)}s`)
   }
 
-  return text.trim()
+  return stripCodeFences(text.trim())
 }
 
 export async function ocrImagePdf(

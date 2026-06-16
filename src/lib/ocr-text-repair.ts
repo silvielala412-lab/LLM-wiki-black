@@ -110,11 +110,26 @@ export function cleanOcrArtifacts(text: string, productName?: string): string {
   return cleaned.trim()
 }
 
+
+/**
+ * Strip ```markdown ... ``` code block wrappers that some vision models
+ * add to their OCR output despite being instructed not to.
+ * Works on individual page text as well as full concatenated documents.
+ */
+export function stripOcrCodeFences(text: string): string {
+  // Remove each ```markdown ... ``` block, keeping only its inner content
+  return text
+    .replace(/^```[a-zA-Z]*\r?\n?/gm, "")
+    .replace(/^```\s*$/gm, "")
+    .trim()
+}
+
 /**
  * Full pre-processing pipeline for OCR text before chunking.
  */
 export function preprocessOcrText(text: string, productName?: string): string {
   let result = text
+  result = stripOcrCodeFences(result)      // ① strip vision-model code fence wrappers
   result = cleanOcrArtifacts(result, productName)
   result = repairOcrLineBreaks(result)
   return result
