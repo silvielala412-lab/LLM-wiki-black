@@ -902,38 +902,54 @@ async function refineSingleModule(
   llmConfig: LlmConfig,
   signal?: AbortSignal,
 ): Promise<number> {
+  const fileName = filePath.split("/").pop() ?? filePath
   const content = await readFile(filePath)
 
   // Parse frontmatter
   const fmMatch = content.match(/^---\n([\s\S]*?)\n---/)
-  if (!fmMatch) return 0
+  if (!fmMatch) {
+    log.info("refine skip", { file: fileName, reason: "no frontmatter", contentStart: content.substring(0, 50) })
+    return 0
+  }
   const fm = fmMatch[1]
   const moduleNameMatch = fm.match(/^module_name:\s*"?([^"\n]+?)"?\s*$/m)
-  if (!moduleNameMatch) return 0
+  if (!moduleNameMatch) {
+    log.info("refine skip", { file: fileName, reason: "no module_name in frontmatter" })
+    return 0
+  }
   const moduleName = moduleNameMatch[1].trim()
 
   // Get key fields definition for this module.
-  // If MODULE_KEY_FIELDS doesn't define this module, fall back to
-  // the field names already in the module's key fields table.
   let keyFields = MODULE_KEY_FIELDS[moduleName]
   if (!keyFields || keyFields.length === 0) {
-    // Dynamically discover field names from the existing table
-    const existingPairs = parseKeyFieldsTable(content) // Map<string,string>
-    if (existingPairs.size === 0) return 0
+    const existingPairs = parseKeyFieldsTable(content)
+    if (existingPairs.size === 0) {
+      log.info("refine skip", { file: fileName, reason: "no key fields in table", moduleName })
+      return 0
+    }
     keyFields = [...existingPairs.keys()]
   }
 
   // Check if there are any "未明确" fields to fill
-  const existingFields = parseKeyFieldsTable(content) // Map<string,string>
+  const existingFields = parseKeyFieldsTable(content)
   let needsRefinement = false
-  for (const v of existingFields.values()) {
-    if (v === "未明确") { needsRefinement = true; break }
+  const unmingqueFields: string[] = []
+  for (const [k, v] of existingFields) {
+    if (v === "未明确") { needsRefinement = true; unmingqueFields.push(k) }
   }
-  if (!needsRefinement) return 0
+  if (!needsRefinement) {
+    log.info("refine skip", { file: fileName, reason: "no 未明确 fields", moduleName, fieldsCount: existingFields.size })
+    return 0
+  }
 
   // Extract source text
   const sourceText = extractSourceText(content)
-  if (!sourceText || sourceText.length < 20) return 0
+  if (!sourceText || sourceText.length < 20) {
+    log.info("refine skip", { file: fileName, reason: "no source text", moduleName, srcLen: sourceText?.length ?? 0 })
+    return 0
+  }
+
+  log.info("refine calling LLM", { file: fileName, moduleName, unmingqueCount: unmingqueFields.length, srcLen: sourceText.length })
 
   // Build focused prompt
   const fieldList = keyFields.map(f => `- ${f}`).join("\n")
