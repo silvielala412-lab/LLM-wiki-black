@@ -994,6 +994,13 @@ ${sourceText.substring(0, 8000)}
 
   // Parse response for new field values
   const newFields = parseKeyFieldsTable(response) // Map<string,string>
+  log.info("refine LLM response", {
+    file: filePath.split("/").pop(),
+    responseLen: response.length,
+    responsePreview: response.substring(0, 300),
+    parsedFieldsCount: newFields.size,
+    parsedFields: [...newFields.entries()].slice(0, 5).map(([k, v]) => `${k}=${v}`),
+  })
   if (newFields.size === 0) return 0
 
   // Merge: replace rows where value starts with "未明确" (may have suffix like "（见计划）")
