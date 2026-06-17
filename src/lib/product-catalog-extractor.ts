@@ -918,14 +918,17 @@ async function refineSingleModule(
   let keyFields = MODULE_KEY_FIELDS[moduleName]
   if (!keyFields || keyFields.length === 0) {
     // Dynamically discover field names from the existing table
-    const existingPairs = parseKeyFieldsTable(content)
-    if (existingPairs.length === 0) return 0
-    keyFields = existingPairs.map(([name]) => name)
+    const existingPairs = parseKeyFieldsTable(content) // Map<string,string>
+    if (existingPairs.size === 0) return 0
+    keyFields = [...existingPairs.keys()]
   }
 
   // Check if there are any "未明确" fields to fill
-  const existingFields = parseKeyFieldsTable(content)
-  const needsRefinement = existingFields.some(([, v]) => v === "未明确")
+  const existingFields = parseKeyFieldsTable(content) // Map<string,string>
+  let needsRefinement = false
+  for (const v of existingFields.values()) {
+    if (v === "未明确") { needsRefinement = true; break }
+  }
   if (!needsRefinement) return 0
 
   // Extract source text
@@ -974,8 +977,8 @@ ${sourceText.substring(0, 8000)}
   if (!response || signal?.aborted) return 0
 
   // Parse response for new field values
-  const newFields = parseKeyFieldsTable(response)
-  if (newFields.length === 0) return 0
+  const newFields = parseKeyFieldsTable(response) // Map<string,string>
+  if (newFields.size === 0) return 0
 
   // Merge: only fill in fields that were "未明确"
   let updatedCount = 0
@@ -1065,13 +1068,24 @@ export async function refineAllProductModules(
 
   let allFiles: Array<{ name: string; path: string; is_dir: boolean }> = []
   try {
-    const tree = (await listDirectory(catalogDir)) as Array<{ name: string; path: string; is_dir: boolean }>
-    allFiles = tree.filter(f => !f.is_dir && f.name.endsWith(".md") && f.name.includes("-"))
-  } catch {
+    const tree = await listDirectory(catalogDir)
+    log.info("listDirectory raw result", {
+      type: typeof tree,
+      length: Array.isArray(tree) ? tree.length : "not array",
+      firstItem: tree?.[0] ? JSON.stringify(tree[0]).substring(0, 200) : "empty",
+      firstItemKeys: tree?.[0] ? Object.keys(tree[0] as Record<string, unknown>) : [],
+    })
+    allFiles = (tree as Array<{ name: string; path: string; is_dir: boolean }>)
+      .filter(f => !f.is_dir && f.name?.endsWith(".md") && f.name?.includes("-"))
+  } catch (err) {
+    log.error("listDirectory failed", { error: String(err), catalogDir })
     return { totalModules: 0, refined: 0, fieldsUpdated: 0, skipped: 0 }
   }
 
-  log.info("开始批量精炼", { totalModules: allFiles.length })
+  log.info("开始批量精炼", { totalModules: allFiles.length, catalogDir })
+  if (allFiles.length > 0) {
+    log.info("sample file", { name: allFiles[0].name, path: allFiles[0].path })
+  }
   activity.updateItem(activityId, {
     detail: `正在精炼 ${allFiles.length} 个模块文件...`,
   })
