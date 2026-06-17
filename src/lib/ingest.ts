@@ -3331,6 +3331,25 @@ async function autoIngestImpl(
     return cachedFiles
   }
 
+  // ── Auto-detect product catalog from source path ──────────────
+  // When files are placed directly into raw/sources/产品/{category}/{productName}/
+  // without going through the Sources UI, folderContext is empty.
+  // Auto-infer it so the product catalog extractor is used.
+  if (!folderContext) {
+    const pathMatch = sp.match(/[/\\]产品[/\\]([^/\\]+)[/\\]([^/\\]+)[/\\][^/\\]+\.pdf$/i)
+    if (pathMatch) {
+      const [, cat, prod] = pathMatch
+      if (INSURANCE_CATEGORIES.includes(cat as InsuranceCategoryType)) {
+        folderContext = encodeProductCatalogFolderContext(
+          cat as InsuranceCategoryType, prod, [], 0,
+        )
+        log.info("auto-detected product catalog context from path", {
+          category: cat, product: prod, folderContext,
+        })
+      }
+    }
+  }
+
   // ── Product Catalog fast-path ─────────────────────────────────
   // Product catalog extraction uses a completely different pipeline:
   // section-scan + merge (see product-catalog-extractor.ts).
