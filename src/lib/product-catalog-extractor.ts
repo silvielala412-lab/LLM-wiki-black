@@ -996,17 +996,20 @@ ${sourceText.substring(0, 8000)}
   const newFields = parseKeyFieldsTable(response) // Map<string,string>
   if (newFields.size === 0) return 0
 
-  // Merge: only fill in fields that were "未明确"
+  // Merge: replace rows where value starts with "未明确" (may have suffix like "（见计划）")
   let updatedCount = 0
   let updatedContent = content
 
   for (const [field, newValue] of newFields) {
-    if (newValue === "未明确" || !newValue) continue
-    // Find the existing row with "未明确" and replace
+    if (!newValue || newValue.startsWith("未明确")) continue
+    // Match row: | field | 未明确... | (with optional suffix after 未明确)
     const escapedField = field.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-    const rowPattern = `| ${field} | 未明确 |`
-    if (updatedContent.includes(rowPattern)) {
-      updatedContent = updatedContent.replace(rowPattern, `| ${field} | ${newValue} |`)
+    const rowRegex = new RegExp(`\\|\\s*${escapedField}\\s*\\|\\s*未明确[^|]*\\|`, "g")
+    if (rowRegex.test(updatedContent)) {
+      updatedContent = updatedContent.replace(
+        new RegExp(`\\|\\s*${escapedField}\\s*\\|\\s*未明确[^|]*\\|`, "g"),
+        `| ${field} | ${newValue} |`
+      )
       updatedCount++
     }
   }
