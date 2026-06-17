@@ -995,14 +995,21 @@ ${sourceText.substring(0, 8000)}
 
   if (!response || signal?.aborted) return 0
 
-  // Parse response for new field values
-  const newFields = parseKeyFieldsTable(response) // Map<string,string>
-  log.info("refine LLM response", {
+  // Parse LLM response: extract table rows directly (no section header required)
+  const newFields = new Map<string, string>()
+  const rowRegex = /^\|\s*(.+?)\s*\|\s*(.+?)\s*\|$/gm
+  let rowMatch: RegExpExecArray | null
+  while ((rowMatch = rowRegex.exec(response)) !== null) {
+    const field = rowMatch[1].trim()
+    const value = rowMatch[2].trim()
+    if (field === "---" || field === "字段" || field.startsWith("--") || value === "值" || value === "---") continue
+    if (field && value) newFields.set(field, value)
+  }
+  log.info("refine parsed response", {
     file: filePath.split("/").pop(),
     responseLen: response.length,
-    responsePreview: response.substring(0, 300),
-    parsedFieldsCount: newFields.size,
-    parsedFields: [...newFields.entries()].slice(0, 5).map(([k, v]) => `${k}=${v}`),
+    parsedCount: newFields.size,
+    sample: [...newFields.entries()].slice(0, 3).map(([k, v]) => `${k}=${v.substring(0, 20)}`),
   })
   if (newFields.size === 0) return 0
 
