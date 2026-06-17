@@ -137,17 +137,6 @@ function buildPrompt(
 | 免赔额金额（无社保） | 1万元/年 |
 | 免赔额类型 | 绝对免赔 |
 | 计划选项 | 计划一（1万元）、计划二（0元） |
-
-## 详细条款原文
-
-1.6 保险金计算方法
-
-1.6.1 年度累计免赔额
-被保险人在一个保险年度内，发生的合理且必要的医疗费用应先扣除年度累计免赔额（见附录2）后，我们再依据本合同约定计算给付保险金。
-
-年度累计免赔额分为两部分：第一部分为您在投保时选择确定的基础免赔额（见附录2），第二部分为我们根据您上一年度的理赔记录确定的追加免赔额。
-
-（原文完整内容继续...）
 ---END---`
 
   return [
@@ -160,22 +149,18 @@ function buildPrompt(
     "## 目标模块（含关键字段提示）",
     moduleList,
     "",
-    "## 输出格式（每个模块必须包含两部分）",
+    "## 输出格式（每个模块只需输出表格，禁止摘抄原文）",
     "",
     "```",
     exampleModule,
     "```",
     "",
     "## 关键规则",
-    "1. **每个模块必须有两部分**：`## 关键字段` 表格 + `## 详细条款原文`",
+    "1. **只需要输出表格**：不需要摘抄原文，只需输出 \`## 关键字段\` 表格即可（原文将由系统自动追加）。",
     "2. **关键字段**：从文档中找到对应值填入表格，找不到的字段填「未明确」。",
-    "3. **详细条款原文**：完整复制原文，包括所有编号（如1.6.1、(7)等）、金额、百分比、条件。",
-    "4. **不压缩不改写**：原文有多少就写多少，绝对不能摘要或省略。",
-    "5. **表格完整复制**：原文中的表格（如费率表、给付限额表）必须完整保留为markdown表格格式。",
-    "6. **编号列表保留**：原文中的(1)(2)(3)或一二三的编号列表必须完整保留。",
-    "7. **多模块归属**：同一段内容可以同时归属多个模块（各模块都输出）。",
-    "8. **空模块不输出**：本章节完全没有相关内容的模块直接跳过，不要输出空块。",
-    "9. **关键字段表格只提炼核心值**，详细说明放在原文部分，不要在表格里写长文本。",
+    "3. **多模块归属**：同一段内容可以同时归属多个模块（各模块都单独输出表格）。",
+    "4. **空模块不输出**：本章节完全没有相关内容的模块直接跳过，不要输出空块。",
+    "5. **关键字段表格只提炼核心值**，不要在表格里写长文本。",
   ].join("\n")
 }
 
@@ -200,15 +185,18 @@ async function streamText(
 
 // ── Parse ---MODULE--- blocks ─────────────────────────────────────────────
 
-function parseModuleBlocks(response: string, validNames: Set<string>): ModuleFragment[] {
+function parseModuleBlocks(response: string, validNames: Set<string>, sectionText: string): ModuleFragment[] {
   const fragments: ModuleFragment[] = []
   const regex = /---MODULE:\s*(.+?)\s*---\n([\s\S]*?)---END---/g
   let match: RegExpExecArray | null
 
   while ((match = regex.exec(response)) !== null) {
     const name = match[1].trim()
-    const md = match[2].trim()
+    let md = match[2].trim()
     if (!md) continue
+
+    // 防御性清理：如果 LLM 不听话还是输出了原文，把它砍掉
+    md = md.replace(/## 详细(?:条款)?原文[\s\S]*$/, "").trim()
 
     let matchedName: string | null = null
     if (validNames.has(name)) {
@@ -223,7 +211,9 @@ function parseModuleBlocks(response: string, validNames: Set<string>): ModuleFra
     }
 
     if (matchedName) {
-      fragments.push({ moduleName: matchedName, markdown: md, sectionIndex: 0 })
+      // 自动注入完整无损的原文
+      const fullMd = `${md}\n\n## 详细条款原文\n\n${sectionText}`
+      fragments.push({ moduleName: matchedName, markdown: fullMd, sectionIndex: 0 })
     } else {
       log.warn("unrecognized module", { name })
     }
@@ -271,7 +261,7 @@ async function extractFromSection(
   }
 
   const validNames = new Set(modules.map(m => m.moduleName))
-  const fragments = parseModuleBlocks(rawResponse, validNames)
+  const fragments = parseModuleBlocks(rawResponse, validNames, sectionText)
   for (const f of fragments) f.sectionIndex = sectionIndex
 
   log.info("section done", {
