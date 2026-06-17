@@ -973,19 +973,22 @@ ${sourceText.substring(0, 8000)}
 - 不要输出"未明确"，只输出有实际值的行
 - 值要简洁准确`
 
-  // Call LLM
+  // Call LLM via callback-based streamChat
   let response = ""
   try {
-    const stream = streamChat({
-      model: llmConfig.model ?? "internal",
-      messages: [{ role: "user", content: prompt }],
-      temperature: 0.1,
-      max_tokens: 2000,
+    await new Promise<void>((resolve, reject) => {
+      streamChat(
+        llmConfig,
+        [{ role: "user", content: prompt }],
+        {
+          onToken: (token) => { response += token },
+          onDone: () => resolve(),
+          onError: (err) => reject(err),
+        },
+        signal,
+        { temperature: 0.1, max_tokens: 2000 },
+      )
     })
-    for await (const chunk of stream) {
-      if (signal?.aborted) break
-      if (chunk.type === "text") response += chunk.text
-    }
   } catch {
     return 0
   }
