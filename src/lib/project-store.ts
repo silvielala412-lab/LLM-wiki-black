@@ -1,4 +1,4 @@
-﻿/**
+/**
  * project-store.ts — Web version
  *
  * Replaces @tauri-apps/plugin-store with localStorage.
@@ -87,7 +87,12 @@ export async function saveLlmConfig(config: LlmConfig): Promise<void> {
 }
 
 export async function loadLlmConfig(): Promise<LlmConfig | null> {
-  return lsGet<LlmConfig>(LLM_CONFIG_KEY)
+  const config = lsGet<LlmConfig>(LLM_CONFIG_KEY)
+  if (config && config.model === "deepseek-chat") {
+    config.model = "deepseek-v4-pro"
+    lsSet(LLM_CONFIG_KEY, config)
+  }
+  return config
 }
 
 export async function saveProviderConfigs(configs: ProviderConfigs): Promise<void> {
@@ -95,7 +100,12 @@ export async function saveProviderConfigs(configs: ProviderConfigs): Promise<voi
 }
 
 export async function loadProviderConfigs(): Promise<ProviderConfigs | null> {
-  return lsGet<ProviderConfigs>(PROVIDER_CONFIGS_KEY)
+  const configs = lsGet<ProviderConfigs>(PROVIDER_CONFIGS_KEY)
+  if (configs?.["deepseek"]?.model === "deepseek-chat") {
+    configs["deepseek"].model = "deepseek-v4-pro"
+    lsSet(PROVIDER_CONFIGS_KEY, configs)
+  }
+  return configs
 }
 
 export async function saveActivePresetId(id: string | null): Promise<void> {
