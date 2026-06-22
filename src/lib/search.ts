@@ -1,6 +1,12 @@
 import { readFile, listDirectory } from "@/commands/fs"
 import type { FileNode } from "@/types/wiki"
 import { normalizePath, getFileStem } from "@/lib/path-utils"
+import {
+  INSURANCE_CATEGORIES,
+  isModuleAllowedForCategory,
+  parseProductModuleTitle,
+  type InsuranceCategoryType,
+} from "@/lib/product-catalog-modules"
 
 /**
  * One image reference extracted from a matched page's markdown.
@@ -203,6 +209,28 @@ function extractFrontmatterScalar(content: string, key: string): string | null {
   const re = new RegExp(`^${key}:\\s*["']?([^"'#\\r\\n]+)["']?\\s*$`, "m")
   const match = fm[1].match(re)
   return match ? match[1].trim().toLowerCase() : null
+}
+
+function extractFrontmatterScalarRaw(content: string, key: string): string | null {
+  const fm = content.match(/^---\r?\n([\s\S]*?)\r?\n---/m)
+  if (!fm) return null
+  const re = new RegExp(`^${key}:\\s*["']?([^"'#\\r\\n]+)["']?\\s*$`, "m")
+  const match = fm[1].match(re)
+  return match ? match[1].trim() : null
+}
+
+function isInvalidProductCatalogModule(content: string, fileName?: string): boolean {
+  const domain = extractFrontmatterScalarRaw(content, "knowledge_domain")
+  const titleMeta = fileName?.endsWith(".md")
+    ? parseProductModuleTitle(fileName.slice(0, -3))
+    : null
+  if (domain && domain !== "product_catalog") return false
+  if (!domain && !titleMeta) return false
+  const moduleName = extractFrontmatterScalarRaw(content, "module_name") ?? titleMeta?.moduleName
+  if (!moduleName) return false
+  const category = extractFrontmatterScalarRaw(content, "insurance_category") ?? titleMeta?.category
+  if (!INSURANCE_CATEGORIES.includes(category as InsuranceCategoryType)) return true
+  return !isModuleAllowedForCategory(category as InsuranceCategoryType, moduleName)
 }
 
 function parseGovernanceSearchMeta(content: string): GovernanceSearchMeta {
@@ -511,6 +539,7 @@ function scoreFile(
   query: string,
 ): SearchResult | null {
   const title = extractTitle(content, file.name)
+  if (isInvalidProductCatalogModule(content, file.name)) return null
   const governance = parseGovernanceSearchMeta(content)
   if (governance.excluded) return null
 

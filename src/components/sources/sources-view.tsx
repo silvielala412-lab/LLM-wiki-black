@@ -27,6 +27,7 @@ import { SERVICE_HIERARCHY } from "@/lib/insurance-schema-registry"
 import type { ServiceHierarchySeries } from "@/lib/insurance-schema-registry"
 import {
   INSURANCE_CATEGORIES,
+  PRODUCT_FIELDS,
   PRODUCT_CATALOG_MODULES,
   type InsuranceCategoryType,
   buildProductModuleTitle,
@@ -1603,8 +1604,14 @@ function ProductCatalogPanel({
         {productName.trim() && (
           <div className="rounded border border-dashed border-muted-foreground/20 bg-muted/20 px-2 py-1.5 text-[10px] text-muted-foreground/70 space-y-0.5">
             <div className="font-medium text-muted-foreground mb-1">
-              将自动抽取 {PRODUCT_CATALOG_MODULES[selectedCategory].filter(m => m.required).length} 个必填模块 /
-              共 {PRODUCT_CATALOG_MODULES[selectedCategory].length} 个模块
+              将生成 {PRODUCT_FIELDS[selectedCategory].length} 个字段页 +
+              {PRODUCT_CATALOG_MODULES[selectedCategory].length} 个模块页
+            </div>
+            <div className="text-muted-foreground/60">
+              字段页对齐基础字段和{selectedCategory}字段，未抽到值时先留空并标记待精炼。
+            </div>
+            <div className="font-medium text-muted-foreground/80 pt-1">
+              必填模块 {PRODUCT_CATALOG_MODULES[selectedCategory].filter(m => m.required).length} 个
             </div>
             {PRODUCT_CATALOG_MODULES[selectedCategory].filter(m => m.required).map(m => (
               <div key={m.moduleName} className="flex items-center gap-1">

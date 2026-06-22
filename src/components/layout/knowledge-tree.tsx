@@ -502,7 +502,7 @@ function ProductCatalogSection({ pages, selectedFile, checkedPaths, setSelectedF
                       modulePages.length >= 5 ? "bg-green-100 text-green-600" :
                       modulePages.length >= 2 ? "bg-blue-100 text-blue-600" :
                       "bg-muted text-muted-foreground"
-                    }`}>{modulePages.length}模块</span>
+                    }`}>{modulePages.length}页</span>
                   </button>
 
                   {productExpanded && (

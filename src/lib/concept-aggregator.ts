@@ -13,6 +13,12 @@ import { readFile, writeFile, listDirectory, createDirectory } from "@/commands/
 import { parseServiceItemTitle } from "@/lib/insurance-schema-registry"
 import { normalizePath } from "@/lib/path-utils"
 import type { FileNode } from "@/types/wiki"
+import {
+  INSURANCE_CATEGORIES,
+  isModuleAllowedForCategory,
+  parseProductModuleTitle,
+  type InsuranceCategoryType,
+} from "@/lib/product-catalog-modules"
 
 // ════════════════════════════════════════════════════════════════
 // Part 1 — Service item concept aggregation (cross-version)
@@ -211,17 +217,55 @@ interface ProductConceptInstance {
   moduleRelPath: string   // relative to projectPath
 }
 
+interface ProductFieldConceptInstance {
+  insuranceCategory: string
+  productName: string
+  fieldName: string
+  fieldScope: string
+  valueSummary: string
+  fieldRelPath: string
+}
+
+interface ProductConceptGroup {
+  modules: ProductConceptInstance[]
+  fields: ProductFieldConceptInstance[]
+}
+
+function frontmatterScalar(fm: string, key: string): string | null {
+  const pattern = new RegExp(`^${key}:\\s*(?:"([^"]*)"|'([^']*)'|([^\\n#]*))\\s*$`, "m")
+  const match = fm.match(pattern)
+  return (match?.[1] ?? match?.[2] ?? match?.[3] ?? "").trim() || null
+}
+
+function getProductConceptGroup(
+  conceptMap: Map<string, ProductConceptGroup>,
+  conceptName: string,
+): ProductConceptGroup {
+  let group = conceptMap.get(conceptName)
+  if (!group) {
+    group = { modules: [], fields: [] }
+    conceptMap.set(conceptName, group)
+  }
+  return group
+}
+
+function parseFieldValue(content: string, fieldName: string): string {
+  const escaped = fieldName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+  const match = content.match(new RegExp(`^\\|\\s*${escaped}\\s*\\|\\s*([^|]*?)\\s*\\|\\s*$`, "m"))
+  return (match?.[1] ?? "").replace(/<br>/g, " ").replace(/\\\|/g, "|").trim()
+}
+
 /**
  * Scan wiki/product_catalog/ for ALL module files and build
- * a map of moduleName → list of products with that module.
+ * a map of concept name → product modules/fields sharing that concept.
  *
- * Every module_name becomes a concept. No filtering or manual mapping.
+ * Every module_name and every populated field_name becomes a concept.
  */
 async function scanProductConcepts(
   projectPath: string,
-): Promise<Map<string, ProductConceptInstance[]>> {
+): Promise<Map<string, ProductConceptGroup>> {
   const pp = normalizePath(projectPath)
-  const conceptMap = new Map<string, ProductConceptInstance[]>()
+  const conceptMap = new Map<string, ProductConceptGroup>()
 
   let catalogFiles: FileNode[] = []
   try {
@@ -238,30 +282,53 @@ async function scanProductConcepts(
       if (!fmMatch) continue
 
       const fm = fmMatch[1]
-      const moduleNameMatch = fm.match(/^module_name:\s*["']?([^"'\n]+?)["']?\s*$/m)
-      const categoryMatch = fm.match(/^insurance_category:\s*["']?([^"'\n]+?)["']?\s*$/m)
-      const productMatch = fm.match(/^product_name:\s*["']?([^"'\n]+?)["']?\s*$/m)
+      const domain = frontmatterScalar(fm, "knowledge_domain")
+      if (domain && domain !== "product_catalog" && domain !== "product_catalog_field") continue
 
-      if (!moduleNameMatch || !categoryMatch || !productMatch) continue
+      const status = frontmatterScalar(fm, "status")
+      if (status === "rejected") continue
 
-      const moduleName = moduleNameMatch[1].trim()
-      const category = categoryMatch[1].trim()
-      const product = productMatch[1].trim()
+      const titleMeta = parseProductModuleTitle(file.name.replace(/\.md$/, ""))
+      const moduleName = frontmatterScalar(fm, "module_name") ?? titleMeta?.moduleName
+      const fieldName = frontmatterScalar(fm, "field_name")
+      const category = frontmatterScalar(fm, "insurance_category") ?? titleMeta?.category
+      const product = frontmatterScalar(fm, "product_name") ?? titleMeta?.productName
+
+      if (!INSURANCE_CATEGORIES.includes(category as InsuranceCategoryType)) continue
+      if (!product) continue
 
       const relPath = file.path.includes(pp)
         ? file.path.slice(pp.length).replace(/^[/\\]/, "")
         : file.path
 
-      // Auto-create concept entry for this module name
-      if (!conceptMap.has(moduleName)) {
-        conceptMap.set(moduleName, [])
+      if (domain === "product_catalog_field") {
+        if (!fieldName) continue
+        const fieldScope = frontmatterScalar(fm, "field_scope") ?? "产品字段"
+        const valueSummary = parseFieldValue(content, fieldName)
+        if (!valueSummary) continue
+
+        const group = getProductConceptGroup(conceptMap, fieldName)
+        const exists = group.fields.some(i => i.productName === product && i.fieldName === fieldName)
+        if (!exists) {
+          group.fields.push({
+            insuranceCategory: category,
+            productName: product,
+            fieldName,
+            fieldScope,
+            valueSummary,
+            fieldRelPath: relPath.replace(/\\/g, "/"),
+          })
+        }
+        continue
       }
 
-      const instances = conceptMap.get(moduleName)!
-      // Dedup by product + module
-      const exists = instances.some(i => i.productName === product && i.moduleName === moduleName)
+      if (!moduleName) continue
+      if (!isModuleAllowedForCategory(category as InsuranceCategoryType, moduleName)) continue
+
+      const group = getProductConceptGroup(conceptMap, moduleName)
+      const exists = group.modules.some(i => i.productName === product && i.moduleName === moduleName)
       if (!exists) {
-        instances.push({
+        group.modules.push({
           insuranceCategory: category,
           productName: product,
           moduleName,
@@ -278,27 +345,47 @@ async function scanProductConcepts(
 
 function buildProductConceptPage(
   conceptName: string,
-  instances: ProductConceptInstance[],
+  group: ProductConceptGroup,
 ): string {
   const today = new Date().toISOString().split("T")[0]
-  const sorted = [...instances].sort((a, b) =>
+  const moduleInstances = [...group.modules].sort((a, b) =>
     a.insuranceCategory.localeCompare(b.insuranceCategory) || a.productName.localeCompare(b.productName)
   )
+  const fieldInstances = [...group.fields].sort((a, b) =>
+    a.insuranceCategory.localeCompare(b.insuranceCategory) || a.productName.localeCompare(b.productName)
+  )
+  const instanceCount = moduleInstances.length + fieldInstances.length
 
-  const tableRows = sorted.map(inst => {
+  const moduleRows = moduleInstances.map(inst => {
     const relLink = `../${inst.moduleRelPath}`
     return `| ${inst.insuranceCategory} | ${inst.productName} | ${inst.moduleName} | [查看详情](${relLink}) |`
   }).join("\n")
 
-  const relatedProducts = sorted.map(i => `"${i.insuranceCategory}-${i.productName}"`).join(", ")
+  const fieldRows = fieldInstances.map(inst => {
+    const relLink = `../${inst.fieldRelPath}`
+    return `| ${inst.insuranceCategory} | ${inst.productName} | ${inst.fieldScope} | ${inst.valueSummary.replace(/\|/g, "\\|")} | [查看字段](${relLink}) |`
+  }).join("\n")
 
-  const productSection = instances.length > 0
-    ? `## 涉及产品（${instances.length}个）
+  const relatedProducts = Array.from(new Set([
+    ...moduleInstances.map(i => `"${i.insuranceCategory}-${i.productName}"`),
+    ...fieldInstances.map(i => `"${i.insuranceCategory}-${i.productName}"`),
+  ])).join(", ")
+
+  const fieldSection = fieldInstances.length > 0
+    ? `## 字段实体（${fieldInstances.length}个）
+
+| 险种类别 | 产品名称 | 字段范围 | 字段值摘要 | 字段页 |
+|---|---|---|---|---|
+${fieldRows}`
+    : `## 字段实体\n\n暂无字段页归属此概念。`
+
+  const moduleSection = moduleInstances.length > 0
+    ? `## 模块实体（${moduleInstances.length}个）
 
 | 险种类别 | 产品名称 | 相关模块 | 详情链接 |
 |---|---|---|---|
-${tableRows}`
-    : `## 涉及产品\n\n暂无产品归属此概念。`
+${moduleRows}`
+    : `## 模块实体\n\n暂无模块页归属此概念。`
 
   return `---
 type: concept
@@ -306,7 +393,9 @@ entity_type: insurance_concept
 title: "${conceptName}"
 knowledge_domain: product_catalog
 tags: ["保险概念", "跨产品"]
-instance_count: ${instances.length}
+instance_count: ${instanceCount}
+field_instance_count: ${fieldInstances.length}
+module_instance_count: ${moduleInstances.length}
 related_products: [${relatedProducts}]
 created: ${today}
 updated: ${today}
@@ -316,12 +405,15 @@ updated: ${today}
 
 「${conceptName}」是保险产品中的通用概念，以下产品涉及此概念。点击详情可查看各产品的具体条款内容。
 
-${productSection}
+${fieldSection}
+
+${moduleSection}
 
 ## 说明
 
 - 此页面由系统自动生成，每次产品目录抽取完成后刷新。
-- 点击"查看详情"可查看各产品对此概念的具体条款内容。
+- 字段实体来自 xlsx 字段页；模块实体来自条款模块页。
+- 空值字段页不会进入概念页，避免污染检索。
 `
 }
 
@@ -340,9 +432,9 @@ export async function buildProductConceptIndex(projectPath: string): Promise<{
 
   let created = 0, updated = 0, skipped = 0
 
-  for (const [conceptName, instances] of conceptMap) {
+  for (const [conceptName, group] of conceptMap) {
     const conceptPath = `${pp}/wiki/concepts/${conceptName}.md`
-    const newContent = buildProductConceptPage(conceptName, instances)
+    const newContent = buildProductConceptPage(conceptName, group)
 
     try {
       const existing = await readFile(conceptPath).catch(() => null)
@@ -350,9 +442,7 @@ export async function buildProductConceptIndex(projectPath: string): Promise<{
         await writeFile(conceptPath, newContent)
         created++
       } else {
-        const existingCountMatch = existing.match(/^instance_count:\s*(\d+)/m)
-        const existingCount = existingCountMatch ? parseInt(existingCountMatch[1]) : 0
-        if (existingCount !== instances.length) {
+        if (existing !== newContent) {
           await writeFile(conceptPath, newContent)
           updated++
         } else {

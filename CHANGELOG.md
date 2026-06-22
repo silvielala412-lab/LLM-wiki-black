@@ -506,15 +506,46 @@ PDF → OCR 全文 → splitIntoSections(25000字/块, 500字重叠)
 
 ---
 
+### 产品目录 v2.4：字段页、越域过滤与质量修复（2026-06-22）
+
+**核心目标**：让产品库 md 同时适合系统检索和人工检索老师阅读，避免空值、越域模块、占位文本和错误回填污染知识库。
+
+**变更文件**：
+
+| 文件 | 变更 |
+|------|------|
+| `src/lib/product-catalog-modules.ts` | 增加险种级模块白名单、`isModuleAllowedForCategory()`；补齐年金险字段；字段 schema 返回全字段 |
+| `src/lib/product-catalog-extractor.ts` | 生成 `product_catalog_field` 字段页；增加知识缺口/已有知识清单；精炼后重建主文件和字段页；寿险/年金险字段桥接；过滤占位文本和错误费用值 |
+| `src/lib/concept-aggregator.ts` | 概念页聚合模块实体 + 字段实体；跳过空值字段页和越域模块 |
+| `src/lib/embedding.ts` | embedding 跳过 `status: rejected` 页面和越域产品模块 |
+| `src/lib/search.ts` | 搜索跳过越域产品模块 |
+| `src/components/sources/sources-view.tsx` | 上传面板展示字段页 + 模块页数量，并说明未抽到值留空待精炼 |
+| `src/components/layout/knowledge-tree.tsx` | 产品树计数文案由“模块”改为“页” |
+
+**质量修复**：
+- 空字段值统一为空字符串，不再写入“未提及/未明确/证据片段中未提及”等占位文本。
+- 年金险不再生成孕妇投保限制等越域 md；搜索、embedding、概念页也会过滤越域模块。
+- 寿险 `保什么` 从 `身故保险金` 模块桥接，避免原文已抽到但主字段为空。
+- `费用` 不再由 `退保费用` 模糊回填；“退保会造成损失”类提示不再进入基础字段 `费用`。
+- 字段页按险种过滤 `evidence_modules`，寿险字段不会再链接到年金模块。
+
+**验证**：
+- `npx tsc --noEmit --pretty false`
+- `git diff --check`
+- 样本观察：`0622-06` / `0622-07` 当前产物未自动清理，后续重新抽取或重建后应用新逻辑。
+
+---
+
 ### 已知问题 / 后续优化
 
 - [ ] `shouldReplaceFieldValue` 的 `informationScore` 权重需实际验证
 - [ ] Refine 阶段新 regex 可能覆盖已正确的值（高风险）
-- [ ] LIFE_INSURANCE_FIELDS / ANNUITY_FIELDS 缺失字段待补齐
+- [x] LIFE_INSURANCE_FIELDS / ANNUITY_FIELDS 主要缺失字段已补齐，继续观察样本效果
 - [ ] 意外医疗险需要独立字段数组（当前复用 MEDICAL_FIELDS）
 - [ ] `onQueueDrained` 在中途中断后不会触发 concept aggregator
+- [ ] 寿险 `保什么` 已能接入身故模块，但摘要详细度仍需继续优化
 
 ---
 
-*最后更新：2026-06-21*  
+*最后更新：2026-06-22*
 *维护者：Claude (Antigravity) + Codex*

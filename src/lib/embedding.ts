@@ -26,6 +26,12 @@ import type { FileNode } from "@/types/wiki"
 import { normalizePath } from "@/lib/path-utils"
 import { getHttpFetch, isFetchNetworkError } from "@/lib/tauri-fetch"
 import { chunkMarkdown, type Chunk } from "@/lib/text-chunker"
+import {
+  INSURANCE_CATEGORIES,
+  isModuleAllowedForCategory,
+  parseProductModuleTitle,
+  type InsuranceCategoryType,
+} from "@/lib/product-catalog-modules"
 
 // ── Error surfacing ──────────────────────────────────────────────────────
 
@@ -39,6 +45,31 @@ let lastEmbeddingError: string | null = null
 
 export function getLastEmbeddingError(): string | null {
   return lastEmbeddingError
+}
+
+function frontmatterScalar(content: string, key: string): string | null {
+  const fmMatch = content.match(/^---\r?\n([\s\S]*?)\r?\n---/)
+  if (!fmMatch) return null
+  const match = fmMatch[1].match(new RegExp(`^${key}:\\s*["']?([^"'\\n#]+)["']?\\s*$`, "m"))
+  return match?.[1]?.trim() ?? null
+}
+
+function isRejectedKnowledgePage(content: string): boolean {
+  return frontmatterScalar(content, "status") === "rejected"
+}
+
+function isInvalidProductCatalogModule(content: string, fileName?: string): boolean {
+  const domain = frontmatterScalar(content, "knowledge_domain")
+  const titleMeta = fileName?.endsWith(".md")
+    ? parseProductModuleTitle(fileName.slice(0, -3))
+    : null
+  if (domain && domain !== "product_catalog") return false
+  if (!domain && !titleMeta) return false
+  const moduleName = frontmatterScalar(content, "module_name") ?? titleMeta?.moduleName
+  if (!moduleName) return false
+  const category = frontmatterScalar(content, "insurance_category") ?? titleMeta?.category
+  if (!INSURANCE_CATEGORIES.includes(category as InsuranceCategoryType)) return true
+  return !isModuleAllowedForCategory(category as InsuranceCategoryType, moduleName)
 }
 
 // ── fetchEmbedding with auto-halve retry ────────────────────────────────
@@ -453,6 +484,11 @@ export async function embedAllPages(
   for (const file of mdFiles) {
     try {
       const content = await readFile(file.path)
+      if (isRejectedKnowledgePage(content) || isInvalidProductCatalogModule(content, `${file.id}.md`)) {
+        done++
+        onProgress?.(done, mdFiles.length)
+        continue
+      }
       const titleMatch = content.match(/^---\n[\s\S]*?^title:\s*["']?(.+?)["']?\s*$/m)
       const title = titleMatch ? titleMatch[1].trim() : file.id
       await embedPage(pp, file.id, title, content, cfg)

@@ -215,7 +215,11 @@ export const ANNUITY_FIELDS: ProductField[] = [
   { fieldName: "保什么", source: "保险责任", valueType: "long", extractable: true },
   { fieldName: "保障人群", source: "根据投保年龄映射", valueType: "short", extractable: true },
   { fieldName: "保证领取", source: "人工填充", valueType: "short", extractable: true },
+  { fieldName: "高流动性", source: "人工填充", valueType: "short", extractable: true, description: "是否具备保单贷款、减保、部分领取等资金流动性特征" },
+  { fieldName: "教育金", source: "人工填充", valueType: "short", extractable: true },
+  { fieldName: "领钱时间早", source: "人工填充", valueType: "short", extractable: true, description: "根据领取期间和首个领取日判断" },
   { fieldName: "双被保人", source: "产品条款", valueType: "short", extractable: true },
+  { fieldName: "投保门槛低", source: "人工填充", valueType: "short", extractable: true },
   { fieldName: "万能账户", source: "产品说明书", valueType: "short", extractable: true },
   { fieldName: "养老金", source: "保险金", valueType: "short", extractable: true },
   { fieldName: "有分红", source: "保单红利", valueType: "short", extractable: true },
@@ -226,6 +230,7 @@ export const ANNUITY_FIELDS: ProductField[] = [
   { fieldName: "保单贷款", source: "保单贷款", valueType: "short", extractable: true },
   { fieldName: "起投金额", source: "人工填充", valueType: "short", extractable: false },
   { fieldName: "现金价值", source: "人工填充", valueType: "short", extractable: false },
+  { fieldName: "契调限制", source: "人工填充", valueType: "short", extractable: true },
   { fieldName: "初始费用", source: "产品说明书", valueType: "short", extractable: true, description: "万能险需填写" },
   { fieldName: "领取手续费", source: "产品说明书", valueType: "short", extractable: true },
   { fieldName: "领取期间", source: "保险条款", valueType: "short", extractable: true },
@@ -243,7 +248,7 @@ export const PRODUCT_FIELDS: Record<InsuranceCategoryType, ProductField[]> = {
 
 /** Get extractable field names for a category (used by extractor prompt) */
 export function getExtractableFields(category: InsuranceCategoryType): ProductField[] {
-  return PRODUCT_FIELDS[category].filter(f => f.extractable)
+  return PRODUCT_FIELDS[category]
 }
 
 // ── 各险种模块列表 ────────────────────────────────────────────────────────────
@@ -378,13 +383,69 @@ const ANNUITY_MODULES: ProductModule[] = [
 // ── 全量模块注册表 ────────────────────────────────────────────────────────────
 
 /** 每个险种的完整模块列表（基础模块 + 专属模块） */
+const COMMON_BASE_MODULE_NAMES = [
+  "产品基础信息",
+  "投保年龄",
+  "投保人群",
+  "犹豫期",
+  "通用责任免除",
+  "投保人变更",
+  "受益人变更",
+  "退保",
+  "保单复效",
+  "理赔报案",
+  "常见拒赔原因",
+  "分年龄保费费率表",
+]
+
+const HEALTH_UNDERWRITING_MODULE_NAMES = [
+  "投保职业",
+  "未成年人保额限制",
+  "孕妇投保限制",
+  "专属健康告知",
+  "标体承保",
+  "加费承保",
+  "除外承保",
+  "延期承保",
+  "拒保判定",
+  "疾病等待期",
+  "既往症免责",
+]
+
+const DISEASE_DEFINITION_MODULE_NAMES = [
+  "重大疾病释义",
+  "中症疾病释义",
+  "轻度疾病释义",
+]
+
+const CATEGORY_BASE_MODULE_NAMES: Record<InsuranceCategoryType, string[]> = {
+  "医疗险": [...COMMON_BASE_MODULE_NAMES, ...HEALTH_UNDERWRITING_MODULE_NAMES],
+  "重疾险": [...COMMON_BASE_MODULE_NAMES, ...HEALTH_UNDERWRITING_MODULE_NAMES, ...DISEASE_DEFINITION_MODULE_NAMES],
+  "意外医疗险": [...COMMON_BASE_MODULE_NAMES, ...HEALTH_UNDERWRITING_MODULE_NAMES],
+  "意外险": [...COMMON_BASE_MODULE_NAMES, "投保职业", "未成年人保额限制"],
+  "寿险": [...COMMON_BASE_MODULE_NAMES, "投保职业", "未成年人保额限制", "专属健康告知", "标体承保", "加费承保", "除外承保", "延期承保", "拒保判定", "疾病等待期"],
+  "年金险": COMMON_BASE_MODULE_NAMES,
+}
+
+function baseModulesForCategory(category: InsuranceCategoryType): ProductModule[] {
+  const allowed = new Set(CATEGORY_BASE_MODULE_NAMES[category])
+  return BASE_MODULES.filter(m => allowed.has(m.moduleName))
+}
+
 export const PRODUCT_CATALOG_MODULES: Record<InsuranceCategoryType, ProductModule[]> = {
-  "医疗险": [...BASE_MODULES, ...MEDICAL_MODULES],
-  "重疾险": [...BASE_MODULES, ...CRITICAL_ILLNESS_MODULES],
-  "意外医疗险": [...BASE_MODULES, ...MEDICAL_MODULES],  // 意外医疗险复用医疗险模块
-  "意外险": [...BASE_MODULES, ...ACCIDENT_MODULES],
-  "寿险": [...BASE_MODULES, ...LIFE_INSURANCE_MODULES],
-  "年金险": [...BASE_MODULES, ...ANNUITY_MODULES],
+  "医疗险": [...baseModulesForCategory("医疗险"), ...MEDICAL_MODULES],
+  "重疾险": [...baseModulesForCategory("重疾险"), ...CRITICAL_ILLNESS_MODULES],
+  "意外医疗险": [...baseModulesForCategory("意外医疗险"), ...MEDICAL_MODULES],  // 意外医疗险复用医疗险模块
+  "意外险": [...baseModulesForCategory("意外险"), ...ACCIDENT_MODULES],
+  "寿险": [...baseModulesForCategory("寿险"), ...LIFE_INSURANCE_MODULES],
+  "年金险": [...baseModulesForCategory("年金险"), ...ANNUITY_MODULES],
+}
+
+export function isModuleAllowedForCategory(
+  category: InsuranceCategoryType,
+  moduleName: string,
+): boolean {
+  return PRODUCT_CATALOG_MODULES[category].some(m => m.moduleName === moduleName)
 }
 
 // ── 命名规则函数 ──────────────────────────────────────────────────────────────

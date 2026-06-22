@@ -20,17 +20,26 @@ import {
   type ModuleGroup,
   PRODUCT_CATALOG_MODULES,
   type ProductModule,
+  type ProductField,
   PRODUCT_FIELDS,
   BASE_FIELDS,
+  isModuleAllowedForCategory,
 } from "@/lib/product-catalog-modules"
 
 const log = getLogger("product-catalog-extractor")
 
 const EMPTY_FIELD_VALUE = ""
 
+const PLACEHOLDER_REGEX = /^(未明确|未提及|未提到|未说明|未在本|未在证据|未从证据|证据片段中未|证据中未|该字段未|文中未|原文未|原文中未|材料未|未找到|未见|没有提到|无明确|不涉及|暂无|暂未|无此信息|无相关|本章节未|条款未|不适用于本|N\/A|n\/a|无$)/
+
 function isMissingFieldValue(value: string | undefined | null): boolean {
   const normalized = (value ?? "").trim()
-  return normalized === "" || normalized.startsWith("未明确")
+  return normalized === "" || PLACEHOLDER_REGEX.test(normalized)
+}
+
+function sanitizeFieldValue(value: string): string {
+  const trimmed = value.trim()
+  return PLACEHOLDER_REGEX.test(trimmed) ? "" : trimmed
 }
 
 const FIELD_EXTRACTION_HINTS: Record<string, Record<string, string>> = {
@@ -38,10 +47,20 @@ const FIELD_EXTRACTION_HINTS: Record<string, Record<string, string>> = {
     "意外豁免": "实际指全部“无等待期/等待期豁免情形”，不限于意外伤害；如原文列出多种情形，必须逐条完整列出，不要只取第 1 条。",
     "等待期内发生理赔处理": "分别列出一般疾病、恶性肿瘤等不同情形下的处理结果，不要合并丢项。",
   },
+  "身故保险金": {
+    "保什么": "概括本产品保险责任。若只有身故责任，填写“身故保险金”及核心给付规则；若同时出现全残、意外身故、疾病身故，必须分别列出。",
+    "全残保障": "仅在原文明示全残/身体全残/全残保险金责任时填写；没有明确全残责任则留空。",
+    "意外身故": "仅在原文把意外身故作为单独责任、额外赔付或单独给付规则时填写；一般身故责任不要强行写成意外身故。",
+    "疾病身故": "仅在原文把疾病身故或非意外身故作为单独责任、额外赔付或单独给付规则时填写。",
+  },
 }
 
 const FIELD_NAME_ALIASES: Record<string, string[]> = {
   "意外豁免": ["无等待期情形", "等待期豁免情形", "无等待期/等待期豁免情形"],
+  "保什么": ["保险责任", "保障责任", "保障内容", "我们保什么", "保险金责任"],
+  "全残保障": ["全残保险金", "身体全残保险金", "全残责任", "身体全残责任"],
+  "意外身故": ["意外身故保险金", "意外死亡保险金"],
+  "疾病身故": ["疾病身故保险金", "非意外身故保险金"],
 }
 
 const FIELD_EVIDENCE_KEYWORDS: Record<string, string[]> = {
@@ -53,7 +72,78 @@ const FIELD_EVIDENCE_KEYWORDS: Record<string, string[]> = {
   "犹豫期": ["犹豫期", "退保", "解除合同", "扣除", "无息退还"],
   "宽限期": ["宽限期", "60日", "逾期", "保险费"],
   "投保年龄": ["投保年龄", "出生", "周岁", "最低", "最高"],
+  "产品简介": ["产品提供", "保障", "保险责任", "阅读指引", "产品"],
+  "产品特色": ["领取方式", "领取期间", "保证给付", "保单贷款", "现金价值", "权益"],
+  "保单权益": ["重要权益", "保单贷款", "自动垫交", "退保", "现金价值", "受益人"],
+  "投保范围": ["投保范围", "被保险人", "投保年龄", "周岁"],
+  "保障人群": ["投保年龄", "被保险人", "周岁"],
+  "高流动性": ["保单贷款", "现金价值", "减保", "部分领取", "退保"],
+  "部分领取": ["部分领取", "减保", "领取", "账户价值"],
+  "保证领取": ["保证给付", "领取期间内身故", "养老保险金总额", "已给付"],
+  "领取规则": ["领取方式", "一次性领取", "年领", "月领", "领取期间"],
+  "领取期间": ["领取期间", "10年", "20年", "届满"],
+  "养老金": ["养老保险金", "给付", "领取方式", "基本保险金额"],
+  "保单贷款": ["保单贷款", "贷款金额", "现金价值", "贷款期限", "贷款利率"],
+  "身故保险金": ["保险责任", "身故保险金", "被保险人身故", "给付", "基本保险金额", "所交保险费", "已交保险费", "现金价值", "合同终止"],
+  "保什么": ["保险责任", "我们保什么", "保什么", "身故保险金", "全残保险金", "意外身故", "疾病身故", "给付", "基本保险金额", "现金价值"],
+  "全残保障": ["全残", "身体全残", "全残保险金", "全残保障"],
+  "意外身故": ["意外身故", "意外伤害", "身故保险金"],
+  "疾病身故": ["疾病身故", "非意外身故", "身故保险金"],
 }
+
+const REFINE_EXTRA_FIELDS_BY_MODULE: Record<string, string[]> = {
+  "产品基础信息": [
+    "险种代码", "险种简称", "险种名称", "产品类别", "产品类型", "主附加险",
+    "产品简介", "产品特色", "保单权益", "交费期限", "交费方式", "宽限期",
+    "保障期间", "保障期间分类", "投保年龄", "保险期间和续保", "投保范围",
+  ],
+  "投保年龄": ["投保年龄", "保障人群", "投保范围"],
+  "投保人群": ["适用人群", "保障人群", "投保范围"],
+  "犹豫期": ["犹豫期", "犹豫期及合同解除（退保）"],
+  "退保": ["犹豫期及合同解除（退保）", "保单权益"],
+  "身故保险金": [
+    "保什么", "身故保险金", "全残保障", "意外身故", "疾病身故", "满期返还",
+    "特殊免责", "购买限制", "保单权益", "产品特色",
+  ],
+  "通用责任免除": ["特殊免责", "免责少"],
+  "未成年人保额限制": ["购买限制"],
+  "年金给付规则": [
+    "保什么", "养老金", "保证领取", "领取规则", "领取期间", "产品特色",
+    "保单权益", "领钱时间早", "教育金",
+  ],
+  "领取期间": ["领取期间", "领取规则", "保障期间", "保险期间和续保", "产品特色"],
+  "领取明细示例": ["领取期间", "领取规则", "养老金", "产品特色"],
+  "保单贷款": ["保单贷款", "高流动性", "现金价值", "保单权益", "产品特色"],
+  "减保": ["部分领取", "高流动性", "现金价值", "保单权益"],
+  "万能账户规则": ["万能账户", "产品利率", "保证利率", "初始费用", "领取手续费", "部分领取", "高流动性"],
+  "保证利率": ["保证利率", "产品利率"],
+  "初始费用": ["初始费用"],
+  "领取手续费": ["领取手续费"],
+  "年度现金价值表": ["现金价值", "高流动性"],
+}
+
+const LONG_FIELD_MODULE_MAP: Record<string, string[]> = {
+  "保什么": [
+    "一般住院医疗", "重大疾病医疗", "特殊门诊医疗", "质子重离子医疗", "恶性肿瘤赴日医疗", "院外特定药品",
+    "重大疾病保险金", "轻症保险金", "中症保险金", "特定重疾额外赔付", "身故保险金",
+    "意外身故", "意外伤残", "意外医疗", "交通意外额外赔付",
+    "年金给付规则", "领取期间",
+  ],
+  "报销范围": ["一般住院医疗", "住院前后门急诊", "特殊门诊医疗", "门诊手术医疗"],
+  "投保范围": ["投保年龄", "投保人群", "投保职业"],
+  "保险期间和续保": ["6年保证续保"],
+  "犹豫期及合同解除（退保）": ["犹豫期", "退保"],
+}
+
+const RULE_DERIVED_FIELD_NAMES = new Set([
+  "保障人群",
+  "保障期间分类",
+  "高流动性",
+  "产品简介",
+  "产品特色",
+  "保单权益",
+  "投保范围",
+])
 
 function uniqueStrings(items: Array<string | undefined | null>): string[] {
   const seen = new Set<string>()
@@ -209,6 +299,17 @@ function shouldReplaceFieldValue(
     : nextScore > currentScore * 1.35 && next.length > current.length + 12
 }
 
+function shouldFuzzyBridgeSchemaField(schemaField: ProductField, extractedName: string): boolean {
+  if (extractedName === schemaField.fieldName) return true
+  if (!schemaField.extractable) return false
+  return extractedName.includes(schemaField.fieldName)
+}
+
+function shouldRejectMainFieldValue(fieldName: string, value: string): boolean {
+  if (fieldName !== "费用") return false
+  return /(?:退保|解除合同).*(?:损失|慎重)|(?:损失|慎重).*(?:退保|解除合同)|可能会遭受一定损失|造成一定的损失/.test(value)
+}
+
 function tableCell(value: string, maxLength = 120): string {
   const normalized = value.replace(/\s+/g, " ").trim()
   const clipped = normalized.length > maxLength
@@ -223,6 +324,20 @@ function fieldScopeLabel(
   category: InsuranceCategoryType,
 ): string {
   return baseFieldNames.has(fieldName) ? "基础字段" : `${category}专属字段`
+}
+
+function valueSourceForField(fieldName: string, value: string): "extracted" | "derived" | "missing" {
+  if (isMissingFieldValue(value)) return "missing"
+  return RULE_DERIVED_FIELD_NAMES.has(fieldName) ? "derived" : "extracted"
+}
+
+function evidenceModulesForField(fieldName: string, category?: InsuranceCategoryType): string[] {
+  const refineModules = Object.entries(REFINE_EXTRA_FIELDS_BY_MODULE)
+    .filter(([, fields]) => fields.includes(fieldName))
+    .map(([moduleName]) => moduleName)
+  const longFieldModules = LONG_FIELD_MODULE_MAP[fieldName] ?? []
+  const modules = uniqueStrings([...refineModules, ...longFieldModules])
+  return category ? modules.filter(moduleName => isModuleAllowedForCategory(category, moduleName)) : modules
 }
 
 function cleanProductName(name: string): string {
@@ -298,6 +413,7 @@ const MODULE_KEY_FIELDS: Record<string, string[]> = {
   "理赔报案": ["报案时限", "报案方式", "所需材料概述"],
   "住院理赔材料": ["必要材料清单", "特殊情形材料"],
   "重疾理赔材料": ["必要材料清单", "特殊情形材料"],
+  "身故保险金": ["保什么", "身故保险金", "身故保险金给付条件", "身故保险金给付金额", "身故保险金给付对象", "全残保障", "意外身故", "疾病身故", "身故保险金责任免除"],
   "社保后赔付比例": ["赔付比例", "适用条件", "结算顺序"],
   "无社保赔付比例": ["赔付比例", "适用条件"],
   "第三方报销分摊": ["分摊规则", "优先级"],
@@ -334,7 +450,6 @@ function buildPrompt(
   // Build enriched field list with hints for LLM
   const productFields = PRODUCT_FIELDS[category] ?? []
   const fieldListWithHints = productFields
-    .filter(f => f.extractable)
     .map(f => {
       let entry = f.fieldName
       if (f.valueHint) entry += `（如：${f.valueHint}）`
@@ -363,7 +478,7 @@ function buildPrompt(
     "## 目标模块（含关键字段提示）",
     moduleList,
     "",
-    "## 产品字段总表（可自动抽取字段，含格式提示）",
+    "## 产品字段总表（对齐 xlsx，含格式提示；找不到值就留空）",
     fieldListWithHints,
     "",
     "## 特别注意：以下业务字段如在本章节出现，必须额外添加到 \`产品基础信息\` 模块",
@@ -386,6 +501,7 @@ function buildPrompt(
     "6. **枚举型规则必须完整**：若原文用 1/2/3 或分号列出多个条件、责任、例外或处理方式，必须全部列出，可用分号压缩，但不能只取第一条。",
     "7. **关键字段表格提炼核心值**：短字段保持简洁；规则型字段可用分号完整列举必要条件。",
     "8. **长文本字段**：标有 [长文本] 的字段，值可以较长（100-300字），概括原文核心内容，不要只写一句话。",
+    "9. **严禁占位文本**：绝对不要输出\"未明确\"、\"未提及\"、\"未在本章节说明\"、\"暂无\"、\"不涉及\"等占位文字。没有值的字段，值直接留空，写成 `| 字段名 |  |` 即可。",
   ].join("\n")
 }
 
@@ -485,7 +601,7 @@ async function extractFromSection(
     return { sectionIndex, fragments: [] }
   }
 
-  const validNames = new Set(modules.map(m => m.moduleName))
+  const validNames = new Set(PRODUCT_CATALOG_MODULES[category].map(m => m.moduleName))
   const fragments = parseModuleBlocks(rawResponse, validNames, sectionText)
   for (const f of fragments) f.sectionIndex = sectionIndex
 
@@ -551,12 +667,38 @@ function parseKeyFieldsTable(markdown: string): Map<string, string> {
   let row: RegExpExecArray | null
   while ((row = rowRegex.exec(tableBlock)) !== null) {
     const field = row[1].trim()
-    const value = row[2].trim()
+    const value = sanitizeFieldValue(row[2])
     // Skip header separators and header row
     if (field === "---" || field === "字段" || field.startsWith("--")) continue
     fields.set(field, value)
   }
   return fields
+}
+
+function hasExtractedFieldValue(markdown: string): boolean {
+  const fields = parseKeyFieldsTable(markdown)
+  for (const value of fields.values()) {
+    if (!isMissingFieldValue(value)) return true
+  }
+  return false
+}
+
+function moduleHasExtractedValues(m: Pick<MergedModule, "contents">): boolean {
+  return m.contents.some(hasExtractedFieldValue)
+}
+
+function collectModuleKeyFields(m: MergedModule | undefined): Map<string, string> {
+  const merged = new Map<string, string>()
+  if (!m?.found) return merged
+  for (const content of m.contents) {
+    const fields = parseKeyFieldsTable(content)
+    for (const [field, value] of fields) {
+      if (!merged.has(field) || shouldReplaceFieldValue(merged.get(field), value, m.moduleName, field)) {
+        merged.set(field, value)
+      }
+    }
+  }
+  return merged
 }
 
 /**
@@ -642,6 +784,7 @@ function buildModuleFile(
   category: InsuranceCategoryType,
   productName: string,
 ): string {
+  const hasValues = moduleHasExtractedValues(m)
   const lines: string[] = []
   lines.push("---")
   lines.push(`title: "${category}-${productName}-${m.moduleName}"`)
@@ -649,8 +792,10 @@ function buildModuleFile(
   lines.push(`insurance_category: "${category}"`)
   lines.push(`product_name: "${productName}"`)
   lines.push(`module_name: "${m.moduleName}"`)
+  lines.push(`concept_name: "${m.moduleName}"`)
   lines.push(`entity_type: "${moduleDef.entityType}"`)
-  lines.push(`status: candidate`)
+  lines.push(`status: ${hasValues ? "candidate" : "rejected"}`)
+  lines.push(`extraction_state: ${hasValues ? "has_values" : "needs_refinement"}`)
   lines.push(`created_by: auto-extract`)
   lines.push(`source_sections: ${m.sectionIndices.length}`)
   lines.push("---")
@@ -662,6 +807,183 @@ function buildModuleFile(
   lines.push(mergeFragmentContents(m.contents, m.sectionIndices, m.moduleName))
 
   return lines.join("\n")
+}
+
+function yamlString(value: string): string {
+  return JSON.stringify(value)
+}
+
+function sanitizeFileNamePart(value: string): string {
+  const cleaned = value
+    .replace(/[<>:"/\\|?*\x00-\x1F]/g, "_")
+    .replace(/\s+/g, " ")
+    .trim()
+  return cleaned.length > 80 ? cleaned.slice(0, 80).trim() : cleaned || "未命名字段"
+}
+
+function splitMarkdownTableRow(line: string): string[] | null {
+  const trimmed = line.trim()
+  if (!trimmed.startsWith("|") || !trimmed.endsWith("|")) return null
+
+  const cells: string[] = []
+  let current = ""
+  for (let i = 1; i < trimmed.length - 1; i++) {
+    const ch = trimmed[i]
+    if (ch === "|" && trimmed[i - 1] !== "\\") {
+      cells.push(current.trim().replace(/\\\|/g, "|"))
+      current = ""
+    } else {
+      current += ch
+    }
+  }
+  cells.push(current.trim().replace(/\\\|/g, "|"))
+  return cells
+}
+
+function parseProductProfileFieldValues(profileMarkdown: string): Map<string, string> {
+  const values = new Map<string, string>()
+  const fieldSection = profileMarkdown.split(/\n## 已有知识清单\b/)[0] ?? profileMarkdown
+  for (const line of fieldSection.split(/\r?\n/)) {
+    const cells = splitMarkdownTableRow(line)
+    if (!cells || cells.length < 2) continue
+    const [field, rawValue] = cells
+    if (!field || field === "字段" || field.startsWith("---")) continue
+    values.set(field, sanitizeFieldValue(rawValue.replace(/<br>/g, "\n")))
+  }
+  return values
+}
+
+function buildProductFieldFile(
+  field: ProductField,
+  value: string,
+  category: InsuranceCategoryType,
+  productName: string,
+  baseFieldNames: Set<string>,
+): string {
+  const hasValue = !isMissingFieldValue(value)
+  const fieldScope = fieldScopeLabel(field.fieldName, baseFieldNames, category)
+  const valueSource = valueSourceForField(field.fieldName, value)
+  const evidenceModules = evidenceModulesForField(field.fieldName, category)
+  const status = hasValue ? "candidate" : "rejected"
+  const extractionState = hasValue ? "has_values" : "needs_refinement"
+  const valueCell = value.replace(/\n/g, "<br>").replace(/\|/g, "\\|")
+  const summary = hasValue
+    ? `${productName} 的${field.fieldName}为：${value.replace(/\s+/g, " ").trim()}`
+    : `${productName} 的${field.fieldName}尚未从已上传资料中抽取到明确值。`
+
+  const lines: string[] = []
+  lines.push("---")
+  lines.push(`title: ${yamlString(`${category}-${productName}-${field.fieldName}`)}`)
+  lines.push(`knowledge_domain: product_catalog_field`)
+  lines.push(`insurance_category: ${yamlString(category)}`)
+  lines.push(`product_name: ${yamlString(productName)}`)
+  lines.push(`field_name: ${yamlString(field.fieldName)}`)
+  lines.push(`field_scope: ${yamlString(fieldScope)}`)
+  lines.push(`concept_name: ${yamlString(field.fieldName)}`)
+  lines.push(`entity_type: product_field`)
+  lines.push(`status: ${status}`)
+  lines.push(`extraction_state: ${extractionState}`)
+  lines.push(`value_source: ${valueSource}`)
+  lines.push(`evidence_modules: [${evidenceModules.map(name => yamlString(name)).join(", ")}]`)
+  lines.push(`value_type: ${field.valueType}`)
+  lines.push(`source_hint: ${yamlString(field.source)}`)
+  lines.push(`created_by: auto-extract`)
+  lines.push("---")
+  lines.push("")
+  lines.push(`# ${field.fieldName}`)
+  lines.push("")
+  lines.push("## 字段值")
+  lines.push("")
+  lines.push("| 字段 | 值 |")
+  lines.push("|---|---|")
+  lines.push(`| ${field.fieldName} | ${valueCell} |`)
+  lines.push("")
+  lines.push("## 字段元信息")
+  lines.push("")
+  lines.push("| 项目 | 内容 |")
+  lines.push("|---|---|")
+  lines.push(`| 字段范围 | ${fieldScope} |`)
+  lines.push(`| 字段类型 | ${field.valueType === "long" ? "长文本" : "短字段"} |`)
+  lines.push(`| 取值来源提示 | ${field.source.replace(/\|/g, "\\|")} |`)
+  lines.push(`| 值来源类型 | ${valueSource === "derived" ? "规则回填" : valueSource === "extracted" ? "原文抽取/模块回填" : "缺失待补"} |`)
+  if (field.valueHint) lines.push(`| 取值格式提示 | ${field.valueHint.replace(/\|/g, "\\|")} |`)
+  if (field.description) lines.push(`| 说明 | ${field.description.replace(/\|/g, "\\|")} |`)
+  if (evidenceModules.length > 0) {
+    lines.push("")
+    lines.push("## 来源与证据")
+    lines.push("")
+    if (valueSource === "derived") {
+      lines.push("该字段由规则从已抽取字段或模块内容回填，原文证据请查看下列模块。")
+    } else if (valueSource === "missing") {
+      lines.push("该字段尚未抽取到值，后续精炼或补充资料时优先查看下列模块。")
+    } else {
+      lines.push("该字段值来自模块抽取或模块精炼，原文证据请查看下列模块。")
+    }
+    lines.push("")
+    for (const moduleName of evidenceModules) {
+      lines.push(`- [[${category}-${productName}-${moduleName}]]`)
+    }
+  }
+  lines.push("")
+  lines.push("## 所属产品")
+  lines.push("")
+  lines.push(`- 险种：${category}`)
+  lines.push(`- 产品：${productName}`)
+  lines.push(`- 主文件：[[${category}-${productName}]]`)
+  lines.push(`- 字段概念：[[${field.fieldName}]]`)
+  lines.push("")
+  lines.push("## 检索摘要")
+  lines.push("")
+  lines.push(summary)
+  if (!hasValue) {
+    lines.push("")
+    lines.push("## 知识缺口")
+    lines.push("")
+    lines.push(`- [ ] ${field.fieldName} 尚未抽取到明确值，后续精炼或补充资料时填充。`)
+  }
+
+  return lines.join("\n")
+}
+
+function buildProductFieldFiles(
+  profileMarkdown: string,
+  category: InsuranceCategoryType,
+  productName: string,
+): Array<{ fileName: string; content: string; hasValue: boolean }> {
+  const fieldValues = parseProductProfileFieldValues(profileMarkdown)
+  const baseFieldNames = new Set(BASE_FIELDS.map(f => f.fieldName))
+  return (PRODUCT_FIELDS[category] ?? []).map(field => {
+    const value = fieldValues.get(field.fieldName) ?? EMPTY_FIELD_VALUE
+    return {
+      fileName: `${category}-${productName}-字段-${sanitizeFileNamePart(field.fieldName)}.md`,
+      content: buildProductFieldFile(field, value, category, productName, baseFieldNames),
+      hasValue: !isMissingFieldValue(value),
+    }
+  })
+}
+
+function deriveAudienceFromAge(ageText: string | undefined): string | null {
+  if (!ageText || isMissingFieldValue(ageText)) return null
+  const ages = [...ageText.matchAll(/(\d+)\s*周岁/g)].map(m => Number.parseInt(m[1], 10))
+  if (ages.length === 0) return null
+  const minAge = Math.min(...ages)
+  const maxAge = Math.max(...ages)
+  if (maxAge <= 17) return "儿童(0-17岁)"
+  if (minAge >= 60) return "老人(60岁以上)"
+  if (minAge >= 18 && maxAge <= 60) return "成人(18-60岁)"
+  const groups: string[] = []
+  if (minAge <= 17) groups.push("儿童(0-17岁)")
+  if (minAge <= 60 && maxAge >= 18) groups.push("成人(18-60岁)")
+  if (maxAge >= 60) groups.push("老人(60岁以上)")
+  return groups.length > 0 ? groups.join("；") : null
+}
+
+function deriveCoveragePeriodClass(periodText: string | undefined): string | null {
+  if (!periodText || isMissingFieldValue(periodText)) return null
+  if (/终身/.test(periodText)) return "终身"
+  if (/1\s*年|一年|保险期间不超过\s*1\s*年/.test(periodText) && !/10\s*年|20\s*年|30\s*年/.test(periodText)) return "短期"
+  if (/至|届满|领取期间|长期|10\s*年|20\s*年|30\s*年/.test(periodText)) return "长期"
+  return null
 }
 
 
@@ -736,7 +1058,7 @@ function buildMainFile(
     // Try to find a match in shortFieldLookup where the extracted name contains this schema name
     for (const [extractedName, extractedValue] of shortFieldLookup) {
       if (isMissingFieldValue(extractedValue)) continue
-      if (extractedName.includes(sf.fieldName) || sf.fieldName.includes(extractedName)) {
+      if (shouldFuzzyBridgeSchemaField(sf, extractedName)) {
         shortFieldLookup.set(sf.fieldName, extractedValue)
         break
       }
@@ -773,15 +1095,135 @@ function buildMainFile(
     }
   }
 
+  const setMainFieldIfMissing = (fieldName: string, value?: string | null) => {
+    if (!value || isMissingFieldValue(value)) return
+    if (!shortFieldLookup.has(fieldName) || isMissingFieldValue(shortFieldLookup.get(fieldName))) {
+      shortFieldLookup.set(fieldName, value)
+    }
+  }
+
+  const setMainFieldIfWeak = (fieldName: string, value?: string | null) => {
+    if (!value || isMissingFieldValue(value)) return
+    const current = shortFieldLookup.get(fieldName)
+    if (!current || isMissingFieldValue(current) || value.length > current.length) {
+      shortFieldLookup.set(fieldName, value)
+    }
+  }
+
+  const ageFields = collectModuleKeyFields(mergedModules.get("投保年龄"))
+  const minAge = ageFields.get("最低投保年龄")
+  const maxAge = ageFields.get("最高投保年龄")
+  if (minAge && maxAge) {
+    setMainFieldIfWeak("投保年龄", `${minAge}至${maxAge}`)
+  }
+
+  const annuityFields = collectModuleKeyFields(mergedModules.get("年金给付规则"))
+  const annuityPayoutFields = collectModuleKeyFields(mergedModules.get("领取期间"))
+  setMainFieldIfMissing("领取规则", annuityFields.get("领取方式") ?? annuityPayoutFields.get("领取方式"))
+  setMainFieldIfMissing("保证领取", annuityFields.get("保证给付"))
+  const pensionParts = uniqueStrings([
+    annuityFields.get("领取方式") ? `领取方式：${annuityFields.get("领取方式")}` : undefined,
+    annuityFields.get("一次性领取金额") ? `一次性领取：${annuityFields.get("一次性领取金额")}` : undefined,
+    annuityFields.get("年领领取期间") ? `年领领取期间：${annuityFields.get("年领领取期间")}` : undefined,
+    annuityFields.get("年领每次给付金额（领取期间10年）") ? `10年领取期间：${annuityFields.get("年领每次给付金额（领取期间10年）")}` : undefined,
+    annuityFields.get("年领每次给付金额（领取期间20年）") ? `20年领取期间：${annuityFields.get("年领每次给付金额（领取期间20年）")}` : undefined,
+  ])
+  if (pensionParts.length > 0) {
+    setMainFieldIfMissing("养老金", pensionParts.join("；"))
+    setMainFieldIfMissing("保什么", `养老保险金；${pensionParts.join("；")}`)
+  }
+  setMainFieldIfMissing("保险期间和续保", shortFieldLookup.get("保障期间"))
+
+  if (category === "寿险") {
+    const deathFields = collectModuleKeyFields(mergedModules.get("身故保险金"))
+    const directCoverage = deathFields.get("保什么")
+    const deathAmount = deathFields.get("身故保险金") ?? deathFields.get("身故保险金给付金额") ?? deathFields.get("身故保险金责任描述")
+    const deathValue = directCoverage && (!deathAmount || informationScore(directCoverage) >= informationScore(deathAmount))
+      ? directCoverage
+      : deathAmount
+    const disabilityValue = deathFields.get("全残保障") ?? deathFields.get("全残保险金") ?? deathFields.get("全残保险金给付金额")
+    const accidentDeathValue = deathFields.get("意外身故")
+    const diseaseDeathValue = deathFields.get("疾病身故")
+    const responsibilityParts = uniqueStrings([
+      deathValue ? `身故保险金：${deathValue}` : undefined,
+      disabilityValue ? `全残保障：${disabilityValue}` : undefined,
+      accidentDeathValue ? `意外身故：${accidentDeathValue}` : undefined,
+      diseaseDeathValue ? `疾病身故：${diseaseDeathValue}` : undefined,
+    ])
+
+    if (responsibilityParts.length > 0) {
+      setMainFieldIfWeak("保什么", responsibilityParts.join("；"))
+      const coverageLabels = uniqueStrings([
+        deathValue ? "身故保险金" : undefined,
+        disabilityValue ? "全残保障" : undefined,
+        accidentDeathValue ? "意外身故" : undefined,
+        diseaseDeathValue ? "疾病身故" : undefined,
+      ])
+      if (coverageLabels.length > 0) {
+        setMainFieldIfMissing("产品简介", `${productName}提供${coverageLabels.join("、")}保障。`)
+      }
+      setMainFieldIfMissing("产品特色", responsibilityParts.join("；"))
+    }
+
+    setMainFieldIfMissing("全残保障", disabilityValue)
+    setMainFieldIfMissing("意外身故", accidentDeathValue)
+    setMainFieldIfMissing("疾病身故", diseaseDeathValue)
+    if (shortFieldLookup.get("投保年龄")) {
+      setMainFieldIfMissing("投保范围", `被保险人投保年龄：${shortFieldLookup.get("投保年龄")}`)
+    }
+
+    const loanFields = collectModuleKeyFields(mergedModules.get("保单贷款"))
+    const reductionFields = collectModuleKeyFields(mergedModules.get("减保"))
+    const lifeRights = uniqueStrings([
+      shortFieldLookup.get("保单贷款") ?? loanFields.get("保单贷款") ?? loanFields.get("贷款规则"),
+      shortFieldLookup.get("部分领取") ?? reductionFields.get("部分领取") ?? reductionFields.get("减保规则"),
+      shortFieldLookup.get("现金价值") ? `现金价值：${shortFieldLookup.get("现金价值")}` : undefined,
+      shortFieldLookup.get("犹豫期") ? `犹豫期：${shortFieldLookup.get("犹豫期")}` : undefined,
+    ])
+    if (lifeRights.length > 0) {
+      setMainFieldIfMissing("保单权益", lifeRights.join("；"))
+    }
+  }
+
+  setMainFieldIfMissing("保障人群", deriveAudienceFromAge(shortFieldLookup.get("投保年龄")))
+  setMainFieldIfMissing("保障期间分类", deriveCoveragePeriodClass(shortFieldLookup.get("保障期间")))
+
+  if (category === "年金险") {
+    const loanFields = collectModuleKeyFields(mergedModules.get("保单贷款"))
+    const loanRule = shortFieldLookup.get("保单贷款") ?? loanFields.get("保单贷款")
+    const payoutRule = shortFieldLookup.get("领取规则")
+    const payoutPeriod = shortFieldLookup.get("领取期间")
+    const guaranteePayout = shortFieldLookup.get("保证领取")
+    const startAge = annuityFields.get("开始领取年龄") ?? annuityFields.get("年金给付起始年龄")
+
+    if (loanRule && !isMissingFieldValue(loanRule)) {
+      setMainFieldIfMissing("高流动性", "具备一定流动性：支持保单贷款，贷款额度与合同现金价值相关")
+    }
+    if (shortFieldLookup.get("投保年龄")) {
+      setMainFieldIfMissing("投保范围", `被保险人投保年龄：${shortFieldLookup.get("投保年龄")}`)
+    }
+    if (shortFieldLookup.get("保什么")) {
+      setMainFieldIfMissing(
+        "产品简介",
+        `${productName}提供养老保险金保障${guaranteePayout ? "，并约定领取期间内身故的保证给付安排" : ""}。`,
+      )
+    }
+
+    const featureParts = uniqueStrings([
+      payoutRule ? `领取规则：${payoutRule}` : undefined,
+      payoutPeriod ? `领取期间：${payoutPeriod}` : undefined,
+      startAge ? `开始领取年龄：${startAge}` : undefined,
+      guaranteePayout ? `保证领取：${guaranteePayout}` : undefined,
+      loanRule ? "支持保单贷款" : undefined,
+    ])
+    if (featureParts.length > 0) {
+      setMainFieldIfMissing("产品特色", featureParts.join("；"))
+      setMainFieldIfMissing("保单权益", featureParts.join("；"))
+    }
+  }
+
   // ── Auto-fill long text fields from module source text ──
   // For long text fields like 保什么, 报销范围 etc., synthesize from module contents
-  const LONG_FIELD_MODULE_MAP: Record<string, string[]> = {
-    "保什么": ["一般住院医疗", "重大疾病医疗", "特殊门诊医疗", "质子重离子医疗", "恶性肿瘤赴日医疗", "院外特定药品"],
-    "报销范围": ["一般住院医疗", "住院前后门急诊", "特殊门诊医疗", "门诊手术医疗"],
-    "投保范围": ["投保年龄", "投保人群", "投保职业"],
-    "保险期间和续保": ["6年保证续保"],
-    "犹豫期及合同解除（退保）": ["犹豫期", "退保"],
-  }
   for (const [fieldName, moduleNames] of Object.entries(LONG_FIELD_MODULE_MAP)) {
     if (shortFieldLookup.has(fieldName) && !isMissingFieldValue(shortFieldLookup.get(fieldName))) continue
     const parts: string[] = []
@@ -802,6 +1244,12 @@ function buildMainFile(
     }
     if (parts.length > 0) {
       shortFieldLookup.set(fieldName, parts.join(" | "))
+    }
+  }
+
+  for (const [fieldName, value] of [...shortFieldLookup]) {
+    if (shouldRejectMainFieldValue(fieldName, value)) {
+      shortFieldLookup.delete(fieldName)
     }
   }
 
@@ -881,7 +1329,14 @@ function buildMainFile(
   }
 
   // ── Section: 模块索引 ─────────────────────────────────────────
-  const found = allModules.filter(m => mergedModules.get(m.moduleName)?.found)
+  const found = allModules.filter(m => {
+    const merged = mergedModules.get(m.moduleName)
+    return !!merged?.found && moduleHasExtractedValues(merged)
+  })
+  const pendingRefinement = allModules.filter(m => {
+    const merged = mergedModules.get(m.moduleName)
+    return !!merged?.found && !moduleHasExtractedValues(merged)
+  })
   const missing = allModules.filter(m => !mergedModules.get(m.moduleName)?.found)
   const knownFields = allFields
     .map(f => ({ field: f, value: shortFieldLookup.get(f.fieldName) ?? EMPTY_FIELD_VALUE }))
@@ -933,7 +1388,10 @@ function buildMainFile(
   lines.push("")
   lines.push("### 缺失模块")
   lines.push("")
-  if (missing.length > 0) {
+  if (pendingRefinement.length > 0 || missing.length > 0) {
+    for (const m of pendingRefinement) {
+      lines.push(`- [ ] **${m.moduleName}** (已定位原文，待精炼)`)
+    }
     for (const m of missing) {
       lines.push(`- [ ] **${m.moduleName}** (${m.required ? "必填" : "选填"})`)
     }
@@ -951,9 +1409,12 @@ function buildMainFile(
   }
   lines.push("")
 
-  if (missing.length > 0) {
+  if (pendingRefinement.length > 0 || missing.length > 0) {
     lines.push("## 待补全模块")
     lines.push("")
+    for (const m of pendingRefinement) {
+      lines.push(`- [ ] **${m.moduleName}** (已定位原文，待精炼)`)
+    }
     for (const m of missing) {
       lines.push(`- [ ] **${m.moduleName}** (${m.required ? "必填" : "选填"})`)
     }
@@ -1149,6 +1610,9 @@ export async function runProductCatalogExtraction(
     names: foundModules.map(m => m.moduleName),
   })
 
+  const catalogDir = `${projectPath}/wiki/product_catalog`
+  await createDirectory(catalogDir)
+
   if (foundModules.length === 0) {
     activity.updateItem(activityId, { detail: "未能提取到任何模块。" })
     return []
@@ -1156,10 +1620,8 @@ export async function runProductCatalogExtraction(
 
   // ── Phase 4: Write files ───────────────────────────────────
   activity.updateItem(activityId, {
-    detail: `正在写入 ${foundModules.length} 个模块文件 + 主文件...`,
+    detail: `正在写入 ${foundModules.length} 个模块文件 + 主文件 + 字段页...`,
   })
-  const catalogDir = `${projectPath}/wiki/product_catalog`
-  await createDirectory(catalogDir)
   const writtenPaths: string[] = []
 
   // 4a: Main product summary file
@@ -1173,7 +1635,19 @@ export async function runProductCatalogExtraction(
     log.error("failed to write main file", { error: String(err) })
   }
 
-  // 4b: Individual module files
+  // 4b: Field-level pages aligned to the Excel schema
+  for (const fieldPage of buildProductFieldFiles(mainContent, category, productName)) {
+    const fieldPath = `${catalogDir}/${fieldPage.fileName}`
+    const fieldRelative = `wiki/product_catalog/${fieldPage.fileName}`
+    try {
+      await writeFile(fieldPath, fieldPage.content)
+      writtenPaths.push(fieldRelative)
+    } catch (err) {
+      log.error("failed to write product field file", { path: fieldRelative, error: String(err) })
+    }
+  }
+
+  // 4c: Individual module files
   for (const m of foundModules) {
     const moduleDef = allModules.find(mod => mod.moduleName === m.moduleName)
     if (!moduleDef) continue
@@ -1191,7 +1665,7 @@ export async function runProductCatalogExtraction(
 
   log.info("all files written", { total: writtenPaths.length })
 
-  // 4c: Save OCR source text for reference
+  // 4d: Save OCR source text for reference
   try {
     const sourceDir = `${projectPath}/wiki/source_text`
     await createDirectory(sourceDir)
@@ -1258,6 +1732,29 @@ function extractSourceText(content: string): string {
   return match ? match[1].trim() : ""
 }
 
+function markModuleHasValues(content: string): string {
+  let next = content.replace(/^status:\s*["']?rejected["']?\s*$/m, "status: candidate")
+  next = next.replace(/^extraction_state:\s*["']?needs_refinement["']?\s*$/m, "extraction_state: has_values")
+  return next
+}
+
+function extraRefineFieldsForModule(moduleName: string, category?: InsuranceCategoryType): string[] {
+  const fields = REFINE_EXTRA_FIELDS_BY_MODULE[moduleName] ?? []
+  if (category === "年金险") return fields
+  return fields.filter(field => !["高流动性", "教育金", "领钱时间早", "投保门槛低", "万能账户", "养老金", "领取规则", "产品利率", "领取期间"].includes(field))
+}
+
+function appendKeyFieldRow(content: string, fieldName: string, value: string): string {
+  const sectionRegex = /(## 关键字段\s*\r?\n\s*\|[^\n]*\|\s*\r?\n\s*\|[-:\s|]+\|\s*\r?\n)((?:\|.*\|\s*\r?\n)*)/
+  if (!sectionRegex.test(content)) return content
+  return content.replace(sectionRegex, (_match, header: string, rows: string) => {
+    if (new RegExp(`^\\|\\s*${escapeRegExp(fieldName)}\\s*\\|`, "m").test(rows)) {
+      return `${header}${rows}`
+    }
+    return `${header}${rows}| ${fieldName} | ${value} |\n`
+  })
+}
+
 /**
  * 对单个模块文件做精炼：读原文 -> LLM 抽关键字段 -> 合并回文件。
  * 返回更新的字段数（0 = 无更新）。
@@ -1278,11 +1775,13 @@ async function refineSingleModule(
   }
   const fm = fmMatch[1]
   const moduleNameMatch = fm.match(/^module_name:\s*"?([^"\n]+?)"?\s*$/m)
+  const categoryMatch = fm.match(/^insurance_category:\s*"?([^"\n]+?)"?\s*$/m)
   if (!moduleNameMatch) {
     log.info("refine skip", { file: fileName, reason: "no module_name in frontmatter" })
     return 0
   }
   const moduleName = moduleNameMatch[1].trim()
+  const category = isInsuranceCategory(categoryMatch?.[1]?.trim()) ? categoryMatch?.[1]?.trim() as InsuranceCategoryType : undefined
 
   // Get key fields definition for this module.
   let keyFields = MODULE_KEY_FIELDS[moduleName]
@@ -1299,18 +1798,33 @@ async function refineSingleModule(
   const existingFields = parseKeyFieldsTable(content)
   let needsRefinement = false
   const targetFields: string[] = []
+
+  const addTargetField = (fieldName: string, force = false) => {
+    const existingName = resolveExistingFieldName(fieldName, existingFields)
+    if (existingName) {
+      if ((force || isMissingFieldValue(existingFields.get(existingName))) && !targetFields.includes(existingName)) {
+        needsRefinement = true
+        targetFields.push(existingName)
+      }
+      return
+    }
+    if (!targetFields.includes(fieldName)) {
+      needsRefinement = true
+      targetFields.push(fieldName)
+    }
+  }
+
   for (const [k, v] of existingFields) {
-    if (isMissingFieldValue(v)) { needsRefinement = true; targetFields.push(k) }
+    if (isMissingFieldValue(v)) addTargetField(k)
   }
   const fieldHints = FIELD_EXTRACTION_HINTS[moduleName]
   if (fieldHints) {
     for (const hintedField of Object.keys(fieldHints)) {
-      const existingName = resolveExistingFieldName(hintedField, existingFields)
-      if (existingName && !targetFields.includes(existingName)) {
-        needsRefinement = true
-        targetFields.push(existingName)
-      }
+      addTargetField(hintedField, true)
     }
+  }
+  for (const extraField of extraRefineFieldsForModule(moduleName, category)) {
+    addTargetField(extraField)
   }
   if (!needsRefinement) {
     log.info("refine skip", { file: fileName, reason: "no empty fields", moduleName, fieldsCount: existingFields.size })
@@ -1360,7 +1874,7 @@ ${sourceExcerpt}
 规则：
 - 只输出“需要提取的字段”中在证据片段里明确找到的字段
 - 如果证据片段没有提到某字段，不要输出该行
-- 不要输出空值或"未明确"，只输出有实际值的行
+- 不要输出空值或任何占位文本（如"未明确"、"未提及"、"暂无"、"不涉及"），只输出有实际值的行
 - 若原文用编号列出多种情形，必须完整列出所有编号情形，不要只输出第一条
 - 值要简洁准确`
 
@@ -1392,7 +1906,7 @@ ${sourceExcerpt}
   let rowMatch: RegExpExecArray | null
   while ((rowMatch = rowRegex.exec(response)) !== null) {
     const field = rowMatch[1].trim()
-    const value = rowMatch[2].trim()
+    const value = sanitizeFieldValue(rowMatch[2])
     if (field === "---" || field === "字段" || field.startsWith("--") || value === "值" || value === "---") continue
     if (field && value) newFields.set(field, value)
   }
@@ -1404,14 +1918,13 @@ ${sourceExcerpt}
   })
   if (newFields.size === 0) return 0
 
-  // Merge: replace rows where value is empty or starts with "未明确".
+  // Merge: replace rows whose current value is empty or placeholder text.
   let updatedCount = 0
   let updatedContent = content
 
   for (const [field, newValue] of newFields) {
     if (isMissingFieldValue(newValue)) continue
-    const existingFieldName = resolveExistingFieldName(field, existingFields)
-    if (!existingFieldName) continue
+    const existingFieldName = resolveExistingFieldName(field, existingFields) ?? field
     if (!shouldReplaceFieldValue(existingFields.get(existingFieldName), newValue, moduleName, existingFieldName)) continue
 
     // Match row: | field | existing value |
@@ -1424,10 +1937,18 @@ ${sourceExcerpt}
       )
       updatedCount++
       existingFields.set(existingFieldName, newValue)
+    } else {
+      const appended = appendKeyFieldRow(updatedContent, existingFieldName, newValue)
+      if (appended !== updatedContent) {
+        updatedContent = appended
+        updatedCount++
+        existingFields.set(existingFieldName, newValue)
+      }
     }
   }
 
   if (updatedCount > 0) {
+    updatedContent = markModuleHasValues(updatedContent)
     await writeFile(filePath, updatedContent)
   }
 
@@ -1460,6 +1981,7 @@ function parseCatalogModuleMetadata(content: string): CatalogModuleMetadata | nu
   const productName = frontmatterValue(content, "product_name")
   const moduleName = frontmatterValue(content, "module_name")
   if (!isInsuranceCategory(categoryValue) || !productName || !moduleName) return null
+  if (!isModuleAllowedForCategory(categoryValue, moduleName)) return null
 
   const sourceSectionsValue = Number.parseInt(frontmatterValue(content, "source_sections") ?? "1", 10)
   return {
@@ -1569,10 +2091,21 @@ async function rebuildMainFilesFromModules(
       allModules,
     )
     await writeFile(`${catalogDir}/${group.category}-${group.productName}.md`, mainContent)
+    for (const fieldPage of buildProductFieldFiles(mainContent, group.category, group.productName)) {
+      await writeFile(`${catalogDir}/${fieldPage.fileName}`, fieldPage.content)
+    }
     rebuilt++
   }
 
   return rebuilt
+}
+
+export async function rebuildProductCatalogMainFiles(
+  projectPath: string,
+  scope?: { category?: string; productName?: string },
+): Promise<number> {
+  const pp = normalizePath(projectPath)
+  return rebuildMainFilesFromModules(`${pp}/wiki/product_catalog`, scope)
 }
 
 /**
