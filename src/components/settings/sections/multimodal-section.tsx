@@ -2,6 +2,7 @@ import { useTranslation } from "react-i18next"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import type { SettingsDraft, DraftSetter } from "../settings-types"
+import { BAILIAN_OCR_MODEL, BAILIAN_VISION_ENDPOINT } from "@/lib/bailian-vision"
 
 interface Props {
   draft: SettingsDraft
@@ -9,7 +10,7 @@ interface Props {
 }
 
 const PROVIDER_OPTIONS: Array<{ value: SettingsDraft["multimodalProvider"]; label: string }> = [
-  { value: "custom", label: "Custom (OpenAI-compat)" },
+  { value: "custom", label: "Alibaba Bailian / Custom" },
   { value: "openai", label: "OpenAI" },
   { value: "anthropic", label: "Anthropic" },
   { value: "google", label: "Google (Gemini)" },
@@ -22,11 +23,11 @@ export function MultimodalSection({ draft, setDraft }: Props) {
   return (
     <div className="space-y-6">
       <div>
-        <h2 className="text-xl font-semibold">{t("settings.sections.multimodal.title", "Image captioning")}</h2>
+        <h2 className="text-xl font-semibold">{t("settings.sections.multimodal.title", "OCR & image understanding")}</h2>
         <p className="mt-1 text-sm text-muted-foreground">
           {t(
             "settings.sections.multimodal.description",
-            "Generate factual captions for images extracted from PDFs / DOCX / PPTX during ingest. Captions are inserted as alt text inside the source markdown — they're what semantic search matches when you search for image content. Cached by image hash so duplicate logos / charts only call the LLM once.",
+            "Use a vision-capable model for scanned-PDF OCR and optional image captions during ingest. The default dedicated endpoint is Alibaba Cloud Model Studio / DashScope Qwen-OCR.",
           )}
         </p>
       </div>
@@ -180,12 +181,12 @@ export function MultimodalSection({ draft, setDraft }: Props) {
                   <Input
                     value={draft.multimodalCustomEndpoint}
                     onChange={(e) => setDraft("multimodalCustomEndpoint", e.target.value)}
-                    placeholder="http://localhost:1234/v1"
+                    placeholder={BAILIAN_VISION_ENDPOINT}
                   />
                   <p className="text-xs text-muted-foreground">
                     {t(
                       "settings.sections.multimodal.customEndpointHint",
-                      "OpenAI-compatible /v1 base. LM Studio, llama.cpp server, vLLM, LocalAI all work.",
+                      "OpenAI-compatible /v1 base. Alibaba Cloud Bailian uses https://dashscope.aliyuncs.com/compatible-mode/v1.",
                     )}
                   </p>
                 </div>
@@ -209,12 +210,12 @@ export function MultimodalSection({ draft, setDraft }: Props) {
                 <Input
                   value={draft.multimodalModel}
                   onChange={(e) => setDraft("multimodalModel", e.target.value)}
-                  placeholder="e.g. Qwen2.5-VL-7B-Instruct, claude-3-5-sonnet-latest, gemini-2.5-flash"
+                  placeholder={BAILIAN_OCR_MODEL}
                 />
                 <p className="text-xs text-muted-foreground">
                   {t(
                     "settings.sections.multimodal.modelHint",
-                    "Must be a vision-capable model. Text-only models will fail with a 400 / image-not-supported error at first ingest.",
+                    "For OCR, use a vision/OCR model such as qwen-vl-ocr-latest. Text-only models will fail with a 400 / image-not-supported error.",
                   )}
                 </p>
               </div>

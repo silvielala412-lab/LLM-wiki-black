@@ -5,8 +5,8 @@
  * Accumulates the stream into a single string and returns it.
  *
  * This reuses the full provider-aware routing logic:
- *   - If backend has LLM_ENDPOINT configured → routes through /api/llm/stream
- *   - Otherwise → direct call using getProviderConfig (handles DeepSeek,
+ *   - Server-managed configs route through /api/llm/stream
+ *   - User-provided configs call getProviderConfig directly (handles DeepSeek,
  *     OpenAI, Ollama, custom, etc.) with the correct URL + auth headers
  *
  * Previous version tried to re-implement this from scratch and failed
@@ -52,7 +52,7 @@ export async function callLLM(
         },
       },
       undefined, // no AbortSignal
-      { temperature: 0.1, maxTokens },
+      { temperature: 0.1, max_tokens: maxTokens },
     )
   })
 }

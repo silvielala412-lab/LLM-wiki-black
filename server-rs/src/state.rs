@@ -58,16 +58,18 @@ pub struct LlmServerConfig {
 impl LlmServerConfig {
     pub fn from_env() -> Self {
         let api_key = Self::opt_env("LLM_API_KEY");
-        let embedding_api_key = Self::opt_env("EMBEDDING_API_KEY");
+        let dashscope_api_key = Self::opt_env("DASHSCOPE_API_KEY");
+        let embedding_api_key = Self::opt_env("EMBEDDING_API_KEY")
+            .or_else(|| dashscope_api_key.clone());
         let vision_endpoint = Self::opt_env("VISION_ENDPOINT");
         let vision_uses_dashscope = vision_endpoint
             .as_deref()
             .map(|endpoint| endpoint.contains("dashscope.aliyuncs.com"))
             .unwrap_or(false);
         let vision_api_key = if vision_uses_dashscope {
-            embedding_api_key
-                .clone()
-                .or_else(|| Self::opt_env("VISION_API_KEY"))
+            Self::opt_env("VISION_API_KEY")
+                .or_else(|| dashscope_api_key.clone())
+                .or_else(|| embedding_api_key.clone())
                 .or_else(|| Self::opt_env("SEARCH_API_KEY"))
         } else {
             Self::opt_env("VISION_API_KEY")

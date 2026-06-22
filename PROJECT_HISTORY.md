@@ -241,73 +241,68 @@ Tier 4: pdftoppm → 图片页面 marker → 前端 VLM OCR
 |---|---|---|---|
 | Q001 | product_catalog 前端上传时是否需要手动选择 domain | ✅ 已确认：手动选择险种类型 | 2026-06-14 |
 | Q002 | 是否需要新建独立「产品库」浏览页面 | ✅ 已确认：需要，包含文件上传界面 | 2026-06-14 |
-| Q003 | DEDUP_KEY_FIELDS：`product_overview: ["product_code"]`，`rate_table: ["related_product","rate_table_version"]` | ✅ 已确认 | 2026-06-14 |
+| Q003 | DEDUP_KEY_FIELDS | ✅ 已确认 | 2026-06-14 |
 | Q004 | 险种产品和服务手册重叠时合并还是分页关联？ | ✅ 已确认：wikilink 关联，不合并 | 2026-06-14 |
-| Q005 | LLM 推断型字段（如「额度类型」、「核保方式」）标注策略 | ✅ 已确认：标注 `confidence: inferred`，进入 needs_review 队列 | 2026-06-15 |
-| Q006 | comparisons / synthesis 层的触发机制何时实现 | ✅ 已确认：Phase 2，先做核心摄入链路 | 2026-06-15 |
+| Q005 | LLM 推断型字段标注策略 | ✅ 已确认：标注 `confidence: inferred` | 2026-06-15 |
+| Q006 | comparisons / synthesis 层触发机制 | ✅ 已确认：Phase 2 | 2026-06-15 |
+| Q007 | `shouldReplaceFieldValue` informationScore 权重验证 | 🔲 待验证 | 2026-06-21 |
+| Q008 | Refine regex `[^|]*` 是否会误覆盖已正确的值 | 🔲 待验证 | 2026-06-21 |
+| Q009 | LIFE_INSURANCE / ANNUITY 缺失字段补齐 | 🔲 待完成 | 2026-06-21 |
+| Q010 | 意外医疗险是否需要独立字段数组 | 🔲 待决定 | 2026-06-21 |
 
 ---
 
-### [2026-06-15] 产品知识库架构设计讨论（业务方案 vs LLM 自动化方案）
+### [2026-06-15 ~ 2026-06-17] Section-Scan 抽取架构重写
 
-**背景**：业务方提供了《产品知识库字段标签维度-20240205.xlsx》，包含 9 个 sheet：
-基础字段 / 医疗险 / 重疾险 / 意外医疗险 / 意外险 / 寿险 / 年金险 / 专业术语目录 / 保险产品知识库示例
+**提交**：`b9a61eb` → `b225d73`（26 个提交）
 
-**Excel 结构理解（已确认）**：
-- `基础字段` sheet = 所有险种公共字段（险种代码、销售状态、交费期、保障期间等）
-- 其余 6 个险种 sheet = 该险种在基础字段之外的**专属扩展字段**
-- 结构等价于「基类 + 子类扩展」，一个 ProductOverview schema + 险种类型控制必填字段
+**背景**：v2.1 的"LLM 生成整个文件"导致险种代码/简称缺失、原文被截断。
 
-**当前代码 ProductOverview 缺失的重要字段（已分析）**：
+**架构变更**：
+- 新 Pipeline：`OCR全文 → splitIntoSections → group-round LLM → parseModuleBlocks → mergeFragmentContents → 注入原文 → Phase 5 精炼`
+- LLM 只输出关键字段表格，原文由代码端 100% 注入
+- Group-Round 分组抽取，每轮 5-8 模块，LLM 调用次数减少 70%
+- Phase 5 精炼：对"未明确"字段做二次聚焦 LLM 调用
+- Concept 聚合系统：`concept-aggregator.ts`，队列清空后自动生成跨产品关联页
 
-| 字段 | 来源 | 优先级 |
-|---|---|---|
-| 主附加险 | 基础字段 | 高（产品搭配核心） |
-| 销售渠道 | 基础字段 | 高 |
-| 犹豫期 / 宽限期 | 基础字段 | 高 |
-| 不限社保（医疗险） | 医疗险 | 高 |
-| 额度类型（百万/小额） | 医疗险 | 高 |
-| 报销比例 / 医院范围 | 医疗险 | 高 |
-| 赔付次数（单次/多次） | 重疾险 | 高 |
-| 疾病分组 | 重疾险 | 高 |
-| 保证利率 / 保单贷款 | 寿险/年金险 | 高 |
-| 领取规则 / 领取期间 | 年金险 | 高 |
+**关键提交**：`b9a61eb`(concept), `209dca3`(group-round), `a0c01e3`(Phase5), `ebdcac4`(streamChat fix), `b225d73`(原文注入)
 
-**架构方案选择**：
-- 业务方案：30+ 文件/产品，模板驱动，目录嵌套
-- 我的方案：6 文件/产品，模块聚合，平铺命名，带 `_extract_schemas/`
-- **用户决定**：先按业务方案来，不行再调整
+---
 
-**关键架构决策（已确认）**：
+### [2026-06-17] DeepSeek v4 迁移 + 路径自动检测
 
-| 决策点 | 结论 |
-|---|---|
-| 文件命名规则 | 方案 A：`{险种类别}-{产品名}-{模块名}.md`（和权益命名规则一致） |
-| 目录位置 | `wiki/product_catalog/` 平铺存放 |
-| 险种类型选择 | 上传时手动选择（医疗险/重疾险/寿险/意外险/年金险） |
-| 多文件关联 | 同一产品的多个文件（条款+费率表+问答）通过 product_code 关联 |
-| LLM 推断字段 | 标注 `confidence: inferred`，进入 needs_review |
-| 维护模式 | LLM 自动化为主，人工审核为辅 |
-| comparisons/synthesis | Phase 2 实现，Phase 1 专注摄入链路 |
+- `deepseek-chat` → `deepseek-v4-pro` 自动迁移
+- `ingest.ts`：路径匹配 `产品/{category}/{productName}/xx.pdf` → 自动推断 `folderContext`
 
-**命名示例**：
-```
-wiki/product_catalog/
-  医疗险-安心百万医疗险2026版-产品基础信息.md
-  医疗险-安心百万医疗险2026版-投保年龄.md
-  医疗险-安心百万医疗险2026版-专属健康告知.md
-  医疗险-安心百万医疗险2026版-标体承保.md
-  医疗险-安心百万医疗险2026版-保障责任.md
-  医疗险-安心百万医疗险2026版-年度免赔额.md
-  医疗险-安心百万医疗险2026版-通用责任免除.md
-  医疗险-安心百万医疗险2026版-理赔报案.md
-  医疗险-安心百万医疗险2026版-费率表.md
-```
+---
 
-**代码回滚点**：
-- Tag: `v0.3-product-catalog-domain`
-- Commit: `aa59484`
-- 分支: `feature/product-catalog-domain`
+### [2026-06-21] Codex 字段质量优化 + Excel 字段对齐
+
+**Codex 改动**：`shouldReplaceFieldValue()` 智能值替换、`FIELD_EXTRACTION_HINTS` 模块级提示、"未明确" → 空值  
+---
+
+### [2026-06-22] v2.3 抽取质量优化 + 前端卡住 bug 修复
+
+**问题**：
+1. 主文件 50%+ 字段为空（抽取不全）
+2. OCR 完成后前端 Activity Panel 显示卡住不动
+3. 产品目录抽取路径无 try-catch，异常时 UI 静默失败
+
+**改动（`product-catalog-extractor.ts`）**：
+- **Section 粒度增大**：`targetChars: 25000 → 6000`，sections 从 65 个降至 ~10 个，LLM 调用从 ~200 降至 ~30
+- **模块→主文件字段桥接**：新增 `MODULE_TO_FIELD_BRIDGE` 映射 11 个模块 → 20+ 个主文件字段（犹豫期、免赔额、续保等）
+- **长文本字段自动合成**：新增 `LONG_FIELD_MODULE_MAP`，从多模块聚合 保什么/报销范围/投保范围 等长字段
+- **Prompt 增强**：字段列表附带 valueHint 格式提示、强制跨章节基础信息提取、长文本字段允许 100-300 字
+- **Fuzzy match 扩展**：去掉 `sf.valueType !== "short"` 限制，长文本字段也参与模糊匹配
+- **Heartbeat 计时器**：每 5 秒更新 Activity Panel 显示已耗时，防止 UI 看起来冻住
+
+**改动（`ingest.ts`）**：
+- 产品目录抽取路径包裹 try-catch，异常时设置 `status: "error"` 并显示错误信息
+
+**效果预估**：
+- 空字段率从 ~50% 降至 ~25%（剩余为运营数据/人工字段，原文不存在）
+- 抽取耗时从 20-30 分钟降至 3-5 分钟
+- Activity Panel 不再出现"冻住"现象
 
 ---
 
@@ -321,4 +316,4 @@ wiki/product_catalog/
 
 ---
 
-*最后更新：2026-06-15*
+*最后更新：2026-06-22*

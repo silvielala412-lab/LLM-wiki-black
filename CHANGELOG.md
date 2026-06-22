@@ -390,5 +390,131 @@ if (path.includes("/wiki/product_catalog/")) return "product"
 
 ---
 
-*最后更新：2026-06-15*  
+---
+
+## v2.2 — Section-Scan 抽取架构 + 知识缺口分析（2026-06-15 ~ 2026-06-21）
+
+**分支**：`feature/product-catalog-domain`  
+**Commits**：`b9a61eb` → `b225d73`（26 个提交）  
+**维护者**：Claude (Antigravity) + Codex  
+**目标**：将产品知识库从"LLM 生成整个文件"改为"OCR 全文切分 → 按组扫描 → 字段级合并"的高保真管线
+
+---
+
+### 架构重大变更：Section-Scan-Merge Pipeline
+
+**问题**：v2.1 让 LLM 一次性生成 2 个模块文件，但 LLM 经常：
+- 丢失原文关键数据（险种代码、简称等）
+- 表格结构被摘要化
+- 原文不完整（只有片段不是全文）
+
+**新架构（`product-catalog-extractor.ts` 重写）**：
+```
+PDF → OCR 全文 → splitIntoSections(25000字/块, 500字重叠)
+  → 每组5-8个模块并发送 LLM（group-round）
+  → parseModuleBlocks 解析响应
+  → mergeFragmentContents 字段级合并（best-value）
+  → 服务端注入 100% 原文到 "## 详细条款原文"
+  → Phase 5: refineSingleModule 精炼未明确字段
+```
+
+**关键设计决策**：
+| 决策 | 结论 | 原因 |
+|------|------|------|
+| LLM 输出格式 | 只输出关键字段表格，禁止摘抄原文 | 原文由代码注入，避免 LLM 篡改/遗漏 |
+| 原文注入方式 | 每个 section 的完整文本注入到对应模块 | 确保 100% 数据保真 |
+| 字段合并策略 | best-value merge：取第一个非"未明确"值 | 跨 section 同一模块的字段互补 |
+| 并发模型 | 8 并发 LLM 调用 | 速度 vs 成本平衡 |
+
+---
+
+### 核心提交详解
+
+#### Concept 聚合系统 (`concept-aggregator.ts`)
+**Commits**: `b9a61eb`, `716d579`
+
+- `scanProductConcepts()`：扫描 `wiki/product_catalog/` 下所有模块文件，从 frontmatter 提取 `module_name`
+- `buildProductConceptIndex()`：为每个 module_name 生成 `wiki/concepts/{模块名}.md` 聚合页
+- 每个 concept 页列出所有包含该模块的产品（跨产品关联表）
+- **触发时机**：`ingest-queue.ts` 的 `onQueueDrained`（所有文件处理完后自动触发）
+
+#### Group-Round 分组抽取
+**Commits**: `209dca3`, `c8f4075`
+
+- 按 `ModuleGroup` 分组：`basic_info` → `exclusion_uw` → `coverage` → `cost_rules` → `contract_admin` → `claim_service` → `disease_definition`
+- 每组 5-8 个模块并发送给 LLM，相比 v2.1 每次 2 个模块，LLM 调用次数减少 70%
+- `MAX_SECTION_PARALLEL` 控制 section 级并发
+
+#### Phase 5: 模块精炼
+**Commits**: `a0c01e3`, `d2f5e60`, `94be1ee`, `ebdcac4`, `f631377`
+
+- `refineSingleModule()`：对每个模块文件的原文做聚焦 LLM 调用，补充"未明确"字段
+- 并发 10，每次只发 ≤8000 字原文 + 字段列表
+- `refineAllProductModules()`：独立入口，UI 按钮触发（不需要重新上传 PDF）
+- **Bug Fix**：`streamChat` 使用 callback 而非 AsyncIterable（`ebdcac4`，CRITICAL）
+
+#### DeepSeek v4 模型迁移
+**Commits**: `2017b42`, `5f3c2fc`
+
+- `llm-presets.ts` 更新 DeepSeek preset：`deepseek-chat` → `deepseek-v4-pro`
+- `wiki-store.ts` 添加自动迁移：加载配置时检测旧模型名并替换
+
+#### 源文件路径自动检测
+**Commit**: `85de3e8`
+
+- `ingest.ts` 新增路径匹配：`产品/{category}/{productName}/xx.pdf` → 自动生成 `folderContext`
+- 解决手动放文件到 `raw/sources/产品/` 目录时不走产品管线的问题
+
+#### 原文注入防截断
+**Commit**: `b225d73`
+
+- Prompt 改为"只输出表格，禁止摘抄原文"
+- `parseModuleBlocks` 自动注入 `sectionText` 作为 `## 详细条款原文`
+- 防御性清理：LLM 不听话输出原文时自动剥离
+
+---
+
+### Codex 改动（2026-06-21，未提交）
+
+**改动文件**：`product-catalog-extractor.ts`
+
+| 改动 | 说明 |
+|------|------|
+| `EMPTY_FIELD_VALUE = ""`  | "未明确" → 空值，对齐 Excel 规范 |
+| `shouldReplaceFieldValue()` | 智能值替换判断（informationScore 评分） |
+| `FIELD_EXTRACTION_HINTS` | 模块级字段抽取提示（解决"只取第 1 条"问题） |
+| `FIELD_NAME_ALIASES` | 字段名别名映射（LLM 输出名 ↔ 模板名） |
+| Prompt 规则 5-7 | 取值来源不跳过、枚举完整、核心值简洁 |
+| 主文件 "已有知识/知识缺口" 清单 | 可视化字段和模块完整度 |
+| Refine regex `[^|]*` | 允许覆盖已有值（需观察效果） |
+
+---
+
+### Excel 字段对齐（2026-06-21）
+
+**参考文件**：《产品知识库字段标签维度-20240205.xlsx》
+
+`product-catalog-modules.ts` 新增字段：
+
+| 位置 | 新增字段 |
+|------|---------|
+| BASE_FIELDS (+11) | 开始/结束使用时间、发布外网、可覆盖风险、产品搭配规则、费用、产品档次、保单件数、退保率、理赔件数/金额 |
+| CRITICAL_ILLNESS (+2) | 高危职业、核保方式 |
+| ACCIDENT (+1) | 高危职业 |
+| LIFE_INSURANCE (+3) | 高危职业、起投金额、契调限制（待完成） |
+| ANNUITY (+5) | 高流动性、教育金、领钱时间早、投保门槛低、契调限制（待完成） |
+
+---
+
+### 已知问题 / 后续优化
+
+- [ ] `shouldReplaceFieldValue` 的 `informationScore` 权重需实际验证
+- [ ] Refine 阶段新 regex 可能覆盖已正确的值（高风险）
+- [ ] LIFE_INSURANCE_FIELDS / ANNUITY_FIELDS 缺失字段待补齐
+- [ ] 意外医疗险需要独立字段数组（当前复用 MEDICAL_FIELDS）
+- [ ] `onQueueDrained` 在中途中断后不会触发 concept aggregator
+
+---
+
+*最后更新：2026-06-21*  
 *维护者：Claude (Antigravity) + Codex*

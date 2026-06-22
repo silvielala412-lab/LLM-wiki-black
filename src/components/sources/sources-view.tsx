@@ -770,12 +770,21 @@ export function SourcesView() {
     // who expected a fresh-import re-run. One button, one path now.
     setIngestingPath(node.path)
     try {
-      await enqueueIngest(project.id, node.path)
+      await enqueueIngest(project.id, node.path, inferProductCatalogFolderContext(node.path))
     } catch (err) {
       console.error("Failed to enqueue ingest:", err)
     } finally {
       setIngestingPath(null)
     }
+  }
+
+  function inferProductCatalogFolderContext(sourcePath: string): string {
+    const match = normalizePath(sourcePath).match(/(?:^|\/)产品\/([^/]+)\/([^/]+)\/[^/]+\.pdf$/i)
+    if (!match) return ""
+    const category = match[1] as InsuranceCategoryType
+    const productName = match[2]
+    if (!INSURANCE_CATEGORIES.includes(category) || !productName) return ""
+    return encodeProductCatalogFolderContext(category, productName, [], 0)
   }
 
   return (
@@ -870,7 +879,10 @@ export function SourcesView() {
                     })
                     const result = await refineAllProductModules(project.path, llmConfig, actId)
                     useActivityStore.getState().updateItem(actId, { status: "done" })
-                    setImportStatus(`✓ 精炼完成：${result.refined}/${result.totalModules} 个模块更新，补充 ${result.fieldsUpdated} 个字段`)
+                    const rebuildSuffix = result.mainFilesRebuilt > 0
+                      ? `，刷新 ${result.mainFilesRebuilt} 个主文件`
+                      : ""
+                    setImportStatus(`✓ 精炼完成：${result.refined}/${result.totalModules} 个模块更新，补充 ${result.fieldsUpdated} 个字段${rebuildSuffix}`)
                     await loadSources()
                   } catch (err) {
                     console.error("Refine failed:", err)

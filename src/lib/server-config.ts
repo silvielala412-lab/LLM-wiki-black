@@ -12,7 +12,8 @@
  * - Vision config is stored separately for use by the PDF-OCR pipeline.
  */
 
-import { useWikiStore } from "@/stores/wiki-store"
+import { useWikiStore, type LlmConfig } from "@/stores/wiki-store"
+import { BAILIAN_OCR_MODEL, BAILIAN_VISION_ENDPOINT } from "@/lib/bailian-vision"
 
 interface ServerLlmConfig {
   provider?: string
@@ -211,13 +212,44 @@ export function getPdfDpi(): number {
 export function buildVisionLlmConfig() {
   const store = useWikiStore.getState()
   const baseCfg = store.llmConfig
-  if (!_visionConfig?.endpoint) return null
-  return {
-    ...baseCfg,
-    provider: "custom" as const,
-    apiKey: _visionConfig.hasApiKey ? "__SERVER_MANAGED_VISION__" : baseCfg.apiKey,
-    customEndpoint: _visionConfig.endpoint,
-    model: _visionConfig.model ?? baseCfg.model,
-    apiMode: "chat_completions" as const,
+  if (_visionConfig?.endpoint) {
+    return {
+      ...baseCfg,
+      provider: "custom" as const,
+      apiKey: _visionConfig.hasApiKey ? "__SERVER_MANAGED_VISION__" : baseCfg.apiKey,
+      customEndpoint: _visionConfig.endpoint,
+      model: _visionConfig.model ?? baseCfg.model,
+      apiMode: "chat_completions" as const,
+    }
   }
+
+  const mmCfg = store.multimodalConfig
+  if (mmCfg.useMainLlm) {
+    return mmCfg.enabled ? baseCfg : null
+  }
+  if (mmCfg.provider === "claude-code") return null
+  if (mmCfg.apiKey === "__SERVER_MANAGED_VISION__") return null
+
+  const model = mmCfg.model || (mmCfg.provider === "custom" ? BAILIAN_OCR_MODEL : "")
+  if (!model) return null
+
+  const cfg: LlmConfig = {
+    ...baseCfg,
+    provider: mmCfg.provider,
+    apiKey: mmCfg.apiKey,
+    model,
+    ollamaUrl: mmCfg.ollamaUrl || baseCfg.ollamaUrl,
+    customEndpoint: mmCfg.customEndpoint,
+    apiMode: mmCfg.provider === "custom" ? (mmCfg.apiMode ?? "chat_completions") : undefined,
+  }
+
+  if (mmCfg.provider === "custom") {
+    cfg.customEndpoint = mmCfg.customEndpoint || BAILIAN_VISION_ENDPOINT
+    cfg.apiMode = mmCfg.apiMode ?? "chat_completions"
+    if (!cfg.customEndpoint || !cfg.apiKey) return null
+  } else if (mmCfg.provider !== "ollama" && !cfg.apiKey) {
+    return null
+  }
+
+  return cfg
 }

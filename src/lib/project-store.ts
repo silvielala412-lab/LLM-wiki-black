@@ -14,6 +14,7 @@ import type {
   OutputLanguage,
   ProviderConfigs,
 } from "@/stores/wiki-store"
+import { BAILIAN_OCR_MODEL, BAILIAN_VISION_ENDPOINT } from "@/lib/bailian-vision"
 
 // ── Generic localStorage helpers ──────────────────────────────────────────────
 
@@ -138,8 +139,34 @@ export async function saveMultimodalConfig(config: MultimodalConfig): Promise<vo
   lsSet(MULTIMODAL_KEY, config)
 }
 
+function normalizeMultimodalConfig(config: MultimodalConfig): MultimodalConfig {
+  if (config.provider !== "custom") return config
+
+  const oldEmptyDefault =
+    config.useMainLlm &&
+    !config.model &&
+    !config.customEndpoint
+
+  if (!oldEmptyDefault && config.model && config.customEndpoint) return config
+
+  return {
+    ...config,
+    useMainLlm: oldEmptyDefault ? false : config.useMainLlm,
+    model: config.model || BAILIAN_OCR_MODEL,
+    customEndpoint: config.customEndpoint || BAILIAN_VISION_ENDPOINT,
+    apiMode: config.apiMode ?? "chat_completions",
+  }
+}
+
 export async function loadMultimodalConfig(): Promise<MultimodalConfig | null> {
-  return lsGet<MultimodalConfig>(MULTIMODAL_KEY)
+  const config = lsGet<MultimodalConfig>(MULTIMODAL_KEY)
+  if (!config) return null
+
+  const normalized = normalizeMultimodalConfig(config)
+  if (JSON.stringify(normalized) !== JSON.stringify(config)) {
+    lsSet(MULTIMODAL_KEY, normalized)
+  }
+  return normalized
 }
 
 // ── Language ──────────────────────────────────────────────────────────────────

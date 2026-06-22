@@ -320,6 +320,55 @@ function safeCacheName(name: string): string {
   return (base || "source").slice(0, 48)
 }
 
+function isPdfExtractionFailureText(content: string): boolean {
+  return /^\(PDF has no extractable text\b/i.test(content.trim()) &&
+    /(pdftoppm|poppler-utils|OCR_ENDPOINT|no pages could be rendered)/i.test(content)
+}
+
+interface FsEntry {
+  name: string
+  path: string
+  is_dir: boolean
+  children?: FsEntry[]
+}
+
+async function readExistingPdfOcrCache(projectPath: string, fileName: string): Promise<string | null> {
+  const cacheRoot = `${projectPath}/.llm-wiki/ocr-cache`
+  const prefix = `${safeCacheName(fileName)}-`
+  let dirs: FsEntry[] = []
+  try {
+    const entries = await listDirectory(cacheRoot) as FsEntry[]
+    dirs = entries.filter((entry) => entry.is_dir && entry.name.startsWith(prefix))
+  } catch {
+    return null
+  }
+
+  for (const dir of dirs) {
+    let files = dir.children?.filter((entry) => !entry.is_dir && /^page-\d+\.md$/i.test(entry.name))
+    if (!files) {
+      try {
+        const entries = await listDirectory(dir.path) as FsEntry[]
+        files = entries.filter((entry) => !entry.is_dir && /^page-\d+\.md$/i.test(entry.name))
+      } catch {
+        files = []
+      }
+    }
+    files.sort((a, b) => a.name.localeCompare(b.name))
+    const pages: string[] = []
+    for (const file of files) {
+      try {
+        const page = await readFile(file.path)
+        if (page.trim()) pages.push(page.trim())
+      } catch {
+        // Ignore a bad cache page; a later page can still be useful.
+      }
+    }
+    if (pages.length > 0) return pages.join("\n\n")
+  }
+
+  return null
+}
+
 function sanitizeJsonValue<T>(value: T): T {
   if (typeof value === "string") {
     return value.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, "") as T
@@ -3152,7 +3201,21 @@ async function autoIngestImpl(
   let sourceContent = rawSourceContent
   let sourceOrigin: IngestSourceOrigin = "raw"
   const rawCacheKey = `${sp}|${rawSourceContent.length}`
-  if (isImagePdf(rawSourceContent)) {
+  const pdfExtractionFailure = isPdfExtractionFailureText(rawSourceContent)
+  if (pdfExtractionFailure) {
+    const cachedOcr = await readExistingPdfOcrCache(pp, fileName)
+    if (cachedOcr) {
+      sourceContent = cachedOcr
+      sourceOrigin = "ocr-pdf"
+      ocrSourceContentCache.set(rawCacheKey, { content: sourceContent, origin: sourceOrigin })
+      activity.updateItem(activityId, { detail: "Reusing persisted PDF OCR cache..." })
+      logOCR.info("pdf-ocr persisted cache hit after PDF render failure", { file: fileName, chars: sourceContent.length })
+    } else {
+      const message = `${rawSourceContent}。未找到可复用 OCR 缓存，请先修复服务器 pdftoppm/poppler 或配置 OCR_ENDPOINT 后再解析。`
+      activity.updateItem(activityId, { status: "error", detail: message })
+      throw new Error(message)
+    }
+  } else if (isImagePdf(rawSourceContent)) {
     const pdfOcrCacheDir = `${pp}/.llm-wiki/ocr-cache/${safeCacheName(fileName)}-${sourceFingerprint(rawSourceContent)}`
     const cached = ocrSourceContentCache.get(rawCacheKey)
     if (cached) {
@@ -3180,15 +3243,15 @@ async function autoIngestImpl(
         logOCR.warn("pdf-ocr failed", { file: fileName, error: err instanceof Error ? err.message : String(err) })
         activity.updateItem(activityId, {
           status: "error",
-          detail: `PDF OCR failed: ${err instanceof Error ? err.message : err}. Configure VISION_ENDPOINT in server settings.`,
+          detail: `PDF OCR failed: ${err instanceof Error ? err.message : err}. Configure server VISION_ENDPOINT or Settings > OCR & Images.`,
         })
         // Non-fatal: fall through with empty content so the pipeline
         // at least generates a stub source-summary page.
-        sourceContent = `(图片型 PDF — OCR 失败。请在服务器配置中设置 VISION_ENDPOINT 和 VISION_MODEL。文件: ${fileName})`
+        sourceContent = `(图片型 PDF — OCR 失败。请在服务器配置 VISION_ENDPOINT/VISION_MODEL，或在设置 > OCR 与图片中配置百炼视觉端点。文件: ${fileName})`
       }
       } else {
       // Vision model not configured → friendly message in the wiki
-      sourceContent = `(图片型 PDF — 服务器未配置视觉模型 VISION_ENDPOINT，无法 OCR。文件: ${fileName})`
+      sourceContent = `(图片型 PDF — 未配置可用视觉 OCR 模型。请配置服务器 VISION_ENDPOINT，或在设置 > OCR 与图片中配置百炼视觉端点。文件: ${fileName})`
       logOCR.warn("pdf-ocr skipped: no vision config", { file: fileName })
       }
     }
@@ -3360,28 +3423,38 @@ async function autoIngestImpl(
     activity.updateItem(activityId, {
       detail: `Product catalog: starting section-scan extraction...`,
     })
-    const writtenPaths = await runProductCatalogExtraction(
-      pp,
-      sourceContent,
-      fileName,
-      productCtxEarly.category as InsuranceCategoryType,
-      productCtxEarly.productName,
-      llmConfig,
-      activityId,
-      signal,
-    )
-    // Save cache so re-imports are skipped
-    if (writtenPaths.length > 0) {
-      await saveIngestCache(pp, fileName, effectiveCacheContent, writtenPaths)
+    try {
+      const writtenPaths = await runProductCatalogExtraction(
+        pp,
+        sourceContent,
+        fileName,
+        productCtxEarly.category as InsuranceCategoryType,
+        productCtxEarly.productName,
+        llmConfig,
+        activityId,
+        signal,
+      )
+      // Save cache so re-imports are skipped
+      if (writtenPaths.length > 0) {
+        await saveIngestCache(pp, fileName, effectiveCacheContent, writtenPaths)
+      }
+      activity.updateItem(activityId, {
+        status: "done",
+        detail: `Product catalog: ${writtenPaths.length} files written`,
+        filesWritten: writtenPaths,
+      })
+      // Trigger knowledge tree refresh so new product catalog files appear immediately
+      useWikiStore.getState().bumpDataVersion()
+      return writtenPaths
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err)
+      log.error("product catalog extraction failed", { error: errMsg, file: fileName })
+      activity.updateItem(activityId, {
+        status: "error",
+        detail: `Product catalog extraction failed: ${errMsg}`,
+      })
+      throw err
     }
-    activity.updateItem(activityId, {
-      status: "done",
-      detail: `Product catalog: ${writtenPaths.length} files written`,
-      filesWritten: writtenPaths,
-    })
-    // Trigger knowledge tree refresh so new product catalog files appear immediately
-    useWikiStore.getState().bumpDataVersion()
-    return writtenPaths
   }
 
   // ── Step 0.5: Extract embedded images ─────────────────────────

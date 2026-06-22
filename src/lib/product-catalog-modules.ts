@@ -1,4 +1,4 @@
-﻿/**
+/**
  * product-catalog-modules.ts
  *
  * 险种产品知识库模块定义。
@@ -82,11 +82,14 @@ export interface ProductField {
 /** 基础字段 (所有险种通用) — 对齐 Excel "基础字段" sheet */
 export const BASE_FIELDS: ProductField[] = [
   { fieldName: "险种代码", source: "官网同步", valueType: "short", extractable: false },
-  { fieldName: "险种名称", source: "产品条款", valueType: "short", extractable: true },
   { fieldName: "险种简称", source: "产品条款", valueType: "short", extractable: true },
+  { fieldName: "险种名称", source: "产品条款", valueType: "short", extractable: true },
+  { fieldName: "开始使用时间", source: "官网同步", valueType: "short", extractable: false },
+  { fieldName: "结束使用时间", source: "官网同步", valueType: "short", extractable: false },
   { fieldName: "产品类别", source: "产品条款", valueType: "short", extractable: true },
   { fieldName: "产品类型", source: "产品条款", valueType: "short", extractable: true },
   { fieldName: "销售渠道", source: "口袋E", valueType: "short", extractable: false },
+  { fieldName: "发布外网", source: "官网同步", valueType: "short", extractable: false },
   { fieldName: "销售状态", source: "官网同步", valueType: "short", extractable: false },
   { fieldName: "主附加险", source: "产品条款", valueType: "short", extractable: true },
   { fieldName: "产品简介", source: "产品说明书", valueType: "long", extractable: true },
@@ -99,18 +102,20 @@ export const BASE_FIELDS: ProductField[] = [
   { fieldName: "犹豫期", source: "产品条款", valueType: "short", extractable: true },
   { fieldName: "等待期", source: "产品条款", valueType: "short", extractable: true },
   { fieldName: "宽限期", source: "产品条款", valueType: "short", extractable: true },
+  { fieldName: "可覆盖风险", source: "保障内容映射", valueType: "short", extractable: true, description: "保险金-风险映射" },
+  { fieldName: "产品搭配规则", source: "口袋E", valueType: "short", extractable: false, description: "主要针对聚财宝或固定产品组合" },
   { fieldName: "保障期间", source: "产品说明书", valueType: "short", extractable: true },
   { fieldName: "保障期间分类", source: "根据保障期间计算", valueType: "short", extractable: true, valueHint: "短期、长期、终身" },
   { fieldName: "投保年龄", source: "产品说明书", valueType: "short", extractable: true },
-  { fieldName: "投保范围", source: "产品条款", valueType: "long", extractable: true },
+  { fieldName: "费用", source: "产品条款", valueType: "short", extractable: false },
+  { fieldName: "产品档次", source: "根据适用人群计算", valueType: "short", extractable: false, description: "和收入保留一个" },
+  { fieldName: "保单件数", source: "产品芯平台同步", valueType: "short", extractable: false },
+  { fieldName: "退保率", source: "运营数据", valueType: "short", extractable: false },
+  { fieldName: "理赔件数", source: "运营数据", valueType: "short", extractable: false },
+  { fieldName: "理赔金额", source: "运营数据", valueType: "short", extractable: false },
   { fieldName: "保险期间和续保", source: "产品说明书", valueType: "long", extractable: true, description: "文本较长" },
   { fieldName: "犹豫期及合同解除（退保）", source: "产品条款", valueType: "long", extractable: true },
-  { fieldName: "通用责任免除", source: "产品条款", valueType: "long", extractable: true },
-  { fieldName: "专属健康告知", source: "健康告知/投保须知", valueType: "long", extractable: true },
-  // 疾病释义（有相关条款的险种填写）
-  { fieldName: "重大疾病释义", source: "产品条款", valueType: "long", extractable: true, description: "重大疾病定义及诊断标准" },
-  { fieldName: "中症疾病释义", source: "产品条款", valueType: "long", extractable: true, description: "中度疾病定义及诊断标准" },
-  { fieldName: "轻度疾病释义", source: "产品条款", valueType: "long", extractable: true, description: "轻度/轻症疾病定义及诊断标准" },
+  { fieldName: "投保范围", source: "产品条款", valueType: "long", extractable: true },
 ]
 
 /** 医疗险专属字段 — 对齐 Excel "医疗险" sheet */
@@ -148,8 +153,10 @@ export const CRITICAL_ILLNESS_FIELDS: ProductField[] = [
   { fieldName: "投被保人豁免", source: "保险条款", valueType: "short", extractable: true },
   { fieldName: "疾病分组", source: "保险责任", valueType: "short", extractable: true, valueHint: "分组、不分组" },
   { fieldName: "赔付次数", source: "保险责任", valueType: "short", extractable: true, valueHint: "单次赔付、多次赔付" },
+  { fieldName: "高危职业", source: "根据投保职业推断", valueType: "short", extractable: false },
   { fieldName: "满期返还", source: "保险责任", valueType: "short", extractable: true },
   { fieldName: "投保职业", source: "产品核保数据", valueType: "short", extractable: true },
+  { fieldName: "核保方式", source: "人工填充", valueType: "short", extractable: false, valueHint: "智能核保、人工核保、智能+人工核保" },
   { fieldName: "轻中重症疾病种类", source: "保险责任", valueType: "short", extractable: true, valueHint: "轻症XX种，重症XX种" },
   { fieldName: "重疾赔付", source: "保险责任", valueType: "long", extractable: true },
   { fieldName: "运动达标涨保障", source: "保险责任", valueType: "short", extractable: true },
@@ -169,6 +176,7 @@ export const ACCIDENT_FIELDS: ProductField[] = [
   { fieldName: "不限社保", source: "人工填充", valueType: "short", extractable: true },
   { fieldName: "满期返还", source: "保险责任", valueType: "short", extractable: true },
   { fieldName: "生效时间", source: "产品条款", valueType: "short", extractable: true },
+  { fieldName: "高危职业", source: "根据投保职业推断", valueType: "short", extractable: false },
   { fieldName: "投保职业", source: "产品核保数据", valueType: "short", extractable: true },
   { fieldName: "住院津贴", source: "保险责任", valueType: "short", extractable: true },
   { fieldName: "综合意外", source: "保险责任", valueType: "short", extractable: true },

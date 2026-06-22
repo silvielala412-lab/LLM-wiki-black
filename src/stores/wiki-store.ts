@@ -1,5 +1,6 @@
 import { create } from "zustand"
 import type { WikiProject, FileNode } from "@/types/wiki"
+import { BAILIAN_OCR_MODEL, BAILIAN_VISION_ENDPOINT } from "@/lib/bailian-vision"
 
 /**
  * Wire protocol used when `provider === "custom"`. Other providers have a
@@ -61,9 +62,8 @@ interface EmbeddingConfig {
  * inline (with empty alt text) and the safety-net `## Embedded
  * Images` section still gets written, but we never touch the LLM.
  *
- * `useMainLlm`: when true (the default for first-time users we
- * onboard), captioning calls go through the same `llmConfig`
- * everything else uses. When false, the dedicated fields below are
+ * `useMainLlm`: when true, captioning calls go through the same
+ * `llmConfig` everything else uses. When false, the dedicated fields below are
  * sent through the same provider machinery — same `streamChat`,
  * same `getProviderConfig`, no duplicate code.
  *
@@ -229,14 +229,15 @@ export const useWikiStore = create<WikiState>((set) => ({
     // (one VLM call per extracted image), and silently turning it
     // on for every user the first time they import a PDF would be
     // a budget surprise. Users who want it flip the toggle in
-    // Settings → Image captioning.
+    // Settings > Multimodal. OCR can still use the dedicated vision
+    // endpoint below when a server/admin key is configured.
     enabled: false,
-    useMainLlm: true,
+    useMainLlm: false,
     provider: "custom",
     apiKey: "",
-    model: "",
+    model: BAILIAN_OCR_MODEL,
     ollamaUrl: "http://localhost:11434",
-    customEndpoint: "",
+    customEndpoint: BAILIAN_VISION_ENDPOINT,
     apiMode: "chat_completions",
     concurrency: 4,
   },

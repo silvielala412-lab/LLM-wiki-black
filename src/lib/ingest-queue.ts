@@ -45,7 +45,7 @@ let processedSinceDrain = false
 let sweepAbortController: AbortController | null = null
 /** Accumulates all entity titles written in this drain cycle for the deferred relation pass. */
 let sessionEntityTitles = new Set<string>()
-const PROCESSING_STALE_MS = 30 * 60 * 1000
+const PROCESSING_STALE_MS = 10 * 60 * 1000
 /** Heartbeat timer ID — polls processNext every 15s to self-recover from any stuck state. */
 let heartbeatTimer: ReturnType<typeof setInterval> | null = null
 /**
@@ -533,6 +533,10 @@ function retryDelayMs(message: string, retryCount: number): number {
   return Math.min(60_000, 5_000 * 2 ** Math.max(0, retryCount - 1))
 }
 
+function isPermanentIngestError(message: string): boolean {
+  return /(未找到可复用 OCR 缓存|PDF has no extractable text|pdftoppm|poppler-utils|OCR_ENDPOINT)/i.test(message)
+}
+
 function startProcessingWatchdog(projectId: string, taskId: string, startedAt: number, projectPath: string): void {
   globalThis.setTimeout(() => {
     if (currentProjectId !== projectId || activeCount === 0) return
@@ -739,6 +743,9 @@ async function processNext(projectId: string): Promise<void> {
       const message = err instanceof Error ? err.message : String(err)
       next.retryCount++
       next.error = message
+      if (isPermanentIngestError(message)) {
+        next.retryCount = MAX_RETRIES
+      }
 
       if (next.retryCount >= MAX_RETRIES) {
         next.status = "failed"

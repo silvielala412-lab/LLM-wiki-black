@@ -26,6 +26,205 @@ import {
 
 const log = getLogger("product-catalog-extractor")
 
+const EMPTY_FIELD_VALUE = ""
+
+function isMissingFieldValue(value: string | undefined | null): boolean {
+  const normalized = (value ?? "").trim()
+  return normalized === "" || normalized.startsWith("未明确")
+}
+
+const FIELD_EXTRACTION_HINTS: Record<string, Record<string, string>> = {
+  "疾病等待期": {
+    "意外豁免": "实际指全部“无等待期/等待期豁免情形”，不限于意外伤害；如原文列出多种情形，必须逐条完整列出，不要只取第 1 条。",
+    "等待期内发生理赔处理": "分别列出一般疾病、恶性肿瘤等不同情形下的处理结果，不要合并丢项。",
+  },
+}
+
+const FIELD_NAME_ALIASES: Record<string, string[]> = {
+  "意外豁免": ["无等待期情形", "等待期豁免情形", "无等待期/等待期豁免情形"],
+}
+
+const FIELD_EVIDENCE_KEYWORDS: Record<string, string[]> = {
+  "疾病等待期": ["等待期", "无等待期", "意外伤害", "重新投保", "上一保险期间", "届满", "60日", "指定", "审核同意", "恶性肿瘤", "合同终止", "返还", "不承担"],
+  "等待期天数": ["等待期", "30日", "天", "日"],
+  "适用疾病范围": ["疾病", "恶性肿瘤", "重度", "所有疾病", "一般疾病"],
+  "意外豁免": ["无等待期", "等待期豁免", "意外伤害", "重新投保", "上一保险期间", "届满", "60日", "指定", "审核同意"],
+  "等待期内发生理赔处理": ["等待期内", "不承担", "给付保险金", "恶性肿瘤", "返还", "合同终止", "一般疾病"],
+  "犹豫期": ["犹豫期", "退保", "解除合同", "扣除", "无息退还"],
+  "宽限期": ["宽限期", "60日", "逾期", "保险费"],
+  "投保年龄": ["投保年龄", "出生", "周岁", "最低", "最高"],
+}
+
+function uniqueStrings(items: Array<string | undefined | null>): string[] {
+  const seen = new Set<string>()
+  const result: string[] = []
+  for (const item of items) {
+    const normalized = (item ?? "").trim()
+    if (!normalized || seen.has(normalized)) continue
+    seen.add(normalized)
+    result.push(normalized)
+  }
+  return result
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+}
+
+function keywordsForField(
+  fieldName: string,
+  moduleName: string,
+  fieldHints?: Record<string, string>,
+): string[] {
+  const aliases = Object.entries(FIELD_NAME_ALIASES)
+    .filter(([canonical, names]) => fieldName === canonical || names.includes(fieldName))
+    .flatMap(([canonical, names]) => [canonical, ...names])
+
+  const hintText = fieldHints?.[fieldName] ?? ""
+  const hintKeywords = hintText.split(/[，；、。:：\s]+/).filter(part => part.length >= 2)
+
+  return uniqueStrings([
+    fieldName,
+    moduleName,
+    ...aliases,
+    ...(FIELD_EVIDENCE_KEYWORDS[moduleName] ?? []),
+    ...(FIELD_EVIDENCE_KEYWORDS[fieldName] ?? []),
+    ...hintKeywords,
+  ])
+}
+
+function chunkTextForEvidence(text: string): string[] {
+  const paragraphs = text
+    .split(/\n{2,}|(?=^#{1,6}\s+)/m)
+    .map(part => part.trim())
+    .filter(Boolean)
+  const parts = paragraphs.length > 0 ? paragraphs : [text.trim()]
+  const chunks: string[] = []
+  let current = ""
+
+  for (const part of parts) {
+    if (current && current.length + part.length + 2 > 1800) {
+      chunks.push(current)
+      current = part
+    } else {
+      current = current ? `${current}\n\n${part}` : part
+    }
+
+    while (current.length > 2400) {
+      chunks.push(current.slice(0, 2000))
+      current = current.slice(1800).trim()
+    }
+  }
+
+  if (current) chunks.push(current)
+  return chunks
+}
+
+function buildRefineSourceExcerpt(
+  sourceText: string,
+  moduleName: string,
+  targetFields: string[],
+  fieldHints?: Record<string, string>,
+  maxChars = 12000,
+): string {
+  const chunks = chunkTextForEvidence(sourceText)
+  const keywords = uniqueStrings([
+    moduleName,
+    ...targetFields.flatMap(field => keywordsForField(field, moduleName, fieldHints)),
+  ]).filter(keyword => keyword.length >= 2)
+
+  const scored = chunks.map((chunk, index) => {
+    let score = 0
+    for (const keyword of keywords) {
+      const matches = chunk.match(new RegExp(escapeRegExp(keyword), "g"))
+      if (!matches) continue
+      const isTargetField = targetFields.includes(keyword)
+      score += matches.length * (isTargetField ? 40 : 12) + Math.min(keyword.length, 12)
+    }
+    if (/(?:^|\n)\s*(?:\d+[.、]|[（(]\d+[）)]|[一二三四五六七八九十]+[、.])/.test(chunk)) {
+      score += 20
+    }
+    return { chunk, index, score }
+  })
+
+  const selected = new Set<number>()
+  let selectedLength = 0
+  for (const item of scored.sort((a, b) => b.score - a.score || a.index - b.index)) {
+    if (item.score <= 0) break
+    if (selectedLength + item.chunk.length > maxChars && selected.size > 0) continue
+    selected.add(item.index)
+    selectedLength += item.chunk.length
+    if (selectedLength >= maxChars) break
+  }
+
+  if (selected.size === 0) return sourceText.slice(0, maxChars)
+
+  return [...selected]
+    .sort((a, b) => a - b)
+    .map(index => chunks[index])
+    .join("\n\n---\n\n")
+    .slice(0, maxChars)
+}
+
+function resolveExistingFieldName(field: string, existingFields: Map<string, string>): string | null {
+  if (existingFields.has(field)) return field
+  for (const [canonical, aliases] of Object.entries(FIELD_NAME_ALIASES)) {
+    if (field === canonical || aliases.includes(field)) {
+      if (existingFields.has(canonical)) return canonical
+    }
+  }
+  for (const existing of existingFields.keys()) {
+    if (existing.includes(field) || field.includes(existing)) return existing
+  }
+  return null
+}
+
+function informationScore(value: string): number {
+  const normalized = value.trim()
+  if (!normalized) return 0
+  const listMarkers = (normalized.match(/(?:^|[;；。]\s*|\n)\s*(?:\d+[.、]|[（(]\d+[）)]|[一二三四五六七八九十]+[、.])/g) ?? []).length
+  const separators = (normalized.match(/[;；。]\s*/g) ?? []).length
+  const keywords = (normalized.match(/无等待期|重新投保|指定|期限|审核同意|意外伤害|合同终止|返还|不承担/g) ?? []).length
+  return normalized.length + listMarkers * 80 + separators * 20 + keywords * 30
+}
+
+function shouldReplaceFieldValue(
+  existing: string | undefined,
+  candidate: string,
+  moduleName?: string,
+  fieldName?: string,
+): boolean {
+  if (isMissingFieldValue(candidate)) return false
+  if (isMissingFieldValue(existing)) return true
+  const current = existing!.trim()
+  const next = candidate.trim()
+  if (current === next || current.includes(next)) return false
+  if (next.includes(current)) return true
+
+  const hinted = !!(moduleName && fieldName && FIELD_EXTRACTION_HINTS[moduleName]?.[fieldName])
+  const currentScore = informationScore(current)
+  const nextScore = informationScore(next)
+  return hinted
+    ? nextScore > currentScore + 30
+    : nextScore > currentScore * 1.35 && next.length > current.length + 12
+}
+
+function tableCell(value: string, maxLength = 120): string {
+  const normalized = value.replace(/\s+/g, " ").trim()
+  const clipped = normalized.length > maxLength
+    ? `${normalized.slice(0, maxLength)}...`
+    : normalized
+  return clipped.replace(/\|/g, "\\|")
+}
+
+function fieldScopeLabel(
+  fieldName: string,
+  baseFieldNames: Set<string>,
+  category: InsuranceCategoryType,
+): string {
+  return baseFieldNames.has(fieldName) ? "基础字段" : `${category}专属字段`
+}
+
 function cleanProductName(name: string): string {
   return name
     .replace(/[（(](?:保险条款|产品条款|产品说明书|投保须知|费率表|核保手册|理赔指南|服务手册|条款)[）)]/g, "")
@@ -47,16 +246,16 @@ interface SectionResult {
 
 // ── Section splitting ─────────────────────────────────────────────────────
 // 将 OCR 全文按标题结构切分成多个「文本块」(sections)。
-// ⚠️ sections ≠ 页数。一个 39 页的 PDF 经 OCR 后约 47000 字，
-// 按 targetChars=25000 切分后通常得到 ~55-65 个 sections。
-// 每个 section 约 700-900 字（带 500 字重叠）。
+// 目标：让每个 section 约 4000-8000 字（≈条款 2-5 页），
+// 一个 39 页 47000 字的 PDF 通常切成 ~8-12 个 sections。
+// 较大的 section 确保 LLM 能看到完整上下文（如免赔额引用附录、续保条款跨页等）。
 
 export function splitIntoSections(sourceContent: string): Chunk[] {
   return chunkMarkdown(sourceContent, {
-    targetChars: 25000,   // 目标每块字符数
-    maxChars: 40000,      // 单块最大字符数
-    minChars: 3000,       // 单块最小字符数（过小则合并上块）
-    overlapChars: 500,    // 相邻块重叠字符数（防止跨界信息丢失）
+    targetChars: 6000,    // 目标每块字符数（约 2-3 页条款）
+    maxChars: 12000,      // 单块最大字符数（约 5-6 页条款）
+    minChars: 1500,       // 单块最小字符数（过小则合并上块）
+    overlapChars: 300,    // 相邻块重叠字符数（防止跨界信息丢失）
   })
 }
 
@@ -125,8 +324,23 @@ function buildPrompt(
   const moduleList = modules.map(m => {
     const keyFields = MODULE_KEY_FIELDS[m.moduleName]
     const keyFieldStr = keyFields ? `\n     关键字段: ${keyFields.join("、")}` : ""
-    return `  - 「${m.moduleName}」${keyFieldStr}`
+    const hints = FIELD_EXTRACTION_HINTS[m.moduleName]
+    const hintStr = hints
+      ? `\n     字段提示: ${Object.entries(hints).map(([field, hint]) => `${field}=${hint}`).join("；")}`
+      : ""
+    return `  - 「${m.moduleName}」${keyFieldStr}${hintStr}`
   }).join("\n")
+
+  // Build enriched field list with hints for LLM
+  const productFields = PRODUCT_FIELDS[category] ?? []
+  const fieldListWithHints = productFields
+    .filter(f => f.extractable)
+    .map(f => {
+      let entry = f.fieldName
+      if (f.valueHint) entry += `（如：${f.valueHint}）`
+      if (f.valueType === "long") entry += ` [长文本]`
+      return entry
+    }).join("、")
 
   const exampleModule = `---MODULE: 年度免赔额---
 ## 关键字段
@@ -149,6 +363,14 @@ function buildPrompt(
     "## 目标模块（含关键字段提示）",
     moduleList,
     "",
+    "## 产品字段总表（可自动抽取字段，含格式提示）",
+    fieldListWithHints,
+    "",
+    "## 特别注意：以下业务字段如在本章节出现，必须额外添加到 \`产品基础信息\` 模块",
+    "主附加险、交费方式、交费期限、宽限期、保证续保、保证续保期、补偿原则、不限社保、",
+    "报销比例、免赔额、额度类型、费率可调、报销门诊住院范围",
+    "（哪怕当前章节主题不是基础信息，只要提到了上述字段的值，就要同时输出一个 产品基础信息 模块）",
+    "",
     "## 输出格式（每个模块只需输出表格，禁止摘抄原文）",
     "",
     "```",
@@ -157,10 +379,13 @@ function buildPrompt(
     "",
     "## 关键规则",
     "1. **只需要输出表格**：不需要摘抄原文，只需输出 \`## 关键字段\` 表格即可（原文将由系统自动追加）。",
-    "2. **关键字段**：从文档中找到对应值填入表格，找不到的字段填「未明确」。",
+    "2. **关键字段**：从文档中找到对应值填入表格，找不到的字段保留字段行，值留空。",
     "3. **多模块归属**：同一段内容可以同时归属多个模块（各模块都单独输出表格）。",
     "4. **空模块不输出**：本章节完全没有相关内容的模块直接跳过，不要输出空块。",
-    "5. **关键字段表格只提炼核心值**，不要在表格里写长文本。",
+    "5. **取值来源不作为跳过理由**：即使字段在业务表里标过人工填充，只要原文明确出现，也要抽取；原文没有就留空。",
+    "6. **枚举型规则必须完整**：若原文用 1/2/3 或分号列出多个条件、责任、例外或处理方式，必须全部列出，可用分号压缩，但不能只取第一条。",
+    "7. **关键字段表格提炼核心值**：短字段保持简洁；规则型字段可用分号完整列举必要条件。",
+    "8. **长文本字段**：标有 [长文本] 的字段，值可以较长（100-300字），概括原文核心内容，不要只写一句话。",
   ].join("\n")
 }
 
@@ -322,7 +547,7 @@ function parseKeyFieldsTable(markdown: string): Map<string, string> {
 
   const tableBlock = keyFieldsMatch[0]
   // Parse each table row: | fieldName | value |
-  const rowRegex = /^\|\s*(.+?)\s*\|\s*(.+?)\s*\|$/gm
+  const rowRegex = /^\|\s*([^|]+?)\s*\|\s*([^|]*?)\s*\|$/gm
   let row: RegExpExecArray | null
   while ((row = rowRegex.exec(tableBlock)) !== null) {
     const field = row[1].trim()
@@ -344,10 +569,10 @@ function extractDetailContent(markdown: string): string {
 
 /**
  * Merge multiple fragments' key-fields tables:
- * for each field, take the first non-"未明确" value.
+ * for each field, take the first non-empty value.
  * Returns a single merged Markdown table + concatenated detail content.
  */
-function mergeFragmentContents(contents: string[], sectionIndices: number[]): string {
+function mergeFragmentContents(contents: string[], sectionIndices: number[], moduleName?: string): string {
   // 1. Collect all field tables and merge
   const mergedFields = new Map<string, string>()
   const fieldOrder: string[] = []
@@ -358,8 +583,8 @@ function mergeFragmentContents(contents: string[], sectionIndices: number[]): st
       if (!mergedFields.has(field)) {
         mergedFields.set(field, value)
         fieldOrder.push(field)
-      } else if (mergedFields.get(field) === "未明确" && value !== "未明确") {
-        // Upgrade from "未明确" to a real value
+      } else if (shouldReplaceFieldValue(mergedFields.get(field), value, moduleName, field)) {
+        // Upgrade from an empty or less-informative value to a better value.
         mergedFields.set(field, value)
       }
     }
@@ -387,7 +612,7 @@ function mergeFragmentContents(contents: string[], sectionIndices: number[]): st
     lines.push("| 字段 | 值 |")
     lines.push("|---|---|")
     for (const field of fieldOrder) {
-      lines.push(`| ${field} | ${mergedFields.get(field) ?? "未明确"} |`)
+      lines.push(`| ${field} | ${mergedFields.get(field) ?? EMPTY_FIELD_VALUE} |`)
     }
     lines.push("")
   }
@@ -434,7 +659,7 @@ function buildModuleFile(
   lines.push("")
 
   // Use field-level merge instead of raw concatenation
-  lines.push(mergeFragmentContents(m.contents, m.sectionIndices))
+  lines.push(mergeFragmentContents(m.contents, m.sectionIndices, m.moduleName))
 
   return lines.join("\n")
 }
@@ -476,14 +701,14 @@ function buildMainFile(
   // Pull short-field values from all modules using best-value merge logic
 
   // Build a lookup: fieldName → best extracted value
-  // Uses the same best-value logic as mergeFragmentContents: take first non-"未明确" value
+  // Uses the same best-value logic as mergeFragmentContents: take first non-empty value
   const basicInfoModule = mergedModules.get("产品基础信息")
   const shortFieldLookup = new Map<string, string>()
   if (basicInfoModule && basicInfoModule.found) {
     for (const content of basicInfoModule.contents) {
       const fields = parseKeyFieldsTable(content)
       for (const [field, value] of fields) {
-        if (!shortFieldLookup.has(field) || (shortFieldLookup.get(field) === "未明确" && value !== "未明确")) {
+        if (!shortFieldLookup.has(field) || shouldReplaceFieldValue(shortFieldLookup.get(field), value, "产品基础信息", field)) {
           shortFieldLookup.set(field, value)
         }
       }
@@ -495,7 +720,7 @@ function buildMainFile(
     for (const content of m.contents) {
       const fields = parseKeyFieldsTable(content)
       for (const [field, value] of fields) {
-        if (value !== "未明确" && (!shortFieldLookup.has(field) || shortFieldLookup.get(field) === "未明确")) {
+        if (!isMissingFieldValue(value) && (!shortFieldLookup.has(field) || shouldReplaceFieldValue(shortFieldLookup.get(field), value, m.moduleName, field))) {
           shortFieldLookup.set(field, value)
         }
       }
@@ -507,15 +732,76 @@ function buildMainFile(
   // a schema field name as a substring.
   const schemaFields = PRODUCT_FIELDS[category] ?? []
   for (const sf of schemaFields) {
-    if (sf.valueType !== "short") continue
-    if (shortFieldLookup.has(sf.fieldName) && shortFieldLookup.get(sf.fieldName) !== "未明确") continue
+    if (shortFieldLookup.has(sf.fieldName) && !isMissingFieldValue(shortFieldLookup.get(sf.fieldName))) continue
     // Try to find a match in shortFieldLookup where the extracted name contains this schema name
     for (const [extractedName, extractedValue] of shortFieldLookup) {
-      if (extractedValue === "未明确") continue
+      if (isMissingFieldValue(extractedValue)) continue
       if (extractedName.includes(sf.fieldName) || sf.fieldName.includes(extractedName)) {
         shortFieldLookup.set(sf.fieldName, extractedValue)
         break
       }
+    }
+  }
+
+  // ── Auto-bridge: fill main file fields from dedicated module key-fields ──
+  // e.g. 犹豫期 module has 犹豫期天数=15日 → main file 犹豫期=15日
+  const MODULE_TO_FIELD_BRIDGE: Record<string, Record<string, string>> = {
+    "犹豫期": { "犹豫期天数": "犹豫期", "犹豫期退保处理": "犹豫期及合同解除（退保）" },
+    "疾病等待期": { "等待期天数": "等待期" },
+    "投保年龄": { "最低投保年龄": "投保年龄", "最高投保年龄": "投保年龄" },
+    "年度免赔额": { "免赔额金额（有社保）": "免赔额", "免赔额类型": "0免赔" },
+    "社保后赔付比例": { "报销比例": "报销比例" },
+    "无社保赔付比例": { "报销比例": "报销比例" },
+    "一般住院医疗": { "适用医院范围": "医院范围", "给付限额": "给付限额", "给付比例": "报销比例", "免赔额": "免赔额" },
+    "投保职业": { "可投职业类别": "投保职业" },
+    "投保人群": { "投保人与被保人关系要求": "投保范围" },
+    "6年保证续保": { "保证续保": "保证续保", "保证续保期": "保证续保期" },
+    "退保": { "犹豫期退保处理": "犹豫期及合同解除（退保）" },
+  }
+  for (const [moduleName, fieldMap] of Object.entries(MODULE_TO_FIELD_BRIDGE)) {
+    const mod = mergedModules.get(moduleName)
+    if (!mod || !mod.found) continue
+    for (const content of mod.contents) {
+      const fields = parseKeyFieldsTable(content)
+      for (const [moduleFieldName, mainFieldName] of Object.entries(fieldMap)) {
+        const val = fields.get(moduleFieldName)
+        if (!val || isMissingFieldValue(val)) continue
+        if (!shortFieldLookup.has(mainFieldName) || isMissingFieldValue(shortFieldLookup.get(mainFieldName))) {
+          shortFieldLookup.set(mainFieldName, val)
+        }
+      }
+    }
+  }
+
+  // ── Auto-fill long text fields from module source text ──
+  // For long text fields like 保什么, 报销范围 etc., synthesize from module contents
+  const LONG_FIELD_MODULE_MAP: Record<string, string[]> = {
+    "保什么": ["一般住院医疗", "重大疾病医疗", "特殊门诊医疗", "质子重离子医疗", "恶性肿瘤赴日医疗", "院外特定药品"],
+    "报销范围": ["一般住院医疗", "住院前后门急诊", "特殊门诊医疗", "门诊手术医疗"],
+    "投保范围": ["投保年龄", "投保人群", "投保职业"],
+    "保险期间和续保": ["6年保证续保"],
+    "犹豫期及合同解除（退保）": ["犹豫期", "退保"],
+  }
+  for (const [fieldName, moduleNames] of Object.entries(LONG_FIELD_MODULE_MAP)) {
+    if (shortFieldLookup.has(fieldName) && !isMissingFieldValue(shortFieldLookup.get(fieldName))) continue
+    const parts: string[] = []
+    for (const mn of moduleNames) {
+      const mod = mergedModules.get(mn)
+      if (!mod || !mod.found) continue
+      for (const content of mod.contents) {
+        const fields = parseKeyFieldsTable(content)
+        // Collect all non-empty field values from this module as a summary
+        const vals: string[] = []
+        for (const [k, v] of fields) {
+          if (!isMissingFieldValue(v) && k !== "字段" && !k.startsWith("--")) {
+            vals.push(`${k}: ${v}`)
+          }
+        }
+        if (vals.length > 0) parts.push(`【${mn}】${vals.join("；")}`)
+      }
+    }
+    if (parts.length > 0) {
+      shortFieldLookup.set(fieldName, parts.join(" | "))
     }
   }
 
@@ -530,7 +816,7 @@ function buildMainFile(
   lines.push("| 字段 | 值 |")
   lines.push("|---|---|")
   for (const f of shortBaseFields) {
-    const val = shortFieldLookup.get(f.fieldName) ?? "未明确"
+    const val = shortFieldLookup.get(f.fieldName) ?? EMPTY_FIELD_VALUE
     lines.push(`| ${f.fieldName} | ${val.replace(/\n/g, " ").replace(/\|/g, "\\|")} |`)
   }
   lines.push("")
@@ -543,14 +829,28 @@ function buildMainFile(
     lines.push("| 字段 | 值 |")
     lines.push("|---|---|")
     for (const f of shortCatFields) {
-      const val = shortFieldLookup.get(f.fieldName) ?? "未明确"
+      const val = shortFieldLookup.get(f.fieldName) ?? EMPTY_FIELD_VALUE
       lines.push(`| ${f.fieldName} | ${val.replace(/\n/g, " ").replace(/\|/g, "\\|")} |`)
     }
     lines.push("")
   }
 
+  // ── Section 3: Long business fields from Excel schema ────────────────
+  const longFields = allFields.filter(f => f.valueType === "long")
+  if (longFields.length > 0) {
+    lines.push("## 长文本字段")
+    lines.push("")
+    lines.push("| 字段 | 值 |")
+    lines.push("|---|---|")
+    for (const f of longFields) {
+      const val = shortFieldLookup.get(f.fieldName) ?? EMPTY_FIELD_VALUE
+      lines.push(`| ${f.fieldName} | ${val.replace(/\n/g, "<br>").replace(/\|/g, "\\|")} |`)
+    }
+    lines.push("")
+  }
 
-  // ── Section 3+: long fields inline ──────────────────────────
+
+  // ── Section 4+: long fields inline ──────────────────────────
   // Fields like 产品简介、产品特色、保单权益 are rendered inline in the main file
   // because they're short enough to include directly. Long clause texts (责任免除 etc)
   // are referenced by link to their dedicated module file.
@@ -583,6 +883,64 @@ function buildMainFile(
   // ── Section: 模块索引 ─────────────────────────────────────────
   const found = allModules.filter(m => mergedModules.get(m.moduleName)?.found)
   const missing = allModules.filter(m => !mergedModules.get(m.moduleName)?.found)
+  const knownFields = allFields
+    .map(f => ({ field: f, value: shortFieldLookup.get(f.fieldName) ?? EMPTY_FIELD_VALUE }))
+    .filter(item => !isMissingFieldValue(item.value))
+  const gapFields = allFields
+    .map(f => ({ field: f, value: shortFieldLookup.get(f.fieldName) ?? EMPTY_FIELD_VALUE }))
+    .filter(item => isMissingFieldValue(item.value))
+
+  lines.push("## 已有知识清单")
+  lines.push("")
+  lines.push("### 已有字段")
+  lines.push("")
+  if (knownFields.length > 0) {
+    lines.push("| 字段范围 | 字段 | 当前值摘要 |")
+    lines.push("|---|---|---|")
+    for (const item of knownFields) {
+      lines.push(`| ${fieldScopeLabel(item.field.fieldName, baseFieldNames, category)} | ${item.field.fieldName} | ${tableCell(item.value)} |`)
+    }
+  } else {
+    lines.push("- 暂无已抽取字段。")
+  }
+  lines.push("")
+  lines.push("### 已有模块")
+  lines.push("")
+  if (found.length > 0) {
+    for (const m of found) {
+      const merged = mergedModules.get(m.moduleName)!
+      const totalChars = merged.contents.reduce((s, c) => s + c.length, 0)
+      lines.push(`- **${m.moduleName}**：${totalChars} 字，覆盖 ${merged.sectionIndices.length} 个章节。`)
+    }
+  } else {
+    lines.push("- 暂无已抽取模块。")
+  }
+  lines.push("")
+
+  lines.push("## 知识缺口清单")
+  lines.push("")
+  lines.push("### 缺失字段")
+  lines.push("")
+  if (gapFields.length > 0) {
+    lines.push("| 字段范围 | 字段 | 类型 |")
+    lines.push("|---|---|---|")
+    for (const item of gapFields) {
+      lines.push(`| ${fieldScopeLabel(item.field.fieldName, baseFieldNames, category)} | ${item.field.fieldName} | ${item.field.valueType === "long" ? "长文本" : "短字段"} |`)
+    }
+  } else {
+    lines.push("- 字段层面暂无缺口。")
+  }
+  lines.push("")
+  lines.push("### 缺失模块")
+  lines.push("")
+  if (missing.length > 0) {
+    for (const m of missing) {
+      lines.push(`- [ ] **${m.moduleName}** (${m.required ? "必填" : "选填"})`)
+    }
+  } else {
+    lines.push("- 模块层面暂无缺口。")
+  }
+  lines.push("")
 
   lines.push("## 已抽取模块")
   lines.push("")
@@ -675,7 +1033,7 @@ export async function runProductCatalogExtraction(
   // relevant keywords. This avoids wasting LLM calls on sections
   // with no relevant content for that group.
   const GROUP_KEYWORDS: Record<ModuleGroup, RegExp | null> = {
-    basic_info: /险种|产品|保险期|交费|保障期|投保|承保|年龄|简称|代码|主险|附加|公司|计划/,
+    basic_info: /险种|产品|保险期|保险期间|交费|保障期|保障期间|投保|承保|年龄|简称|代码|主险|附加|公司|计划|等待期|无等待期|犹豫期|宽限期|豁免|重新投保|届满|合同解除|退保/,
     coverage: null,  // coverage scans ALL sections (main content, most widely distributed)
     cost_rules: /免赔|费率|保费|费用|赔付|比例|限额|给付|计算|上浮|社保/,
     exclusion_uw: /免除|免责|除外|既往|告知|核保|拒保|加费|延期|健康/,
@@ -693,52 +1051,75 @@ export async function runProductCatalogExtraction(
 
   const sectionResults: SectionResult[] = []
   let totalCalls = 0
+  const extractionStartTime = Date.now()
+  let completedGroups = 0
+  const totalGroups = [...groupMap.keys()].length
 
-  for (const groupKey of GROUP_ORDER) {
-    if (signal?.aborted) break
-    const groupModules = groupMap.get(groupKey)
-    if (!groupModules || groupModules.length === 0) continue
-
-    const isDiseaseGroup = groupKey === "disease_definition"
-    const keywordFilter = GROUP_KEYWORDS[groupKey]
-
-    // Filter sections by keyword relevance for this group
-    const relevantSections = keywordFilter
-      ? sections
-          .map((s, idx) => ({ ...s, originalIndex: idx }))
-          .filter(s => keywordFilter.test(s.text))
-      : sections.map((s, idx) => ({ ...s, originalIndex: idx }))
-
-    if (relevantSections.length === 0) {
-      log.info("group skipped (no relevant sections)", { group: groupKey })
-      continue
-    }
-
+  // Heartbeat: update activity panel every 5 seconds so the UI doesn't look frozen
+  let heartbeatDetail = ""
+  const heartbeatTimer = setInterval(() => {
+    const elapsed = Math.round((Date.now() - extractionStartTime) / 1000)
+    const min = Math.floor(elapsed / 60)
+    const sec = elapsed % 60
+    const timeStr = min > 0 ? `${min}分${sec}秒` : `${sec}秒`
     activity.updateItem(activityId, {
-      detail: `[${groupKey}] ${relevantSections.length}/${sections.length} 个相关章节，${groupModules.length} 个模块...`,
+      detail: `${heartbeatDetail}（已耗时 ${timeStr}）`,
     })
+  }, 5000)
 
-    // Process chunks in batches to avoid overwhelming the internal model.
-    for (let i = 0; i < relevantSections.length; i += MAX_SECTION_PARALLEL) {
+  try {
+    for (const groupKey of GROUP_ORDER) {
       if (signal?.aborted) break
-      const batch = relevantSections.slice(i, i + MAX_SECTION_PARALLEL)
+      const groupModules = groupMap.get(groupKey)
+      if (!groupModules || groupModules.length === 0) continue
+
+      const isDiseaseGroup = groupKey === "disease_definition"
+      const keywordFilter = GROUP_KEYWORDS[groupKey]
+
+      // Filter sections by keyword relevance for this group
+      const relevantSections = keywordFilter
+        ? sections
+            .map((s, idx) => ({ ...s, originalIndex: idx }))
+            .filter(s => keywordFilter.test(s.text))
+        : sections.map((s, idx) => ({ ...s, originalIndex: idx }))
+
+      if (relevantSections.length === 0) {
+        log.info("group skipped (no relevant sections)", { group: groupKey })
+        continue
+      }
+
+      completedGroups++
+      heartbeatDetail = `[${completedGroups}/${totalGroups}] ${groupKey}: ${relevantSections.length}/${sections.length} 个相关章节，${groupModules.length} 个模块`
       activity.updateItem(activityId, {
-        detail: `[${groupKey}] 章节 ${Math.min(i + MAX_SECTION_PARALLEL, relevantSections.length)}/${relevantSections.length}（总${sections.length}），模块数 ${groupModules.length}...`,
+        detail: `${heartbeatDetail}...`,
       })
-      const batchPromises = batch.map((section) =>
-        extractFromSection(
-          section.text, section.originalIndex, section.headingPath,
-          sections.length, groupModules,
-          category, productName, llmConfig, activityId, signal,
-          isDiseaseGroup ? { temperature: 0.1, max_tokens: 16000 } : undefined,
+
+      // Process chunks in batches to avoid overwhelming the internal model.
+      for (let i = 0; i < relevantSections.length; i += MAX_SECTION_PARALLEL) {
+        if (signal?.aborted) break
+        const batch = relevantSections.slice(i, i + MAX_SECTION_PARALLEL)
+        const batchEnd = Math.min(i + MAX_SECTION_PARALLEL, relevantSections.length)
+        heartbeatDetail = `[${completedGroups}/${totalGroups}] ${groupKey}: 章节 ${batchEnd}/${relevantSections.length}，模块 ${groupModules.length} 个`
+        activity.updateItem(activityId, {
+          detail: `${heartbeatDetail}...`,
+        })
+        const batchPromises = batch.map((section) =>
+          extractFromSection(
+            section.text, section.originalIndex, section.headingPath,
+            sections.length, groupModules,
+            category, productName, llmConfig, activityId, signal,
+            isDiseaseGroup ? { temperature: 0.1, max_tokens: 16000 } : undefined,
+          )
         )
-      )
-      totalCalls += batch.length
-      const batchResults = await Promise.allSettled(batchPromises)
-      for (const r of batchResults) {
-        if (r.status === "fulfilled") sectionResults.push(r.value)
+        totalCalls += batch.length
+        const batchResults = await Promise.allSettled(batchPromises)
+        for (const r of batchResults) {
+          if (r.status === "fulfilled") sectionResults.push(r.value)
+        }
       }
     }
+  } finally {
+    clearInterval(heartbeatTimer)
   }
 
   // totalCalls     = 实际发送给 LLM 的请求总数
@@ -839,20 +1220,13 @@ export async function runProductCatalogExtraction(
     log.warn("failed to save OCR source text", { error: String(err) })
   }
 
-  // ── Phase 5: Module Refinement ────────────────────────────────────────
-  // 对每个模块的「详细条款原文」做二次精炼，补充关键字段中的「未明确」值。
-  activity.updateItem(activityId, { detail: "Phase 5: 正在精炼模块关键字段..." })
-  try {
-    const refineResult = await refineModuleFiles(
-      projectPath, category, productName, llmConfig, activityId, signal,
-    )
-    log.info("模块精炼完成", refineResult)
-  } catch (err) {
-    log.warn("模块精炼失败，不影响已有结果", { error: String(err) })
-  }
+  log.info("initial extraction complete; refinement is manual", {
+    foundModules: foundModules.length,
+    filesWritten: writtenPaths.length,
+  })
 
   activity.updateItem(activityId, {
-    detail: `完成：${foundModules.length}/${allModules.length} 个模块，${writtenPaths.length} 个文件。`,
+    detail: `完成：${foundModules.length}/${allModules.length} 个模块，${writtenPaths.length} 个文件。已保留原文，可点击“精炼”补抽缺口。`,
   })
 
   return writtenPaths
@@ -862,7 +1236,7 @@ export async function runProductCatalogExtraction(
 // Phase 5 — Module Refinement (二次精炼)
 //
 // 对每个模块文件的「详细条款原文」做聚焦式 LLM 调用，
-// 补充首次抽取中遗漏（标记为「未明确」）的关键字段。
+// 补充首次抽取中遗漏（值为空）的关键字段。
 // 并发数 10，每次只发几百字原文 + 字段列表。
 // ════════════════════════════════════════════════════════════════
 
@@ -873,6 +1247,7 @@ interface RefineResult {
   refined: number
   fieldsUpdated: number
   skipped: number
+  mainFilesRebuilt: number
 }
 
 /**
@@ -896,7 +1271,7 @@ async function refineSingleModule(
   const content = await readFile(filePath)
 
   // Parse frontmatter
-  const fmMatch = content.match(/^---\n([\s\S]*?)\n---/)
+  const fmMatch = content.match(/^---\r?\n([\s\S]*?)\r?\n---/)
   if (!fmMatch) {
     log.info("refine skip", { file: fileName, reason: "no frontmatter", contentStart: content.substring(0, 50) })
     return 0
@@ -920,15 +1295,25 @@ async function refineSingleModule(
     keyFields = [...existingPairs.keys()]
   }
 
-  // Check if there are any "未明确" fields to fill
+  // Check if there are any empty/missing fields to fill
   const existingFields = parseKeyFieldsTable(content)
   let needsRefinement = false
-  const unmingqueFields: string[] = []
+  const targetFields: string[] = []
   for (const [k, v] of existingFields) {
-    if (v === "未明确") { needsRefinement = true; unmingqueFields.push(k) }
+    if (isMissingFieldValue(v)) { needsRefinement = true; targetFields.push(k) }
+  }
+  const fieldHints = FIELD_EXTRACTION_HINTS[moduleName]
+  if (fieldHints) {
+    for (const hintedField of Object.keys(fieldHints)) {
+      const existingName = resolveExistingFieldName(hintedField, existingFields)
+      if (existingName && !targetFields.includes(existingName)) {
+        needsRefinement = true
+        targetFields.push(existingName)
+      }
+    }
   }
   if (!needsRefinement) {
-    log.info("refine skip", { file: fileName, reason: "no 未明确 fields", moduleName, fieldsCount: existingFields.size })
+    log.info("refine skip", { file: fileName, reason: "no empty fields", moduleName, fieldsCount: existingFields.size })
     return 0
   }
 
@@ -939,17 +1324,32 @@ async function refineSingleModule(
     return 0
   }
 
-  log.info("refine calling LLM", { file: fileName, moduleName, unmingqueCount: unmingqueFields.length, srcLen: sourceText.length })
+  const sourceExcerpt = buildRefineSourceExcerpt(sourceText, moduleName, targetFields, fieldHints)
+  log.info("refine calling LLM", {
+    file: fileName,
+    moduleName,
+    targetCount: targetFields.length,
+    srcLen: sourceText.length,
+    excerptLen: sourceExcerpt.length,
+  })
 
   // Build focused prompt
-  const fieldList = keyFields.map(f => `- ${f}`).join("\n")
-  const prompt = `你是保险条款分析专家。请从以下原文中提取关键字段。
+  const fieldList = targetFields.map(f => `- ${f}`).join("\n")
+  const fieldHintBlock = fieldHints
+    ? [
+        "",
+        "## 字段特别说明",
+        ...Object.entries(fieldHints).map(([field, hint]) => `- ${field}: ${hint}`),
+      ].join("\n")
+    : ""
+  const prompt = `你是保险条款分析专家。请从以下证据片段中提取关键字段。
 
 ## 需要提取的字段
 ${fieldList}
+${fieldHintBlock}
 
-## 原文
-${sourceText.substring(0, 8000)}
+## 证据片段
+${sourceExcerpt}
 
 ## 输出要求
 请输出 Markdown 表格，格式如下：
@@ -958,9 +1358,10 @@ ${sourceText.substring(0, 8000)}
 | 字段名 | 提取到的值 |
 
 规则：
-- 只输出在原文中明确找到的字段
-- 如果原文没有提到某字段，不要输出该行
-- 不要输出"未明确"，只输出有实际值的行
+- 只输出“需要提取的字段”中在证据片段里明确找到的字段
+- 如果证据片段没有提到某字段，不要输出该行
+- 不要输出空值或"未明确"，只输出有实际值的行
+- 若原文用编号列出多种情形，必须完整列出所有编号情形，不要只输出第一条
 - 值要简洁准确`
 
   // Call LLM via callback-based streamChat
@@ -987,7 +1388,7 @@ ${sourceText.substring(0, 8000)}
 
   // Parse LLM response: extract table rows directly (no section header required)
   const newFields = new Map<string, string>()
-  const rowRegex = /^\|\s*(.+?)\s*\|\s*(.+?)\s*\|$/gm
+  const rowRegex = /^\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|$/gm
   let rowMatch: RegExpExecArray | null
   while ((rowMatch = rowRegex.exec(response)) !== null) {
     const field = rowMatch[1].trim()
@@ -1003,21 +1404,26 @@ ${sourceText.substring(0, 8000)}
   })
   if (newFields.size === 0) return 0
 
-  // Merge: replace rows where value starts with "未明确" (may have suffix like "（见计划）")
+  // Merge: replace rows where value is empty or starts with "未明确".
   let updatedCount = 0
   let updatedContent = content
 
   for (const [field, newValue] of newFields) {
-    if (!newValue || newValue.startsWith("未明确")) continue
-    // Match row: | field | 未明确... | (with optional suffix after 未明确)
-    const escapedField = field.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-    const rowRegex = new RegExp(`\\|\\s*${escapedField}\\s*\\|\\s*未明确[^|]*\\|`, "g")
+    if (isMissingFieldValue(newValue)) continue
+    const existingFieldName = resolveExistingFieldName(field, existingFields)
+    if (!existingFieldName) continue
+    if (!shouldReplaceFieldValue(existingFields.get(existingFieldName), newValue, moduleName, existingFieldName)) continue
+
+    // Match row: | field | existing value |
+    const escapedField = escapeRegExp(existingFieldName)
+    const rowRegex = new RegExp(`\\|\\s*${escapedField}\\s*\\|\\s*[^|]*\\|`, "g")
     if (rowRegex.test(updatedContent)) {
       updatedContent = updatedContent.replace(
-        new RegExp(`\\|\\s*${escapedField}\\s*\\|\\s*未明确[^|]*\\|`, "g"),
-        `| ${field} | ${newValue} |`
+        new RegExp(`\\|\\s*${escapedField}\\s*\\|\\s*[^|]*\\|`, "g"),
+        `| ${existingFieldName} | ${newValue} |`
       )
       updatedCount++
+      existingFields.set(existingFieldName, newValue)
     }
   }
 
@@ -1028,11 +1434,152 @@ ${sourceText.substring(0, 8000)}
   return updatedCount
 }
 
+type CatalogFileEntry = { name: string; path: string; is_dir: boolean }
+
+interface CatalogModuleMetadata {
+  category: InsuranceCategoryType
+  productName: string
+  moduleName: string
+  sourceSections: number
+}
+
+function frontmatterValue(content: string, key: string): string | null {
+  const fmMatch = content.match(/^---\r?\n([\s\S]*?)\r?\n---/)
+  if (!fmMatch) return null
+  const pattern = new RegExp(`^${escapeRegExp(key)}:\\s*(?:"([^"]*)"|'([^']*)'|([^\\n#]*))\\s*$`, "m")
+  const match = fmMatch[1].match(pattern)
+  return (match?.[1] ?? match?.[2] ?? match?.[3] ?? "").trim() || null
+}
+
+function isInsuranceCategory(value: string | null | undefined): value is InsuranceCategoryType {
+  return !!value && Object.prototype.hasOwnProperty.call(PRODUCT_CATALOG_MODULES, value)
+}
+
+function parseCatalogModuleMetadata(content: string): CatalogModuleMetadata | null {
+  const categoryValue = frontmatterValue(content, "insurance_category")
+  const productName = frontmatterValue(content, "product_name")
+  const moduleName = frontmatterValue(content, "module_name")
+  if (!isInsuranceCategory(categoryValue) || !productName || !moduleName) return null
+
+  const sourceSectionsValue = Number.parseInt(frontmatterValue(content, "source_sections") ?? "1", 10)
+  return {
+    category: categoryValue,
+    productName,
+    moduleName,
+    sourceSections: Number.isFinite(sourceSectionsValue) && sourceSectionsValue > 0 ? sourceSectionsValue : 1,
+  }
+}
+
+async function filterModuleFiles(
+  files: CatalogFileEntry[],
+  scope?: { category?: string; productName?: string },
+): Promise<CatalogFileEntry[]> {
+  const moduleFiles: CatalogFileEntry[] = []
+  for (const file of files) {
+    try {
+      const content = await readFile(file.path)
+      const metadata = parseCatalogModuleMetadata(content)
+      if (!metadata) continue
+      if (scope?.category && metadata.category !== scope.category) continue
+      if (scope?.productName && metadata.productName !== scope.productName) continue
+      moduleFiles.push(file)
+    } catch (err) {
+      log.warn("failed to inspect catalog module file", { file: file.name, error: String(err) })
+    }
+  }
+  return moduleFiles
+}
+
+async function rebuildMainFilesFromModules(
+  catalogDir: string,
+  scope?: { category?: string; productName?: string },
+): Promise<number> {
+  const tree = (await listDirectory(catalogDir)) as CatalogFileEntry[]
+  const files = tree.filter(f => !f.is_dir && f.name?.endsWith(".md"))
+  const groups = new Map<string, {
+    category: InsuranceCategoryType
+    productName: string
+    sectionCount: number
+    modules: Map<string, MergedModule>
+  }>()
+
+  for (const file of files) {
+    let content = ""
+    try {
+      content = await readFile(file.path)
+    } catch (err) {
+      log.warn("failed to read catalog module while rebuilding main file", { file: file.name, error: String(err) })
+      continue
+    }
+
+    const metadata = parseCatalogModuleMetadata(content)
+    if (!metadata) continue
+    if (scope?.category && metadata.category !== scope.category) continue
+    if (scope?.productName && metadata.productName !== scope.productName) continue
+
+    const key = `${metadata.category}\0${metadata.productName}`
+    let group = groups.get(key)
+    if (!group) {
+      group = {
+        category: metadata.category,
+        productName: metadata.productName,
+        sectionCount: metadata.sourceSections,
+        modules: new Map<string, MergedModule>(),
+      }
+      groups.set(key, group)
+    }
+
+    group.sectionCount = Math.max(group.sectionCount, metadata.sourceSections)
+    const existing = group.modules.get(metadata.moduleName)
+    if (existing) {
+      existing.contents.push(content)
+      existing.sectionIndices.push(existing.sectionIndices.length)
+      existing.found = true
+    } else {
+      group.modules.set(metadata.moduleName, {
+        moduleName: metadata.moduleName,
+        contents: [content],
+        sectionIndices: [0],
+        found: true,
+      })
+    }
+  }
+
+  let rebuilt = 0
+  for (const group of groups.values()) {
+    const allModules = PRODUCT_CATALOG_MODULES[group.category]
+    const merged = new Map<string, MergedModule>()
+    for (const moduleDef of allModules) {
+      merged.set(moduleDef.moduleName, {
+        moduleName: moduleDef.moduleName,
+        contents: [],
+        sectionIndices: [],
+        found: false,
+      })
+    }
+    for (const [moduleName, moduleData] of group.modules) {
+      merged.set(moduleName, moduleData)
+    }
+
+    const mainContent = buildMainFile(
+      merged,
+      group.category,
+      group.productName,
+      Math.max(group.sectionCount, 1),
+      allModules,
+    )
+    await writeFile(`${catalogDir}/${group.category}-${group.productName}.md`, mainContent)
+    rebuilt++
+  }
+
+  return rebuilt
+}
+
 /**
  * 对指定产品的所有模块文件做精炼。
- * 在 runProductCatalogExtraction 的 Phase 5 中自动调用。
+ * 可用于手动补抽某个产品，并在结束后刷新产品主文件。
  */
-async function refineModuleFiles(
+export async function refineModuleFiles(
   projectPath: string,
   category: string,
   productName: string,
@@ -1044,12 +1591,13 @@ async function refineModuleFiles(
   const catalogDir = `${pp}/wiki/product_catalog`
   const prefix = `${category}-${productName}-`
 
-  let files: Array<{ name: string; path: string; is_dir: boolean }> = []
+  let files: CatalogFileEntry[] = []
   try {
-    const tree = (await listDirectory(catalogDir)) as Array<{ name: string; path: string; is_dir: boolean }>
-    files = tree.filter(f => !f.is_dir && f.name.startsWith(prefix) && f.name.endsWith(".md"))
+    const tree = (await listDirectory(catalogDir)) as CatalogFileEntry[]
+    const candidates = tree.filter(f => !f.is_dir && f.name.startsWith(prefix) && f.name.endsWith(".md"))
+    files = await filterModuleFiles(candidates, { category, productName })
   } catch {
-    return { totalModules: 0, refined: 0, fieldsUpdated: 0, skipped: 0 }
+    return { totalModules: 0, refined: 0, fieldsUpdated: 0, skipped: 0, mainFilesRebuilt: 0 }
   }
 
   const activity = useActivityStore.getState()
@@ -1074,7 +1622,17 @@ async function refineModuleFiles(
     }
   }
 
-  return { totalModules: files.length, refined, fieldsUpdated, skipped }
+  let mainFilesRebuilt = 0
+  if (!signal?.aborted) {
+    activity.updateItem(activityId, { detail: "正在刷新产品主文件..." })
+    try {
+      mainFilesRebuilt = await rebuildMainFilesFromModules(catalogDir, { category, productName })
+    } catch (err) {
+      log.warn("failed to rebuild product main file after refinement", { error: String(err), category, productName })
+    }
+  }
+
+  return { totalModules: files.length, refined, fieldsUpdated, skipped, mainFilesRebuilt }
 }
 
 /**
@@ -1092,7 +1650,7 @@ export async function refineAllProductModules(
   const catalogDir = `${pp}/wiki/product_catalog`
   const activity = useActivityStore.getState()
 
-  let allFiles: Array<{ name: string; path: string; is_dir: boolean }> = []
+  let allFiles: CatalogFileEntry[] = []
   try {
     const tree = await listDirectory(catalogDir)
     log.info("listDirectory raw result", {
@@ -1101,11 +1659,12 @@ export async function refineAllProductModules(
       firstItem: tree?.[0] ? JSON.stringify(tree[0]).substring(0, 200) : "empty",
       firstItemKeys: tree?.[0] ? Object.keys(tree[0] as Record<string, unknown>) : [],
     })
-    allFiles = (tree as Array<{ name: string; path: string; is_dir: boolean }>)
+    const candidates = (tree as CatalogFileEntry[])
       .filter(f => !f.is_dir && f.name?.endsWith(".md") && f.name?.includes("-"))
+    allFiles = await filterModuleFiles(candidates)
   } catch (err) {
     log.error("listDirectory failed", { error: String(err), catalogDir })
-    return { totalModules: 0, refined: 0, fieldsUpdated: 0, skipped: 0 }
+    return { totalModules: 0, refined: 0, fieldsUpdated: 0, skipped: 0, mainFilesRebuilt: 0 }
   }
 
   log.info("开始批量精炼", { totalModules: allFiles.length, catalogDir })
@@ -1137,10 +1696,22 @@ export async function refineAllProductModules(
     }
   }
 
-  log.info("批量精炼完成", { totalModules: allFiles.length, refined, fieldsUpdated, skipped })
+  let mainFilesRebuilt = 0
+  if (!signal?.aborted) {
+    activity.updateItem(activityId, {
+      detail: "正在刷新产品主文件的已有知识/知识缺口清单...",
+    })
+    try {
+      mainFilesRebuilt = await rebuildMainFilesFromModules(catalogDir)
+    } catch (err) {
+      log.warn("failed to rebuild product main files after refinement", { error: String(err), catalogDir })
+    }
+  }
+
+  log.info("批量精炼完成", { totalModules: allFiles.length, refined, fieldsUpdated, skipped, mainFilesRebuilt })
   activity.updateItem(activityId, {
-    detail: `精炼完成：${refined}/${allFiles.length} 个模块更新，共补充 ${fieldsUpdated} 个字段。`,
+    detail: `精炼完成：${refined}/${allFiles.length} 个模块更新，共补充 ${fieldsUpdated} 个字段，刷新 ${mainFilesRebuilt} 个主文件。`,
   })
 
-  return { totalModules: allFiles.length, refined, fieldsUpdated, skipped }
+  return { totalModules: allFiles.length, refined, fieldsUpdated, skipped, mainFilesRebuilt }
 }

@@ -36,23 +36,12 @@ function parseLines(chunk: Uint8Array, buffer: string): [string[], string] {
 // ── Backend proxy detection ───────────────────────────────────────────────────
 
 /**
- * Whether the server has LLM_ENDPOINT configured.
- * Cached after first call — the config doesn't change at runtime.
+ * The main LLM proxy is only for server-managed requests. User-provided
+ * endpoints go through the normal provider client so dedicated vision
+ * configs do not get routed to the text-only server LLM.
  */
-let _serverHasLlm: boolean | null = null
-
-async function serverHasLlm(): Promise<boolean> {
-  if (_serverHasLlm !== null) return _serverHasLlm
-  try {
-    const res = await fetch("/api/config")
-    if (!res.ok) { _serverHasLlm = false; return false }
-    const cfg = await res.json()
-    _serverHasLlm = !!(cfg?.llm?.endpoint)
-    return _serverHasLlm
-  } catch {
-    _serverHasLlm = false
-    return false
-  }
+function shouldUseServerLlmProxy(config: LlmConfig): boolean {
+  return config.apiKey === "__SERVER_MANAGED__"
 }
 
 // Standard OpenAI SSE line parser (used for the backend proxy stream,
@@ -86,8 +75,6 @@ export async function streamChat(
    */
   requestOverrides?: RequestOverrides,
 ): Promise<void> {
-  const { onToken, onDone, onError } = callbacks
-
   // Claude Code CLI uses a subprocess transport (stdin/stdout), not
   // HTTP. Dispatch before getProviderConfig — that function throws for
   // this provider because it has no URL/headers.
@@ -108,10 +95,10 @@ export async function streamChat(
   }
 
   // ── Backend proxy mode ────────────────────────────────────────────────────
-  // When the Rust backend has LLM_ENDPOINT configured, route through
-  // /api/llm/stream. This avoids Mixed Content errors (HTTPS page → HTTP
-  // LLM service) and CORS issues without requiring changes to the LLM service.
-  const useProxy = await serverHasLlm()
+  // Server-managed main LLM requests route through /api/llm/stream. This
+  // avoids Mixed Content/CORS issues while letting user-provided endpoints
+  // (including dedicated vision OCR configs) use their own provider client.
+  const useProxy = shouldUseServerLlmProxy(config)
 
   if (useProxy) {
     return streamChatViaProxy(config, messages, callbacks, signal, requestOverrides)
@@ -130,7 +117,7 @@ async function streamChatDirect(
   signal?: AbortSignal,
   requestOverrides?: RequestOverrides,
 ): Promise<void> {
-  const { onToken, onDone, onError } = callbacks
+  const { onDone, onError } = callbacks
   const providerConfig = getProviderConfig(config)
 
   const timeoutMs = 30 * 60 * 1000
@@ -259,7 +246,7 @@ async function streamChatViaProxyEndpoint(
   requestOverrides?: RequestOverrides,
   label: string = "LLM",
 ): Promise<void> {
-  const { onToken, onDone, onError } = callbacks
+  const { onDone, onError } = callbacks
 
   const body: Record<string, unknown> = { messages: toOpenAiCompatMessages(messages) }
   if (requestOverrides?.temperature !== undefined) body.temperature = requestOverrides.temperature
