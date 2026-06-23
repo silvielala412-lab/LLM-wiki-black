@@ -448,10 +448,13 @@ function buildPrompt(
   }).join("\n")
 
   // Build enriched field list with hints for LLM
+  // Show all fields so LLM knows the full schema, but mark non-extractable ones
+  // to prevent hallucination of operational/manual-fill data.
   const productFields = PRODUCT_FIELDS[category] ?? []
   const fieldListWithHints = productFields
     .map(f => {
       let entry = f.fieldName
+      if (!f.extractable) entry += ` [人工填充-请勿抽取]`
       if (f.valueHint) entry += `（如：${f.valueHint}）`
       if (f.valueType === "long") entry += ` [长文本]`
       return entry
@@ -1635,8 +1638,9 @@ export async function runProductCatalogExtraction(
     log.error("failed to write main file", { error: String(err) })
   }
 
-  // 4b: Field-level pages aligned to the Excel schema
+  // 4b: Field-level pages aligned to the Excel schema (only for fields with values)
   for (const fieldPage of buildProductFieldFiles(mainContent, category, productName)) {
+    if (!fieldPage.hasValue) continue
     const fieldPath = `${catalogDir}/${fieldPage.fileName}`
     const fieldRelative = `wiki/product_catalog/${fieldPage.fileName}`
     try {
@@ -2092,6 +2096,7 @@ async function rebuildMainFilesFromModules(
     )
     await writeFile(`${catalogDir}/${group.category}-${group.productName}.md`, mainContent)
     for (const fieldPage of buildProductFieldFiles(mainContent, group.category, group.productName)) {
+      if (!fieldPage.hasValue) continue
       await writeFile(`${catalogDir}/${fieldPage.fileName}`, fieldPage.content)
     }
     rebuilt++
