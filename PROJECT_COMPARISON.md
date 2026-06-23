@@ -198,5 +198,52 @@ nashsu 的 `sources[]` 字段跟踪每个 wiki 页面来自哪些源文件，是
 
 ---
 
+## 六、与腾讯 WeKnora 深度对比（2026-06-22 新增）
+
+> **WeKnora**: ⭐16.9k | 腾讯开源 | Go + Vue + PostgreSQL | Docker 部署
+> **GitHub**: https://github.com/Tencent/WeKnora
+
+### 定位差异
+
+| 维度 | WeKnora | 我们 |
+|------|---------|------|
+| **定位** | 通用企业知识平台 | 保险领域专用知识图谱 |
+| **抽取哲学** | "切块→向量→检索时再理解" | "上传时就精确提取每个字段" |
+| **产出物** | 概述性 Wiki 页面 + 向量 chunks | 结构化字段表（字段=值）+ 模块文件 |
+| **技术栈** | Go + Vue + PostgreSQL + Neo4j | TypeScript + Vite + Rust |
+
+### 知识抽取对比（核心环节）
+
+| 抽取能力 | WeKnora | 我们 | 谁更优 |
+|---------|---------|------|-------|
+| 文档格式覆盖 | 10+ 格式 | PDF only (4级 OCR) | 🏆 WeKnora |
+| Schema 约束 | ❌ 无 | ✅ 47字段×6险种 | 🏆 我们 |
+| 模块化抽取 | ❌ 通用 Agent | ✅ 30+ 专业模块 | 🏆 我们 |
+| 多轮精炼 | ❌ 一次性 | ✅ N 次精炼 | 🏆 我们 |
+| 占位符清洗 | ❌ | ✅ 30+ regex 模式 | 🏆 我们 |
+| 跨模块桥接 | ❌ | ✅ MODULE_TO_FIELD_BRIDGE | 🏆 我们 |
+| 向量 Embedding | ✅ HNSW + 多 provider | ⚠️ 基础 | 🏆 WeKnora |
+| 知识图谱基础设施 | ✅ Neo4j | ✅ relation-index | 🏆 WeKnora |
+| 可观测性 | ✅ Langfuse | ⚠️ log only | 🏆 WeKnora |
+
+**结论：在保险领域知识抽取环节，我们的 schema-driven + module-based 方案明确更优。但在检索引擎和企业级基础设施方面，WeKnora 更成熟。**
+
+### WeKnora 值得借鉴的能力
+
+| 能力 | WeKnora 实现 | 借鉴优先级 |
+|------|-------------|-----------|
+| Langfuse 全链路 trace | 解析→分块→向量→推理的 span tree | **P0** |
+| Hybrid Search | BM25 + Vector + GraphRAG | **P0** |
+| MCP Server | 标准化 Agent 工具协议 | P1 |
+| IM 对接 | 企微/飞书/Slack | P2 |
+| 自适应分块 | chunk_size 可配 + preview | P2 |
+| 多租户 RBAC | 4级角色矩阵 | P3 |
+
+### 推荐策略
+
+**不替换，要互补。** 知识抽取用我们的管线（Schema-Driven），检索和可观测性借鉴 WeKnora。
+
+---
+
 *文档维护：Claude（Antigravity）*
-*最后对比时间：2026-05-27*
+*最后对比时间：2026-06-22*
