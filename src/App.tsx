@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react"
+import { useState, useEffect, useRef } from "react"
 import i18n from "@/i18n"
 import { useWikiStore } from "@/stores/wiki-store"
 import { useReviewStore } from "@/stores/review-store"
@@ -26,6 +26,8 @@ function App() {
   const setActiveView = useWikiStore((s) => s.setActiveView)
   const [showCreateDialog, setShowCreateDialog] = useState(false)
   const [loading, setLoading] = useState(true)
+  const initStartedRef = useRef(false)
+  const openingProjectRef = useRef<string | null>(null)
 
   const { user, isLoading: authLoading, checkSession } = useAuthStore()
 
@@ -183,6 +185,9 @@ function App() {
 
   // Auto-open last project on startup
   useEffect(() => {
+    if (initStartedRef.current) return
+    initStartedRef.current = true
+
     async function init() {
       try {
         const savedConfig = await loadLlmConfig()
@@ -255,6 +260,11 @@ function App() {
   }, [])
 
   async function handleProjectOpened(proj: WikiProject) {
+    const openKey = `${proj.id}:${proj.path}`
+    if (openingProjectRef.current === openKey) return
+    openingProjectRef.current = openKey
+
+    try {
     // Clear all per-project state BEFORE loading new project data
     // to prevent cross-project contamination. MUST be awaited so the
     // ingest queue / graph cache are actually cleared before the new
@@ -269,6 +279,15 @@ function App() {
     useWikiStore.getState().bumpDataVersion()
     await saveLastProject(proj)
 
+    // Initialise the decoupled logger before restoring the queue so startup
+    // queue/OCR diagnostics are not lost.
+    initLogger({
+      level: import.meta.env.DEV ? "debug" : "info",
+      fileWriter: writeFile,
+      fileReader: readFile,
+      logFilePath: `${proj.path}/system-logs/ingest.ndjson`,
+    })
+
     // Restore ingest queue (resume interrupted tasks). Keyed by the
     // project's stable UUID so the queue still finds the right project
     // even if the filesystem path changed since the task was enqueued.
@@ -280,15 +299,6 @@ function App() {
       restoreQueue(proj.id, proj.path).catch((err) =>
         console.error("Failed to restore ingest queue:", err)
       )
-    })
-
-    // Initialise the decoupled logger with a file sink for this project.
-    // All ingest/queue/ocr logs will be persisted to system-logs/ingest.ndjson.
-    initLogger({
-      level: import.meta.env.DEV ? "debug" : "info",
-      fileWriter: writeFile,
-      fileReader: readFile,
-      logFilePath: `${proj.path}/system-logs/ingest.ndjson`,
     })
 
     // Clip server not used in web mode — skip.
@@ -321,6 +331,9 @@ function App() {
       }
     } catch {
       // ignore, start fresh
+    }
+    } finally {
+      if (openingProjectRef.current === openKey) openingProjectRef.current = null
     }
   }
 

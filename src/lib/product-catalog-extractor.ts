@@ -13,6 +13,7 @@ import { createDirectory, writeFile, readFile, listDirectory } from "@/commands/
 import { normalizePath } from "@/lib/path-utils"
 import { getLogger } from "@/lib/logger"
 import { useActivityStore } from "@/stores/activity-store"
+import { useReviewStore, type ReviewItem } from "@/stores/review-store"
 import type { LlmConfig } from "@/stores/wiki-store"
 import { preprocessOcrText } from "@/lib/ocr-text-repair"
 import {
@@ -30,22 +31,114 @@ const log = getLogger("product-catalog-extractor")
 
 const EMPTY_FIELD_VALUE = ""
 
-const PLACEHOLDER_REGEX = /^(未明确|未提及|未提到|未说明|未在本|未在证据|未从证据|证据片段中未|证据中未|该字段未|文中未|原文未|原文中未|材料未|未找到|未见|没有提到|无明确|不涉及|暂无|暂未|无此信息|无相关|本章节未|条款未|不适用于本|N\/A|n\/a|无$)/
+const PLACEHOLDER_REGEX = /^(未明确|未提及|未提到|未说明|未在本|未在证据|未从证据|证据片段未|证据片段中未|证据片段没有|证据中未|该字段未|文中未|原文未|原文中未|材料未|未找到|未见|没有提到|证据不足|无明确|不涉及|暂无|暂未|无此信息|无相关|本章节未|条款未|不适用于本|N\/A|n\/a|无$)/
+const SOURCE_ONLY_PLACEHOLDER_REGEX = /^(?:详见来源文件|详见费率表|详见(?:原文|附件|附表|条款|附录)|参见来源文件|请参见来源文件)(?:[:：\s]|$)/i
+const REFERENCE_ONLY_PREFIX_REGEX = /^(?:详见|见|参见|参考|请参见|请查看|查看)\s*/i
+const REFERENCE_ONLY_TARGET_REGEX = /^(?:来源文件|费率表|原文|附件|附表|附录|条款|章节|投保范围|责任免除|保险金给付限额|计划表|保险计划表|第?\d+(?:\.\d+)*\s*(?:条|节)?)/i
+
+function isReferenceOnlyFieldValue(value: string): boolean {
+  const normalized = value.trim()
+  if (!REFERENCE_ONLY_PREFIX_REGEX.test(normalized)) return false
+  const target = normalized.replace(REFERENCE_ONLY_PREFIX_REGEX, "").trim()
+  if (!target) return true
+  return REFERENCE_ONLY_TARGET_REGEX.test(target) || (target.length <= 48 && /\d+(?:\.\d+)+/.test(target))
+}
 
 function isMissingFieldValue(value: string | undefined | null): boolean {
   const normalized = (value ?? "").trim()
-  return normalized === "" || PLACEHOLDER_REGEX.test(normalized)
+  return normalized === ""
+    || PLACEHOLDER_REGEX.test(normalized)
+    || SOURCE_ONLY_PLACEHOLDER_REGEX.test(normalized)
+    || isReferenceOnlyFieldValue(normalized)
 }
 
 function sanitizeFieldValue(value: string): string {
   const trimmed = value.trim()
-  return PLACEHOLDER_REGEX.test(trimmed) ? "" : trimmed
+  return PLACEHOLDER_REGEX.test(trimmed)
+    || SOURCE_ONLY_PLACEHOLDER_REGEX.test(trimmed)
+    || isReferenceOnlyFieldValue(trimmed)
+    ? ""
+    : trimmed
+}
+
+const FIELD_VALUE_HINTS = new Map<string, string>()
+for (const field of [...BASE_FIELDS, ...Object.values(PRODUCT_FIELDS).flat()] as ProductField[]) {
+  if (field.valueHint && !FIELD_VALUE_HINTS.has(field.fieldName)) {
+    FIELD_VALUE_HINTS.set(field.fieldName, field.valueHint)
+  }
+}
+
+function normalizeHintText(value: string): string {
+  return value
+    .replace(/^(?:如|例如|示例|取值格式|取值格式提示)\s*[:：]\s*/i, "")
+    .replace(/\s+/g, "")
+    .replace(/[，、；;]/g, ",")
+    .replace(/,+/g, ",")
+    .replace(/^,|,$/g, "")
+}
+
+function isFieldValueHintEcho(fieldName: string, value: string): boolean {
+  const hint = FIELD_VALUE_HINTS.get(fieldName)
+  if (!hint) return false
+  const trimmed = value.trim()
+  if (/^(?:如|例如|示例|取值格式|取值格式提示)\s*[:：]/i.test(trimmed)) return true
+  const hintLooksLikeOptions = /[、，,；;]/.test(hint)
+  return hintLooksLikeOptions && normalizeHintText(trimmed) === normalizeHintText(hint)
+}
+
+function normalizeCanonicalFieldValue(fieldName: string, value: string): string {
+  const cleaned = sanitizeFieldValue(value)
+  if (!cleaned || isFieldValueHintEcho(fieldName, cleaned)) return ""
+
+  if (fieldName === "交费方式") {
+    if (/一次性[交缴]清|一次[交缴]清|趸交/.test(cleaned)) return "趸交"
+    if (/半年交|半年度交|每半年/.test(cleaned)) return "半年交"
+    if (/季交|季度交|每季/.test(cleaned)) return "季交"
+    if (/月交|按月|每月/.test(cleaned)) return "月交"
+    if (/年交|年度交|每年/.test(cleaned)) return "年交"
+  }
+
+  return cleaned
+}
+
+function isFieldValueCompatible(fieldName: string, value: string): boolean {
+  const cleaned = value.trim()
+  if (!cleaned || isMissingFieldValue(cleaned)) return false
+
+  if (fieldName === "投保范围") {
+    return !/^【?投保职业】?/.test(cleaned)
+      && !/职业类别/.test(cleaned)
+      && !/[0-9一二三四五六七八九十]+[-－—~至到][0-9一二三四五六七八九十]+类职业/.test(cleaned)
+  }
+
+  if (fieldName === "投保年龄") {
+    return !(/职业/.test(cleaned) && !/(年龄|周岁|岁|出生)/.test(cleaned))
+  }
+
+  if (fieldName === "保证续保") {
+    if (/^\d+(?:\.\d+)?\s*(?:年|个月|日|天)$/.test(cleaned)) return false
+    if (/续保期|保证续保期/.test(cleaned) && !/(是|否|支持|不支持|保证续保|不保证续保)/.test(cleaned)) return false
+  }
+
+  return true
 }
 
 const FIELD_EXTRACTION_HINTS: Record<string, Record<string, string>> = {
   "疾病等待期": {
     "意外豁免": "实际指全部“无等待期/等待期豁免情形”，不限于意外伤害；如原文列出多种情形，必须逐条完整列出，不要只取第 1 条。",
     "等待期内发生理赔处理": "分别列出一般疾病、恶性肿瘤等不同情形下的处理结果，不要合并丢项。",
+  },
+  "分年龄保费费率表": {
+    "费率表数据": "必须提取费率表正文。若表格很长，至少保留表头维度、全部计划名称、年龄段范围、首末年龄段和代表性年龄段费率；不能只写“详见来源文件/详见费率表”。",
+    "计划说明": "列出计划一/计划二/计划三等计划名称及对应维度，如有基本医疗/公费医疗、无基本医疗/公费医疗、首次投保/续保等。",
+  },
+  "有社保费率": {
+    "保费区间": "从费率表中提取有基本医疗保险或公费医疗列的最低-最高保费，最好按计划列出；不能只写“详见来源文件”。",
+    "费率表摘要": "概括有社保列的表头、年龄段、计划维度和代表性数值。",
+  },
+  "无社保费率上浮": {
+    "上浮比例": "若原文给出无基本医疗/公费医疗费率列，应与有基本医疗列对比提取大致上浮范围或说明按无社保费率表计收；不能把赔付条件误填为费率条件。",
+    "适用条件": "只填写与无基本医疗/公费医疗费率适用相关的条件，不要填保险责任赔付条件。",
   },
   "身故保险金": {
     "保什么": "概括本产品保险责任。若只有身故责任，填写“身故保险金”及核心给付规则；若同时出现全残、意外身故、疾病身故，必须分别列出。",
@@ -121,6 +214,47 @@ const REFINE_EXTRA_FIELDS_BY_MODULE: Record<string, string[]> = {
   "领取手续费": ["领取手续费"],
   "年度现金价值表": ["现金价值", "高流动性"],
 }
+
+const FIELD_DIRECT_EXTRACTION_HINTS: Record<string, string> = {
+  "现金价值": "提取现金价值的定义、查询方式、用途或与保单贷款/减保/自动垫交相关的现金价值规则；不要只写“详见现金价值表”。",
+  "部分领取": "寿险条款中常以“减保”或“减少基本保险金额”表达类似权益；若原文明确支持减保，可概括为支持减保/减少基本保险金额及核心规则。",
+  "特殊免责": "提取区别于普通理赔流程的责任免除或不承担给付责任情形，必须来自免责条款或保险责任模块。",
+  "免责少": "只有原文能支持免责范围较少、免责条款数量或主要免责类型时才填写；不要主观评价。",
+  "购买限制": "提取未成年人身故保额限制、投保年龄限制、购买额度限制等明确购买约束。",
+  "全残保障": "仅原文明示全残/身体全残/全残保险金责任时填写。",
+  "意外身故": "仅原文把意外身故作为单独责任、额外赔付或单独给付规则时填写。",
+  "疾病身故": "仅原文把疾病身故或非意外身故作为单独责任、额外赔付或单独给付规则时填写。",
+  "满期返还": "仅原文明示满期保险金、满期返还或保险期间届满返还时填写。",
+  "适用人群": "优先从投保人群、投保年龄、投被保关系中抽取；不要从营销话术臆测。",
+  "投保范围": "提取具体被保险人范围、投保年龄、投保限制或投被保关系；不要只写“见条款/见投保范围”。",
+  "保障人群": "可根据明确投保年龄映射儿童/成人/老人等人群；不要输出“见投保范围”。",
+  "投保职业": "只抽具体可投职业类别、拒保职业类别或职业限制；如果证据只有投保年龄或“见投保范围/见条款”，不要输出。",
+}
+
+const FIELD_PREFERRED_EVIDENCE_MODULES: Record<string, string[]> = {
+  "现金价值": ["年度现金价值表", "减保", "保单贷款"],
+  "部分领取": ["减保"],
+  "特殊免责": ["通用责任免除", "身故保险金"],
+  "免责少": ["通用责任免除"],
+  "购买限制": ["未成年人保额限制", "身故保险金"],
+  "全残保障": ["身故保险金"],
+  "意外身故": ["身故保险金"],
+  "疾病身故": ["身故保险金"],
+  "满期返还": ["身故保险金"],
+  "适用人群": ["投保人群", "投保年龄"],
+}
+
+const PRODUCT_META_FIELD_NAMES = new Set([
+  "险种代码",
+  "险种名称",
+  "开始使用时间",
+  "结束使用时间",
+  "产品类别",
+  "产品类型",
+  "销售渠道",
+  "销售状态",
+  "产品档次",
+])
 
 const LONG_FIELD_MODULE_MAP: Record<string, string[]> = {
   "保什么": [
@@ -332,11 +466,12 @@ function valueSourceForField(fieldName: string, value: string): "extracted" | "d
 }
 
 function evidenceModulesForField(fieldName: string, category?: InsuranceCategoryType): string[] {
+  const metaModules = PRODUCT_META_FIELD_NAMES.has(fieldName) ? ["产品基础信息"] : []
   const refineModules = Object.entries(REFINE_EXTRA_FIELDS_BY_MODULE)
     .filter(([, fields]) => fields.includes(fieldName))
     .map(([moduleName]) => moduleName)
   const longFieldModules = LONG_FIELD_MODULE_MAP[fieldName] ?? []
-  const modules = uniqueStrings([...refineModules, ...longFieldModules])
+  const modules = uniqueStrings([...metaModules, ...refineModules, ...longFieldModules])
   return category ? modules.filter(moduleName => isModuleAllowedForCategory(category, moduleName)) : modules
 }
 
@@ -344,6 +479,65 @@ function cleanProductName(name: string): string {
   return name
     .replace(/[（(](?:保险条款|产品条款|产品说明书|投保须知|费率表|核保手册|理赔指南|服务手册|条款)[）)]/g, "")
     .trim()
+}
+
+function stringFromRecord(record: Record<string, unknown>, keys: string[]): string {
+  for (const key of keys) {
+    const value = record[key]
+    if (typeof value === "string" && value.trim()) return sanitizeFieldValue(value)
+    if (typeof value === "number" && Number.isFinite(value)) return String(value)
+  }
+  return ""
+}
+
+function assignMetaField(fields: Map<string, string>, fieldName: string, value: string): void {
+  const cleaned = sanitizeFieldValue(value)
+  if (!cleaned || isMissingFieldValue(cleaned)) return
+  fields.set(fieldName, cleaned)
+}
+
+function collectJsonObjects(text: string): Record<string, unknown>[] {
+  const objects: Record<string, unknown>[] = []
+  const jsonLike = text.match(/\{[^{}]*(?:"planCode"|"actualPlanCode"|"clauseName"|"planSalesStatus"|"startDate")[^{}]*\}/g) ?? []
+  for (const item of jsonLike) {
+    try {
+      const parsed = JSON.parse(item) as unknown
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        objects.push(parsed as Record<string, unknown>)
+      }
+    } catch {
+      // Ignore non-JSON braces from OCR/table text.
+    }
+  }
+  return objects
+}
+
+function extractDeterministicProductMetaFields(text: string, category: InsuranceCategoryType): Map<string, string> {
+  const fields = new Map<string, string>()
+
+  for (const record of collectJsonObjects(text)) {
+    assignMetaField(fields, "险种代码", stringFromRecord(record, ["actualPlanCode", "planCode", "productCode", "code"]))
+    assignMetaField(fields, "险种名称", stringFromRecord(record, ["clauseName", "productName", "planName", "title", "name"]))
+    assignMetaField(fields, "销售状态", stringFromRecord(record, ["planSalesStatus", "salesStatus", "status"]))
+    assignMetaField(fields, "销售渠道", stringFromRecord(record, ["planSalesChannel", "salesChannel", "channel"]))
+    assignMetaField(fields, "开始使用时间", stringFromRecord(record, ["startDate", "effectiveDate", "date"]))
+    assignMetaField(fields, "结束使用时间", stringFromRecord(record, ["endDate", "stopDate", "expireDate"]))
+    assignMetaField(fields, "产品类型", stringFromRecord(record, ["planPlanType", "productType", "type"]))
+    assignMetaField(fields, "产品档次", stringFromRecord(record, ["productLevel", "level"]))
+  }
+
+  for (const line of text.split(/\r?\n/)) {
+    const cells = splitMarkdownTableRow(line)
+    if (!cells || cells.length < 2) continue
+    const [field, value] = cells
+    if (!field || !value || field === "字段" || field.startsWith("---")) continue
+    if (["险种代码", "险种名称", "销售状态", "销售渠道", "开始使用时间", "结束使用时间", "产品类型", "产品档次"].includes(field)) {
+      assignMetaField(fields, field, value)
+    }
+  }
+
+  assignMetaField(fields, "产品类别", category)
+  return fields
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────
@@ -504,7 +698,9 @@ function buildPrompt(
     "6. **枚举型规则必须完整**：若原文用 1/2/3 或分号列出多个条件、责任、例外或处理方式，必须全部列出，可用分号压缩，但不能只取第一条。",
     "7. **关键字段表格提炼核心值**：短字段保持简洁；规则型字段可用分号完整列举必要条件。",
     "8. **长文本字段**：标有 [长文本] 的字段，值可以较长（100-300字），概括原文核心内容，不要只写一句话。",
-    "9. **严禁占位文本**：绝对不要输出\"未明确\"、\"未提及\"、\"未在本章节说明\"、\"暂无\"、\"不涉及\"等占位文字。没有值的字段，值直接留空，写成 `| 字段名 |  |` 即可。",
+    "9. **费率表必须落表**：如果章节来自费率表或出现单位费率表，费率字段不能只写“详见来源文件/详见费率表”；至少写出表头维度、计划名称、年龄段范围、首末年龄段及代表性年龄段数值。",
+    "10. **严禁占位文本**：绝对不要输出\"未明确\"、\"未提及\"、\"未在本章节说明\"、\"暂无\"、\"不涉及\"、\"详见来源文件\"等占位文字。没有值的字段，值直接留空，写成 `| 字段名 |  |` 即可。",
+    "11. **严禁引用式答案**：不要把章节编号、条款位置或附件位置当成字段值；例如 `见投保范围（1.3）`、`见条款1.3`、`详见附录2` 必须留空。只有同一值里已经包含具体年龄、金额、比例、范围或规则时，才可以保留附带引用。",
   ].join("\n")
 }
 
@@ -670,7 +866,7 @@ function parseKeyFieldsTable(markdown: string): Map<string, string> {
   let row: RegExpExecArray | null
   while ((row = rowRegex.exec(tableBlock)) !== null) {
     const field = row[1].trim()
-    const value = sanitizeFieldValue(row[2])
+    const value = normalizeCanonicalFieldValue(field, row[2])
     // Skip header separators and header row
     if (field === "---" || field === "字段" || field.startsWith("--")) continue
     fields.set(field, value)
@@ -851,7 +1047,26 @@ function parseProductProfileFieldValues(profileMarkdown: string): Map<string, st
     if (!cells || cells.length < 2) continue
     const [field, rawValue] = cells
     if (!field || field === "字段" || field.startsWith("---")) continue
-    values.set(field, sanitizeFieldValue(rawValue.replace(/<br>/g, "\n")))
+    values.set(field, normalizeCanonicalFieldValue(field, rawValue.replace(/<br>/g, "\n")))
+  }
+  return values
+}
+
+function parseDirectProductFieldValueTables(
+  content: string,
+  category: InsuranceCategoryType,
+): Map<string, string> {
+  const values = new Map<string, string>()
+  const allowedFields = new Set((PRODUCT_FIELDS[category] ?? []).map(field => field.fieldName))
+  for (const line of content.split(/\r?\n/)) {
+    const cells = splitMarkdownTableRow(line)
+    if (!cells || cells.length < 2) continue
+    const fieldName = cells[0].trim()
+    if (!allowedFields.has(fieldName)) continue
+    const value = normalizeCanonicalFieldValue(fieldName, cells[1].replace(/<br>/g, "\n"))
+    if (isMissingFieldValue(value)) continue
+    if (!isFieldValueCompatible(fieldName, value)) continue
+    values.set(fieldName, value)
   }
   return values
 }
@@ -965,6 +1180,211 @@ function buildProductFieldFiles(
   })
 }
 
+type ProductCatalogExtractionMode = "rebuild" | "incremental"
+
+interface ProductCatalogExtractionOptions {
+  mode?: ProductCatalogExtractionMode
+}
+
+interface ProductCatalogWriteContext {
+  projectPath: string
+  catalogDir: string
+  mergedModules: Map<string, MergedModule>
+  foundModules: MergedModule[]
+  category: InsuranceCategoryType
+  productName: string
+  sectionCount: number
+  allModules: ProductModule[]
+  sourceContent: string
+  cleanedContent: string
+  fileName: string
+  activityId: string
+}
+
+function compareFieldValue(value: string): string {
+  return value
+    .replace(/<br>/g, "\n")
+    .replace(/\s+/g, " ")
+    .replace(/[。；;，,、]+$/g, "")
+    .trim()
+}
+
+function fieldValuesEquivalent(existing: string, incoming: string): boolean {
+  return compareFieldValue(existing) === compareFieldValue(incoming)
+}
+
+function markdownFieldValue(value: string): string {
+  return value.replace(/\n/g, "<br>").replace(/\|/g, "\\|")
+}
+
+function fieldTableRow(fieldName: string, value: string): string {
+  return `| ${fieldName} | ${markdownFieldValue(value)} |`
+}
+
+function getFieldRowValue(content: string, fieldName: string): string {
+  for (const line of content.split(/\r?\n/)) {
+    const cells = splitMarkdownTableRow(line)
+    if (!cells || cells.length < 2) continue
+    if (cells[0] !== fieldName) continue
+    return normalizeCanonicalFieldValue(fieldName, cells[1].replace(/<br>/g, "\n"))
+  }
+  return ""
+}
+
+function setFirstFieldRow(content: string, fieldName: string, value: string): string {
+  const lines = content.split(/\r?\n/)
+  let changed = false
+  const next = lines.map(line => {
+    if (changed) return line
+    const cells = splitMarkdownTableRow(line)
+    if (!cells || cells.length < 2 || cells[0] !== fieldName) return line
+    changed = true
+    return fieldTableRow(fieldName, value)
+  })
+  return changed ? next.join("\n") : content
+}
+
+function appendIncrementalSourceText(content: string, incomingContent: string, fileName: string): string {
+  const sourceText = extractSourceText(incomingContent)
+  if (!sourceText || content.includes(sourceText.slice(0, 200))) return content
+  return [
+    content.trimEnd(),
+    "",
+    "---",
+    `<!-- 增量来源：${fileName} -->`,
+    "",
+    sourceText,
+  ].join("\n")
+}
+
+function formatConflictValue(value: string): string {
+  const normalized = value.replace(/\s+/g, " ").trim()
+  return normalized.length > 300 ? `${normalized.slice(0, 300)}...` : normalized
+}
+
+function buildProductFieldConflictReviewItem(input: {
+  category: InsuranceCategoryType
+  productName: string
+  fieldName: string
+  existingValue: string
+  incomingValue: string
+  sourceFileName: string
+  affectedPath: string
+  pageKind: "字段页" | "模块页" | "产品身份"
+}): Omit<ReviewItem, "id" | "resolved" | "createdAt"> {
+  const title = `${input.pageKind === "产品身份" ? "产品身份冲突" : "产品字段冲突"}：${input.fieldName}｜${input.productName}`
+  return {
+    type: "contradiction",
+    title,
+    description: [
+      `增量上传文件「${input.sourceFileName}」抽取到的字段值与现有${input.pageKind}不同。系统已保留旧值，未自动覆盖。`,
+      "",
+      `产品：${input.category}-${input.productName}`,
+      `字段：${input.fieldName}`,
+      `页面：${input.affectedPath}`,
+      "",
+      `现有值：${formatConflictValue(input.existingValue)}`,
+      `新增值：${formatConflictValue(input.incomingValue)}`,
+      "",
+      "请人工判断采用新值、保留旧值，或手动合并为更完整表述。",
+    ].join("\n"),
+    sourcePath: input.sourceFileName,
+    affectedPages: [input.affectedPath],
+    conflict: {
+      kind: "product-field",
+      category: input.category,
+      productName: input.productName,
+      fieldName: input.fieldName,
+      pageKind: input.pageKind,
+      existingValue: input.existingValue,
+      incomingValue: input.incomingValue,
+      sourceFileName: input.sourceFileName,
+      affectedPath: input.affectedPath,
+    },
+    options: [
+      { label: "保留旧值", action: "keep-existing" },
+      { label: "采用新值", action: "accept-incoming" },
+      { label: "手动合并", action: "manual-merge" },
+      { label: "忽略本次", action: "dismiss" },
+    ],
+  }
+}
+
+function addUniqueReviewItem(items: Omit<ReviewItem, "id" | "resolved" | "createdAt">[], item: Omit<ReviewItem, "id" | "resolved" | "createdAt">): void {
+  if (items.some(existing => existing.title === item.title)) return
+  items.push(item)
+}
+
+function shouldAbortIncrementalForIdentity(
+  existingValues: Map<string, string>,
+  incomingValues: Map<string, string>,
+  category: InsuranceCategoryType,
+  productName: string,
+  fileName: string,
+  mainRelativePath: string,
+): Omit<ReviewItem, "id" | "resolved" | "createdAt">[] {
+  const reviews: Omit<ReviewItem, "id" | "resolved" | "createdAt">[] = []
+  for (const fieldName of ["产品类别", "险种代码", "险种名称"]) {
+    const existing = existingValues.get(fieldName)
+    const incoming = incomingValues.get(fieldName)
+    if (isMissingFieldValue(existing) || isMissingFieldValue(incoming)) continue
+    if (fieldValuesEquivalent(existing!, incoming!)) continue
+    addUniqueReviewItem(reviews, buildProductFieldConflictReviewItem({
+      category,
+      productName,
+      fieldName,
+      existingValue: existing!,
+      incomingValue: incoming!,
+      sourceFileName: fileName,
+      affectedPath: mainRelativePath,
+      pageKind: "产品身份",
+    }))
+  }
+  return reviews
+}
+
+async function writeProductSourceText(
+  projectPath: string,
+  category: InsuranceCategoryType,
+  productName: string,
+  fileName: string,
+  cleanedContent: string,
+  sectionCount: number,
+  mode: ProductCatalogExtractionMode,
+): Promise<string | null> {
+  try {
+    const sourceDir = `${projectPath}/wiki/source_text`
+    await createDirectory(sourceDir)
+    const sourceStem = sanitizeFileNamePart(fileName.replace(/\.[^.]+$/i, ""))
+    const ocrFileName = mode === "incremental"
+      ? `${category}-${productName}-增量原文-${sourceStem}.md`
+      : `${category}-${productName}-OCR原文.md`
+    const ocrPath = `${sourceDir}/${ocrFileName}`
+    const ocrLines: string[] = [
+      "---",
+      `title: "${ocrFileName.replace(/\.md$/i, "")}"`,
+      `knowledge_domain: source_text`,
+      `insurance_category: "${category}"`,
+      `product_name: "${productName}"`,
+      `source_file: "${fileName}"`,
+      `total_chars: ${cleanedContent.length}`,
+      `total_sections: ${sectionCount}`,
+      `created_by: auto-extract`,
+      mode === "incremental" ? `update_mode: incremental` : `update_mode: rebuild`,
+      "---",
+      "",
+      `# ${productName} ${mode === "incremental" ? "增量" : "OCR"} 原文`,
+      "",
+      cleanedContent,
+    ]
+    await writeFile(ocrPath, ocrLines.join("\n"))
+    return `wiki/source_text/${ocrFileName}`
+  } catch (err) {
+    log.warn("failed to save product source text", { error: String(err), mode })
+    return null
+  }
+}
+
 function deriveAudienceFromAge(ageText: string | undefined): string | null {
   if (!ageText || isMissingFieldValue(ageText)) return null
   const ages = [...ageText.matchAll(/(\d+)\s*周岁/g)].map(m => Number.parseInt(m[1], 10))
@@ -1004,6 +1424,7 @@ function buildMainFile(
   productName: string,
   sectionCount: number,
   allModules: ProductModule[],
+  sourceContent = "",
 ): string {
   const lines: string[] = []
 
@@ -1111,6 +1532,15 @@ function buildMainFile(
     if (!current || isMissingFieldValue(current) || value.length > current.length) {
       shortFieldLookup.set(fieldName, value)
     }
+  }
+
+  const deterministicMetaText = [
+    sourceContent,
+    ...[...mergedModules.values()].flatMap(m => m.contents),
+  ].filter(Boolean).join("\n\n")
+  const deterministicMetaFields = extractDeterministicProductMetaFields(deterministicMetaText, category)
+  for (const [fieldName, value] of deterministicMetaFields) {
+    shortFieldLookup.set(fieldName, value)
   }
 
   const ageFields = collectModuleKeyFields(mergedModules.get("投保年龄"))
@@ -1431,8 +1861,275 @@ function buildMainFile(
 
 // 每批并发发送给 LLM 的 section 数量。
 // 设太高会导致内网模型过载/超时，设太低会拖慢总耗时。
-// 当前值 8 = 每批 8 个 section 同时调用 LLM，等全部返回后发下一批。
-const MAX_SECTION_PARALLEL = 8
+// 当前值 4 = 每批 4 个 section 同时调用 LLM，等全部返回后发下一批。
+const MAX_SECTION_PARALLEL = 4
+
+async function writeFullProductCatalogOutputs(ctx: ProductCatalogWriteContext): Promise<string[]> {
+  const writtenPaths: string[] = []
+  const mainContent = buildMainFile(
+    ctx.mergedModules,
+    ctx.category,
+    ctx.productName,
+    ctx.sectionCount,
+    ctx.allModules,
+    ctx.sourceContent,
+  )
+  const mainFileName = `${ctx.category}-${ctx.productName}.md`
+  const mainPath = `${ctx.catalogDir}/${mainFileName}`
+  try {
+    await writeFile(mainPath, mainContent)
+    writtenPaths.push(`wiki/product_catalog/${mainFileName}`)
+  } catch (err) {
+    log.error("failed to write main file", { error: String(err) })
+  }
+
+  for (const fieldPage of buildProductFieldFiles(mainContent, ctx.category, ctx.productName)) {
+    const fieldPath = `${ctx.catalogDir}/${fieldPage.fileName}`
+    const fieldRelative = `wiki/product_catalog/${fieldPage.fileName}`
+    try {
+      await writeFile(fieldPath, fieldPage.content)
+      writtenPaths.push(fieldRelative)
+    } catch (err) {
+      log.error("failed to write product field file", { path: fieldRelative, error: String(err) })
+    }
+  }
+
+  for (const m of ctx.foundModules) {
+    const moduleDef = ctx.allModules.find(mod => mod.moduleName === m.moduleName)
+    if (!moduleDef) continue
+    const content = buildModuleFile(m, moduleDef, ctx.category, ctx.productName)
+    const moduleFileName = `${ctx.category}-${ctx.productName}-${m.moduleName}.md`
+    const modulePath = `${ctx.catalogDir}/${moduleFileName}`
+    const moduleRelative = `wiki/product_catalog/${moduleFileName}`
+    try {
+      await writeFile(modulePath, content)
+      writtenPaths.push(moduleRelative)
+    } catch (err) {
+      log.error("failed to write module file", { path: moduleRelative, error: String(err) })
+    }
+  }
+
+  const sourcePath = await writeProductSourceText(
+    ctx.projectPath,
+    ctx.category,
+    ctx.productName,
+    ctx.fileName,
+    ctx.cleanedContent,
+    ctx.sectionCount,
+    "rebuild",
+  )
+  if (sourcePath) writtenPaths.push(sourcePath)
+  return writtenPaths
+}
+
+async function writeIncrementalProductCatalogOutputs(ctx: ProductCatalogWriteContext): Promise<string[]> {
+  const activity = useActivityStore.getState()
+  const writtenPaths: string[] = []
+  const reviewItems: Omit<ReviewItem, "id" | "resolved" | "createdAt">[] = []
+  const mainFileName = `${ctx.category}-${ctx.productName}.md`
+  const mainRelative = `wiki/product_catalog/${mainFileName}`
+  const mainPath = `${ctx.catalogDir}/${mainFileName}`
+  const existingMain = await readFile(mainPath).catch(() => null)
+
+  if (!existingMain) {
+    activity.updateItem(ctx.activityId, {
+      detail: "未找到既有产品主文件，增量上传自动转为首次全量写入...",
+    })
+    return writeFullProductCatalogOutputs(ctx)
+  }
+
+  const incomingMain = buildMainFile(
+    ctx.mergedModules,
+    ctx.category,
+    ctx.productName,
+    ctx.sectionCount,
+    ctx.allModules,
+    ctx.sourceContent,
+  )
+  const existingValues = parseProductProfileFieldValues(existingMain)
+  const incomingValues = parseProductProfileFieldValues(incomingMain)
+  const directIncomingValues = parseDirectProductFieldValueTables(
+    `${ctx.sourceContent}\n\n${ctx.cleanedContent}`,
+    ctx.category,
+  )
+  for (const [fieldName, value] of directIncomingValues) {
+    incomingValues.set(fieldName, value)
+  }
+  const identityReviews = shouldAbortIncrementalForIdentity(
+    existingValues,
+    incomingValues,
+    ctx.category,
+    ctx.productName,
+    ctx.fileName,
+    mainRelative,
+  )
+  if (identityReviews.length > 0) {
+    useReviewStore.getState().addItems(identityReviews)
+    const sourcePath = await writeProductSourceText(
+      ctx.projectPath,
+      ctx.category,
+      ctx.productName,
+      ctx.fileName,
+      ctx.cleanedContent,
+      ctx.sectionCount,
+      "incremental",
+    )
+    if (sourcePath) writtenPaths.push(sourcePath)
+    activity.updateItem(ctx.activityId, {
+      detail: `增量更新已暂停：发现 ${identityReviews.length} 个产品身份冲突，未覆盖现有知识。`,
+    })
+    return writtenPaths
+  }
+
+  const schemaFieldNames = new Set((PRODUCT_FIELDS[ctx.category] ?? []).map(field => field.fieldName))
+  let moduleUpdatedCount = 0
+  let fieldFilledCount = 0
+  let sameFieldCount = 0
+  let conflictCount = 0
+  let updatedMain = existingMain
+
+  for (const m of ctx.foundModules) {
+    if (!moduleHasExtractedValues(m)) continue
+    const moduleDef = ctx.allModules.find(mod => mod.moduleName === m.moduleName)
+    if (!moduleDef) continue
+    const incomingContent = buildModuleFile(m, moduleDef, ctx.category, ctx.productName)
+    const incomingFields = parseKeyFieldsTable(incomingContent)
+    const usefulIncomingFields = [...incomingFields.entries()].filter(([, value]) => !isMissingFieldValue(value))
+    if (usefulIncomingFields.length === 0) continue
+
+    const moduleFileName = `${ctx.category}-${ctx.productName}-${m.moduleName}.md`
+    const moduleRelative = `wiki/product_catalog/${moduleFileName}`
+    const modulePath = `${ctx.catalogDir}/${moduleFileName}`
+    const existingContent = await readFile(modulePath).catch(() => null)
+
+    if (!existingContent) {
+      await writeFile(modulePath, incomingContent)
+      writtenPaths.push(moduleRelative)
+      moduleUpdatedCount++
+      continue
+    }
+
+    const existingFields = parseKeyFieldsTable(existingContent)
+    let updatedModule = existingContent
+    let changed = false
+
+    for (const [fieldName, incomingValue] of usefulIncomingFields) {
+      const existingValue = existingFields.get(fieldName)
+      if (isMissingFieldValue(existingValue)) {
+        const replaced = setFirstFieldRow(updatedModule, fieldName, incomingValue)
+        const next = replaced === updatedModule
+          ? appendKeyFieldRow(updatedModule, fieldName, incomingValue)
+          : replaced
+        if (next !== updatedModule) {
+          updatedModule = next
+          changed = true
+        }
+        continue
+      }
+      if (fieldValuesEquivalent(existingValue!, incomingValue)) continue
+      if (!schemaFieldNames.has(fieldName)) {
+        addUniqueReviewItem(reviewItems, buildProductFieldConflictReviewItem({
+          category: ctx.category,
+          productName: ctx.productName,
+          fieldName: `${m.moduleName}.${fieldName}`,
+          existingValue: existingValue!,
+          incomingValue,
+          sourceFileName: ctx.fileName,
+          affectedPath: moduleRelative,
+          pageKind: "模块页",
+        }))
+        conflictCount++
+      }
+    }
+
+    if (changed) {
+      updatedModule = markModuleHasValues(appendIncrementalSourceText(updatedModule, incomingContent, ctx.fileName))
+      await writeFile(modulePath, updatedModule)
+      writtenPaths.push(moduleRelative)
+      moduleUpdatedCount++
+    }
+  }
+
+  const baseFieldNames = new Set(BASE_FIELDS.map(f => f.fieldName))
+  for (const field of PRODUCT_FIELDS[ctx.category] ?? []) {
+    const incomingValue = incomingValues.get(field.fieldName)
+    if (isMissingFieldValue(incomingValue)) continue
+    if (!isFieldValueCompatible(field.fieldName, incomingValue!)) {
+      log.info("incremental field value ignored: incompatible with field", {
+        field: field.fieldName,
+        value: incomingValue,
+        productName: ctx.productName,
+      })
+      continue
+    }
+
+    const fieldFileName = `${ctx.category}-${ctx.productName}-字段-${sanitizeFileNamePart(field.fieldName)}.md`
+    const fieldRelative = `wiki/product_catalog/${fieldFileName}`
+    const fieldPath = `${ctx.catalogDir}/${fieldFileName}`
+    const existingFieldContent = await readFile(fieldPath).catch(() => null)
+    const existingFromField = existingFieldContent ? getFieldRowValue(existingFieldContent, field.fieldName) : ""
+    const existingValue = !isMissingFieldValue(existingFromField)
+      ? existingFromField
+      : existingValues.get(field.fieldName) ?? ""
+    const incomingFieldContent = buildProductFieldFile(field, incomingValue!, ctx.category, ctx.productName, baseFieldNames)
+
+    if (isMissingFieldValue(existingValue)) {
+      await writeFile(fieldPath, incomingFieldContent)
+      writtenPaths.push(fieldRelative)
+      const nextMain = setFirstFieldRow(updatedMain, field.fieldName, incomingValue!)
+      if (nextMain !== updatedMain) updatedMain = nextMain
+      fieldFilledCount++
+      continue
+    }
+
+    if (fieldValuesEquivalent(existingValue, incomingValue!)) {
+      if (!existingFieldContent) {
+        await writeFile(fieldPath, incomingFieldContent)
+        writtenPaths.push(fieldRelative)
+      }
+      sameFieldCount++
+      continue
+    }
+
+    addUniqueReviewItem(reviewItems, buildProductFieldConflictReviewItem({
+      category: ctx.category,
+      productName: ctx.productName,
+      fieldName: field.fieldName,
+      existingValue,
+      incomingValue: incomingValue!,
+      sourceFileName: ctx.fileName,
+      affectedPath: fieldRelative,
+      pageKind: "字段页",
+    }))
+    conflictCount++
+  }
+
+  if (updatedMain !== existingMain) {
+    await writeFile(mainPath, updatedMain)
+    writtenPaths.push(mainRelative)
+  }
+
+  const sourcePath = await writeProductSourceText(
+    ctx.projectPath,
+    ctx.category,
+    ctx.productName,
+    ctx.fileName,
+    ctx.cleanedContent,
+    ctx.sectionCount,
+    "incremental",
+  )
+  if (sourcePath) writtenPaths.push(sourcePath)
+
+  if (reviewItems.length > 0) {
+    useReviewStore.getState().addItems(reviewItems)
+  }
+
+  activity.updateItem(ctx.activityId, {
+    detail: `增量更新完成：补充字段 ${fieldFilledCount} 个，更新模块 ${moduleUpdatedCount} 个，相同字段 ${sameFieldCount} 个，冲突 ${conflictCount} 个。`,
+  })
+
+  return Array.from(new Set(writtenPaths))
+}
 
 export async function runProductCatalogExtraction(
   projectPath: string,
@@ -1443,6 +2140,7 @@ export async function runProductCatalogExtraction(
   llmConfig: LlmConfig,
   activityId: string,
   signal?: AbortSignal,
+  options: ProductCatalogExtractionOptions = {},
 ): Promise<string[]> {
   const productName = cleanProductName(rawProductName)
   log.info("product name cleaned", { raw: rawProductName, clean: productName })
@@ -1622,89 +2320,41 @@ export async function runProductCatalogExtraction(
   }
 
   // ── Phase 4: Write files ───────────────────────────────────
+  const mode = options.mode ?? "rebuild"
   activity.updateItem(activityId, {
-    detail: `正在写入 ${foundModules.length} 个模块文件 + 主文件 + 字段页...`,
+    detail: mode === "incremental"
+      ? `正在增量合并 ${foundModules.length} 个模块：只补非空字段，冲突进审核...`
+      : `正在写入 ${foundModules.length} 个模块文件 + 主文件 + 字段页...`,
   })
-  const writtenPaths: string[] = []
 
-  // 4a: Main product summary file
-  const mainContent = buildMainFile(mergedModules, category, productName, sections.length, allModules)
-  const mainFileName = `${category}-${productName}.md`
-  const mainPath = `${catalogDir}/${mainFileName}`
-  try {
-    await writeFile(mainPath, mainContent)
-    writtenPaths.push(`wiki/product_catalog/${mainFileName}`)
-  } catch (err) {
-    log.error("failed to write main file", { error: String(err) })
+  const writeContext: ProductCatalogWriteContext = {
+    projectPath,
+    catalogDir,
+    mergedModules,
+    foundModules,
+    category,
+    productName,
+    sectionCount: sections.length,
+    allModules,
+    sourceContent,
+    cleanedContent,
+    fileName,
+    activityId,
   }
+  const writtenPaths = mode === "incremental"
+    ? await writeIncrementalProductCatalogOutputs(writeContext)
+    : await writeFullProductCatalogOutputs(writeContext)
 
-  // 4b: Field-level pages aligned to the Excel schema (only for fields with values)
-  for (const fieldPage of buildProductFieldFiles(mainContent, category, productName)) {
-    if (!fieldPage.hasValue) continue
-    const fieldPath = `${catalogDir}/${fieldPage.fileName}`
-    const fieldRelative = `wiki/product_catalog/${fieldPage.fileName}`
-    try {
-      await writeFile(fieldPath, fieldPage.content)
-      writtenPaths.push(fieldRelative)
-    } catch (err) {
-      log.error("failed to write product field file", { path: fieldRelative, error: String(err) })
-    }
-  }
-
-  // 4c: Individual module files
-  for (const m of foundModules) {
-    const moduleDef = allModules.find(mod => mod.moduleName === m.moduleName)
-    if (!moduleDef) continue
-    const content = buildModuleFile(m, moduleDef, category, productName)
-    const moduleFileName = `${category}-${productName}-${m.moduleName}.md`
-    const modulePath = `${catalogDir}/${moduleFileName}`
-    const moduleRelative = `wiki/product_catalog/${moduleFileName}`
-    try {
-      await writeFile(modulePath, content)
-      writtenPaths.push(moduleRelative)
-    } catch (err) {
-      log.error("failed to write module file", { path: moduleRelative, error: String(err) })
-    }
-  }
-
-  log.info("all files written", { total: writtenPaths.length })
-
-  // 4d: Save OCR source text for reference
-  try {
-    const sourceDir = `${projectPath}/wiki/source_text`
-    await createDirectory(sourceDir)
-    const ocrFileName = `${category}-${productName}-OCR原文.md`
-    const ocrPath = `${sourceDir}/${ocrFileName}`
-    const ocrLines: string[] = [
-      "---",
-      `title: "${category}-${productName}-OCR原文"`,
-      `knowledge_domain: source_text`,
-      `insurance_category: "${category}"`,
-      `product_name: "${productName}"`,
-      `source_file: "${fileName}"`,
-      `total_chars: ${cleanedContent.length}`,
-      `total_sections: ${sections.length}`,
-      `created_by: auto-extract`,
-      "---",
-      "",
-      `# ${productName} OCR 原文`,
-      "",
-      cleanedContent,
-    ]
-    await writeFile(ocrPath, ocrLines.join("\n"))
-    writtenPaths.push(`wiki/source_text/${ocrFileName}`)
-    log.info("OCR source text saved", { path: ocrPath, chars: cleanedContent.length })
-  } catch (err) {
-    log.warn("failed to save OCR source text", { error: String(err) })
-  }
-
-  log.info("initial extraction complete; refinement is manual", {
+  log.info("product catalog extraction write complete", {
+    mode,
     foundModules: foundModules.length,
     filesWritten: writtenPaths.length,
   })
 
   activity.updateItem(activityId, {
-    detail: `完成：${foundModules.length}/${allModules.length} 个模块，${writtenPaths.length} 个文件。已保留原文，可点击“精炼”补抽缺口。`,
+    detail: mode === "incremental"
+      ? `增量完成：${writtenPaths.length} 个文件变更/记录，已有值未被自动覆盖。`
+      : `完成：${foundModules.length}/${allModules.length} 个模块，${writtenPaths.length} 个文件。已保留原文，可点击“精炼”补抽缺口。`,
   })
 
   return writtenPaths
@@ -1726,6 +2376,8 @@ interface RefineResult {
   fieldsUpdated: number
   skipped: number
   mainFilesRebuilt: number
+  fieldGapsAttempted?: number
+  fieldGapsRefined?: number
 }
 
 /**
@@ -1757,6 +2409,15 @@ function appendKeyFieldRow(content: string, fieldName: string, value: string): s
     }
     return `${header}${rows}| ${fieldName} | ${value} |\n`
   })
+}
+
+function setKeyFieldRow(content: string, fieldName: string, value: string): string {
+  const escapedField = escapeRegExp(fieldName)
+  const rowRegex = new RegExp(`\\|\\s*${escapedField}\\s*\\|\\s*[^|]*\\|`, "g")
+  if (rowRegex.test(content)) {
+    return content.replace(rowRegex, `| ${fieldName} | ${value} |`)
+  }
+  return appendKeyFieldRow(content, fieldName, value)
 }
 
 /**
@@ -1879,6 +2540,7 @@ ${sourceExcerpt}
 - 只输出“需要提取的字段”中在证据片段里明确找到的字段
 - 如果证据片段没有提到某字段，不要输出该行
 - 不要输出空值或任何占位文本（如"未明确"、"未提及"、"暂无"、"不涉及"），只输出有实际值的行
+- 不要输出引用式答案（如"见投保范围（1.3）"、"见条款1.3"、"详见附录2"）；如果只能定位到章节或附件但没有具体值，不要输出该行
 - 若原文用编号列出多种情形，必须完整列出所有编号情形，不要只输出第一条
 - 值要简洁准确`
 
@@ -1935,10 +2597,7 @@ ${sourceExcerpt}
     const escapedField = escapeRegExp(existingFieldName)
     const rowRegex = new RegExp(`\\|\\s*${escapedField}\\s*\\|\\s*[^|]*\\|`, "g")
     if (rowRegex.test(updatedContent)) {
-      updatedContent = updatedContent.replace(
-        new RegExp(`\\|\\s*${escapedField}\\s*\\|\\s*[^|]*\\|`, "g"),
-        `| ${existingFieldName} | ${newValue} |`
-      )
+      updatedContent = setKeyFieldRow(updatedContent, existingFieldName, newValue)
       updatedCount++
       existingFields.set(existingFieldName, newValue)
     } else {
@@ -1968,12 +2627,35 @@ interface CatalogModuleMetadata {
   sourceSections: number
 }
 
+interface CatalogFieldMetadata {
+  category: InsuranceCategoryType
+  productName: string
+  fieldName: string
+  sourceHint: string
+  valueType: string
+  evidenceModules: string[]
+}
+
 function frontmatterValue(content: string, key: string): string | null {
   const fmMatch = content.match(/^---\r?\n([\s\S]*?)\r?\n---/)
   if (!fmMatch) return null
   const pattern = new RegExp(`^${escapeRegExp(key)}:\\s*(?:"([^"]*)"|'([^']*)'|([^\\n#]*))\\s*$`, "m")
   const match = fmMatch[1].match(pattern)
   return (match?.[1] ?? match?.[2] ?? match?.[3] ?? "").trim() || null
+}
+
+function frontmatterArray(content: string, key: string): string[] {
+  const fmMatch = content.match(/^---\r?\n([\s\S]*?)\r?\n---/)
+  if (!fmMatch) return []
+  const pattern = new RegExp(`^${escapeRegExp(key)}:\\s*\\[(.*?)\\]\\s*$`, "m")
+  const match = fmMatch[1].match(pattern)
+  if (!match) return []
+  const raw = match[1].trim()
+  if (!raw) return []
+  return raw
+    .split(",")
+    .map(item => item.trim().replace(/^["']|["']$/g, ""))
+    .filter(Boolean)
 }
 
 function isInsuranceCategory(value: string | null | undefined): value is InsuranceCategoryType {
@@ -1996,6 +2678,28 @@ function parseCatalogModuleMetadata(content: string): CatalogModuleMetadata | nu
   }
 }
 
+function parseCatalogFieldMetadata(content: string): CatalogFieldMetadata | null {
+  const domain = frontmatterValue(content, "knowledge_domain")
+  if (domain !== "product_catalog_field") return null
+  if (frontmatterValue(content, "status") !== "rejected") return null
+
+  const categoryValue = frontmatterValue(content, "insurance_category")
+  const productName = frontmatterValue(content, "product_name")
+  const fieldName = frontmatterValue(content, "field_name")
+  if (!isInsuranceCategory(categoryValue) || !productName || !fieldName) return null
+
+  const fieldDef = PRODUCT_FIELDS[categoryValue].find(field => field.fieldName === fieldName)
+  return {
+    category: categoryValue,
+    productName,
+    fieldName,
+    sourceHint: frontmatterValue(content, "source_hint") ?? fieldDef?.source ?? "",
+    valueType: frontmatterValue(content, "value_type") ?? fieldDef?.valueType ?? "short",
+    evidenceModules: frontmatterArray(content, "evidence_modules")
+      .filter(moduleName => isModuleAllowedForCategory(categoryValue, moduleName)),
+  }
+}
+
 async function filterModuleFiles(
   files: CatalogFileEntry[],
   scope?: { category?: string; productName?: string },
@@ -2014,6 +2718,181 @@ async function filterModuleFiles(
     }
   }
   return moduleFiles
+}
+
+function orderEvidenceModules(fieldName: string, modules: string[]): string[] {
+  const preferred = FIELD_PREFERRED_EVIDENCE_MODULES[fieldName] ?? []
+  return [...modules].sort((a, b) => {
+    const ai = preferred.indexOf(a)
+    const bi = preferred.indexOf(b)
+    if (ai >= 0 || bi >= 0) return (ai >= 0 ? ai : 999) - (bi >= 0 ? bi : 999)
+    return 0
+  })
+}
+
+async function refineSingleFieldGap(
+  fieldFile: CatalogFileEntry,
+  moduleFilesByKey: Map<string, CatalogFileEntry>,
+  llmConfig: LlmConfig,
+  signal?: AbortSignal,
+): Promise<number> {
+  const fieldContent = await readFile(fieldFile.path)
+  const metadata = parseCatalogFieldMetadata(fieldContent)
+  if (!metadata || metadata.evidenceModules.length === 0) return 0
+
+  const orderedModules = orderEvidenceModules(metadata.fieldName, metadata.evidenceModules)
+  const evidence: Array<{ moduleName: string; file: CatalogFileEntry; content: string; sourceText: string }> = []
+  for (const moduleName of orderedModules) {
+    const moduleFile = moduleFilesByKey.get(`${metadata.category}\0${metadata.productName}\0${moduleName}`)
+    if (!moduleFile) continue
+    const content = await readFile(moduleFile.path)
+    const sourceText = extractSourceText(content)
+    if (!sourceText || sourceText.length < 20) continue
+    evidence.push({ moduleName, file: moduleFile, content, sourceText })
+  }
+  if (evidence.length === 0) return 0
+
+  const sourceText = evidence
+    .map(item => `## ${item.moduleName}\n\n${item.sourceText}`)
+    .join("\n\n---\n\n")
+  const sourceExcerpt = buildRefineSourceExcerpt(
+    sourceText,
+    evidence[0].moduleName,
+    [metadata.fieldName],
+    undefined,
+    14000,
+  )
+  const directHint = FIELD_DIRECT_EXTRACTION_HINTS[metadata.fieldName]
+  const prompt = `你是保险产品字段抽取专家。请只从证据片段中补抽 1 个产品字段。
+
+## 产品
+- 险种：${metadata.category}
+- 产品：${metadata.productName}
+
+## 需要补抽的字段
+- 字段名：${metadata.fieldName}
+- 字段类型：${metadata.valueType === "long" ? "长文本" : "短字段"}
+- 取值来源提示：${metadata.sourceHint || "未提供"}
+${directHint ? `- 字段说明：${directHint}` : ""}
+
+## 证据模块
+${evidence.map(item => `- ${item.moduleName}`).join("\n")}
+
+## 证据片段
+${sourceExcerpt}
+
+## 输出要求
+请输出 Markdown 表格：
+| 字段 | 值 |
+|---|---|
+| ${metadata.fieldName} | 提取到的值 |
+
+规则：
+- 只允许输出字段名为“${metadata.fieldName}”的一行。
+- 只有证据片段明确支持该字段时才输出；证据不足就不要输出任何字段行。
+- 不要输出“未明确”“未提及”“暂无”“不涉及”等占位文本。
+- 不要输出“见投保范围（1.3）”“见条款1.3”“详见附录2”等引用式答案；如果证据只给出章节或附件位置，没有具体字段值，就不要输出字段行。
+- 如果原文明示不支持、无该责任、无该费用，可写成“不支持...”或“无...”，但必须带上字段语义，不要只写单字“无”。
+- 短字段尽量简洁；长文本可用 100-300 字概括必要规则。`
+
+  let response = ""
+  try {
+    await new Promise<void>((resolve, reject) => {
+      streamChat(
+        llmConfig,
+        [{ role: "user", content: prompt }],
+        {
+          onToken: (token) => { response += token },
+          onDone: () => resolve(),
+          onError: (err) => reject(err),
+        },
+        signal,
+        { temperature: 0.1, max_tokens: 1200 },
+      )
+    })
+  } catch {
+    return 0
+  }
+
+  if (!response || signal?.aborted) return 0
+  const rowRegex = /^\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|$/gm
+  let rowMatch: RegExpExecArray | null
+  let extractedValue = ""
+  while ((rowMatch = rowRegex.exec(response)) !== null) {
+    const field = rowMatch[1].trim()
+    const value = sanitizeFieldValue(rowMatch[2])
+    if (field !== metadata.fieldName || !value || value === "值" || value === "---") continue
+    extractedValue = value
+    break
+  }
+  if (!extractedValue || isMissingFieldValue(extractedValue)) return 0
+
+  const target = evidence[0]
+  const updatedContent = markModuleHasValues(setKeyFieldRow(target.content, metadata.fieldName, extractedValue))
+  if (updatedContent === target.content) return 0
+  await writeFile(target.file.path, updatedContent)
+  log.info("field gap refined", {
+    field: metadata.fieldName,
+    moduleName: target.moduleName,
+    productName: metadata.productName,
+  })
+  return 1
+}
+
+async function refineFieldGapPages(
+  catalogDir: string,
+  llmConfig: LlmConfig,
+  scope?: { category?: string; productName?: string },
+  activityId?: string,
+  signal?: AbortSignal,
+): Promise<{ attempted: number; refined: number }> {
+  const tree = (await listDirectory(catalogDir)) as CatalogFileEntry[]
+  const files = tree.filter(file => !file.is_dir && file.name?.endsWith(".md"))
+
+  const moduleFilesByKey = new Map<string, CatalogFileEntry>()
+  const fieldFiles: CatalogFileEntry[] = []
+  for (const file of files) {
+    let content = ""
+    try {
+      content = await readFile(file.path)
+    } catch {
+      continue
+    }
+
+    const moduleMetadata = parseCatalogModuleMetadata(content)
+    if (moduleMetadata) {
+      moduleFilesByKey.set(`${moduleMetadata.category}\0${moduleMetadata.productName}\0${moduleMetadata.moduleName}`, file)
+      continue
+    }
+
+    const fieldMetadata = parseCatalogFieldMetadata(content)
+    if (!fieldMetadata) continue
+    if (scope?.category && fieldMetadata.category !== scope.category) continue
+    if (scope?.productName && fieldMetadata.productName !== scope.productName) continue
+    if (fieldMetadata.evidenceModules.length === 0) continue
+    fieldFiles.push(file)
+  }
+
+  const activity = activityId ? useActivityStore.getState() : null
+  let refined = 0
+  let attempted = 0
+  for (let i = 0; i < fieldFiles.length; i++) {
+    if (signal?.aborted) break
+    const file = fieldFiles[i]
+    attempted++
+    activity?.updateItem(activityId!, {
+      detail: `字段缺口补抽 ${i + 1}/${fieldFiles.length}...`,
+    })
+
+    try {
+      const updated = await refineSingleFieldGap(file, moduleFilesByKey, llmConfig, signal)
+      if (updated > 0) refined += updated
+    } catch (err) {
+      log.warn("failed to refine field gap", { file: file.name, error: String(err) })
+    }
+  }
+
+  return { attempted, refined }
 }
 
 async function rebuildMainFilesFromModules(
@@ -2096,7 +2975,6 @@ async function rebuildMainFilesFromModules(
     )
     await writeFile(`${catalogDir}/${group.category}-${group.productName}.md`, mainContent)
     for (const fieldPage of buildProductFieldFiles(mainContent, group.category, group.productName)) {
-      if (!fieldPage.hasValue) continue
       await writeFile(`${catalogDir}/${fieldPage.fileName}`, fieldPage.content)
     }
     rebuilt++
@@ -2160,6 +3038,20 @@ export async function refineModuleFiles(
     }
   }
 
+  let fieldGapsAttempted = 0
+  let fieldGapsRefined = 0
+  if (!signal?.aborted) {
+    activity.updateItem(activityId, { detail: "正在按字段页缺口补抽..." })
+    try {
+      const fieldResult = await refineFieldGapPages(catalogDir, llmConfig, { category, productName }, activityId, signal)
+      fieldGapsAttempted = fieldResult.attempted
+      fieldGapsRefined = fieldResult.refined
+      fieldsUpdated += fieldResult.refined
+    } catch (err) {
+      log.warn("failed to refine field gaps", { error: String(err), category, productName })
+    }
+  }
+
   let mainFilesRebuilt = 0
   if (!signal?.aborted) {
     activity.updateItem(activityId, { detail: "正在刷新产品主文件..." })
@@ -2170,7 +3062,7 @@ export async function refineModuleFiles(
     }
   }
 
-  return { totalModules: files.length, refined, fieldsUpdated, skipped, mainFilesRebuilt }
+  return { totalModules: files.length, refined, fieldsUpdated, skipped, mainFilesRebuilt, fieldGapsAttempted, fieldGapsRefined }
 }
 
 /**
@@ -2234,6 +3126,22 @@ export async function refineAllProductModules(
     }
   }
 
+  let fieldGapsAttempted = 0
+  let fieldGapsRefined = 0
+  if (!signal?.aborted) {
+    activity.updateItem(activityId, {
+      detail: "正在按字段页缺口补抽...",
+    })
+    try {
+      const fieldResult = await refineFieldGapPages(catalogDir, llmConfig, undefined, activityId, signal)
+      fieldGapsAttempted = fieldResult.attempted
+      fieldGapsRefined = fieldResult.refined
+      fieldsUpdated += fieldResult.refined
+    } catch (err) {
+      log.warn("failed to refine field gaps", { error: String(err), catalogDir })
+    }
+  }
+
   let mainFilesRebuilt = 0
   if (!signal?.aborted) {
     activity.updateItem(activityId, {
@@ -2246,10 +3154,10 @@ export async function refineAllProductModules(
     }
   }
 
-  log.info("批量精炼完成", { totalModules: allFiles.length, refined, fieldsUpdated, skipped, mainFilesRebuilt })
+  log.info("批量精炼完成", { totalModules: allFiles.length, refined, fieldsUpdated, skipped, mainFilesRebuilt, fieldGapsAttempted, fieldGapsRefined })
   activity.updateItem(activityId, {
-    detail: `精炼完成：${refined}/${allFiles.length} 个模块更新，共补充 ${fieldsUpdated} 个字段，刷新 ${mainFilesRebuilt} 个主文件。`,
+    detail: `精炼完成：${refined}/${allFiles.length} 个模块更新，字段缺口补抽 ${fieldGapsRefined}/${fieldGapsAttempted} 个，共补充 ${fieldsUpdated} 个字段，刷新 ${mainFilesRebuilt} 个主文件。`,
   })
 
-  return { totalModules: allFiles.length, refined, fieldsUpdated, skipped, mainFilesRebuilt }
+  return { totalModules: allFiles.length, refined, fieldsUpdated, skipped, mainFilesRebuilt, fieldGapsAttempted, fieldGapsRefined }
 }

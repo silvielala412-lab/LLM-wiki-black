@@ -249,10 +249,66 @@ function getProductConceptGroup(
   return group
 }
 
+function isEscapedAt(value: string, index: number): boolean {
+  let backslashes = 0
+  for (let i = index - 1; i >= 0 && value[i] === "\\"; i--) backslashes++
+  return backslashes % 2 === 1
+}
+
+function splitMarkdownTableRow(line: string): string[] | null {
+  const trimmed = line.trim()
+  if (!trimmed.startsWith("|") || !trimmed.endsWith("|")) return null
+
+  const cells: string[] = []
+  let current = ""
+  for (let i = 1; i < trimmed.length - 1; i++) {
+    const ch = trimmed[i]
+    if (ch === "|" && !isEscapedAt(trimmed, i)) {
+      cells.push(current.trim().replace(/\\\|/g, "|"))
+      current = ""
+    } else {
+      current += ch
+    }
+  }
+  cells.push(current.trim().replace(/\\\|/g, "|"))
+  return cells
+}
+
+const PLACEHOLDER_VALUE_REGEX = /^(未明确|未提及|未提到|未说明|未在本|未在证据|未从证据|证据片段未|证据片段中未|证据片段没有|证据中未|该字段未|文中未|原文未|原文中未|材料未|未找到|未见|没有提到|证据不足|无明确|不涉及|暂无|暂未|无此信息|无相关|本章节未|条款未|不适用于本|N\/A|n\/a|无$)/
+const REFERENCE_ONLY_PREFIX_REGEX = /^(?:详见|见|参见|参考|请参见|请查看|查看)\s*/i
+const REFERENCE_ONLY_TARGET_REGEX = /^(?:来源文件|费率表|原文|附件|附表|附录|条款|章节|投保范围|责任免除|保险金给付限额|计划表|保险计划表|第?\d+(?:\.\d+)*\s*(?:条|节)?)/i
+
+function isReferenceOnlyFieldValue(value: string): boolean {
+  const normalized = value.trim()
+  if (!REFERENCE_ONLY_PREFIX_REGEX.test(normalized)) return false
+  const target = normalized.replace(REFERENCE_ONLY_PREFIX_REGEX, "").trim()
+  if (!target) return true
+  return REFERENCE_ONLY_TARGET_REGEX.test(target) || (target.length <= 48 && /\d+(?:\.\d+)+/.test(target))
+}
+
+function isMissingConceptFieldValue(value: string): boolean {
+  const normalized = value.trim()
+  return normalized === "" || PLACEHOLDER_VALUE_REGEX.test(normalized) || isReferenceOnlyFieldValue(normalized)
+}
+
+function summarizeFieldValue(value: string, maxLength = 180): string {
+  const normalized = value.replace(/<br>/g, " ").replace(/\s+/g, " ").trim()
+  if (normalized.length <= maxLength) return normalized
+  return `${normalized.slice(0, maxLength).trim()}...`
+}
+
+function markdownTableCell(value: string): string {
+  return value.replace(/\s+/g, " ").trim().replace(/\|/g, "\\|")
+}
+
 function parseFieldValue(content: string, fieldName: string): string {
-  const escaped = fieldName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-  const match = content.match(new RegExp(`^\\|\\s*${escaped}\\s*\\|\\s*([^|]*?)\\s*\\|\\s*$`, "m"))
-  return (match?.[1] ?? "").replace(/<br>/g, " ").replace(/\\\|/g, "|").trim()
+  for (const line of content.split(/\r?\n/)) {
+    const cells = splitMarkdownTableRow(line)
+    if (!cells || cells.length < 2) continue
+    if (cells[0] !== fieldName) continue
+    return cells[1].replace(/<br>/g, " ").trim()
+  }
+  return ""
 }
 
 /**
@@ -304,8 +360,9 @@ async function scanProductConcepts(
       if (domain === "product_catalog_field") {
         if (!fieldName) continue
         const fieldScope = frontmatterScalar(fm, "field_scope") ?? "产品字段"
-        const valueSummary = parseFieldValue(content, fieldName)
-        if (!valueSummary) continue
+        const fieldValue = parseFieldValue(content, fieldName)
+        if (isMissingConceptFieldValue(fieldValue)) continue
+        const valueSummary = summarizeFieldValue(fieldValue)
 
         const group = getProductConceptGroup(conceptMap, fieldName)
         const exists = group.fields.some(i => i.productName === product && i.fieldName === fieldName)
@@ -355,15 +412,17 @@ function buildProductConceptPage(
     a.insuranceCategory.localeCompare(b.insuranceCategory) || a.productName.localeCompare(b.productName)
   )
   const instanceCount = moduleInstances.length + fieldInstances.length
+  const conceptRelativeLink = (wikiRelPath: string) =>
+    `../${wikiRelPath.replace(/\\/g, "/").replace(/^wiki\//, "")}`
 
   const moduleRows = moduleInstances.map(inst => {
-    const relLink = `../${inst.moduleRelPath}`
+    const relLink = conceptRelativeLink(inst.moduleRelPath)
     return `| ${inst.insuranceCategory} | ${inst.productName} | ${inst.moduleName} | [查看详情](${relLink}) |`
   }).join("\n")
 
   const fieldRows = fieldInstances.map(inst => {
-    const relLink = `../${inst.fieldRelPath}`
-    return `| ${inst.insuranceCategory} | ${inst.productName} | ${inst.fieldScope} | ${inst.valueSummary.replace(/\|/g, "\\|")} | [查看字段](${relLink}) |`
+    const relLink = conceptRelativeLink(inst.fieldRelPath)
+    return `| ${markdownTableCell(inst.insuranceCategory)} | ${markdownTableCell(inst.productName)} | ${markdownTableCell(inst.fieldScope)} | ${markdownTableCell(inst.valueSummary)} | [查看字段](${relLink}) |`
   }).join("\n")
 
   const relatedProducts = Array.from(new Set([

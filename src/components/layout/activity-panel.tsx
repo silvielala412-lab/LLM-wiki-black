@@ -7,7 +7,7 @@ import {
 import { useActivityStore, type ActivityItem } from "@/stores/activity-store"
 import { useWikiStore } from "@/stores/wiki-store"
 import { normalizePath, getFileName, isAbsolutePath } from "@/lib/path-utils"
-import { getQueue, getQueueSummary, retryTask, cancelTask, cancelAllTasks, type IngestTask } from "@/lib/ingest-queue"
+import { getQueue, getQueueSummary, retryTask, cancelTask, cancelAllTasks, ensureQueueProcessing, type IngestTask } from "@/lib/ingest-queue"
 
 const FILE_TYPE_ICONS: Record<string, typeof FileText> = {
   sources: BookOpen,
@@ -43,6 +43,10 @@ export function ActivityPanel() {
   // Poll queue state
   useEffect(() => {
     const interval = setInterval(() => {
+      const summary = getQueueSummary()
+      if (summary.pending + summary.processing > 0) {
+        ensureQueueProcessing("activity-panel")
+      }
       setQueueTasks([...getQueue()])
     }, 1000)
     return () => clearInterval(interval)

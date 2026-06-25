@@ -53,7 +53,7 @@ fn guard_path(path: &str, root: &Path) -> anyhow::Result<PathBuf> {
 
 // ── Known file type categories (same as Tauri) ──────────────────────────────
 
-const OFFICE_EXTS: &[&str] = &["docx", "pptx", "xlsx", "odt", "ods", "odp"];
+const OFFICE_EXTS: &[&str] = &["docx", "pptx", "xlsx", "xls", "odt", "ods", "odp"];
 const IMAGE_EXTS: &[&str] = &[
     "png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "tiff", "tif", "avif", "svg",
 ];
@@ -492,6 +492,33 @@ async fn extract_pdf_content_async(path: &str, state: &AppState) -> anyhow::Resu
 
     let dpi = state.llm_config.pdf_dpi;
     if state.llm_config.pdf_ocr_mode == "always" {
+        // "always" is intended to force OCR for scanned PDFs, but many product
+        // rate tables are digital PDFs with a high-quality text layer. For those,
+        // pdftotext preserves numeric tables far better than vision OCR and avoids
+        // sending large page-image payloads to the browser.
+        let path_for_pdftotext = path.to_string();
+        match tokio::task::spawn_blocking(move || extract_pdf_text_with_pdftotext(&path_for_pdftotext)).await {
+            Ok(Ok(text)) if !text.trim().is_empty() => {
+                let trimmed = text.trim().to_string();
+                let char_count = trimmed.chars().count();
+                if char_count >= 200 && !is_garbled_pdf_text(&trimmed) {
+                    tracing::info!(
+                        "pdf-ocr-mode=always: using text layer for {path} ({char_count} chars)"
+                    );
+                    return Ok(trimmed);
+                }
+                tracing::warn!(
+                    "pdf-ocr-mode=always: text layer unusable for {path} ({char_count} chars), falling through to image OCR"
+                );
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                tracing::warn!("pdf-ocr-mode=always: pdftotext failed for {path}: {e}, using image OCR");
+            }
+            Err(e) => {
+                tracing::warn!("pdf-ocr-mode=always: pdftotext worker failed for {path}: {e}, using image OCR");
+            }
+        }
         let path_owned = path.to_string();
         return tokio::task::spawn_blocking(move || pdf_image_pages_marker(&path_owned, dpi, None))
             .await?;

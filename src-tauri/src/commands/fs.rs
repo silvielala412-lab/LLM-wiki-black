@@ -8,7 +8,7 @@ use crate::panic_guard::run_guarded;
 use crate::types::wiki::FileNode;
 
 /// Known binary formats that need special extraction
-const OFFICE_EXTS: &[&str] = &["docx", "pptx", "xlsx", "odt", "ods", "odp"];
+const OFFICE_EXTS: &[&str] = &["docx", "pptx", "xlsx", "xls", "odt", "ods", "odp"];
 const IMAGE_EXTS: &[&str] = &[
     "png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "tiff", "tif", "avif", "heic", "heif", "svg",
 ];
@@ -16,7 +16,7 @@ const MEDIA_EXTS: &[&str] = &[
     "mp4", "webm", "mov", "avi", "mkv", "flv", "wmv", "m4v",
     "mp3", "wav", "ogg", "flac", "aac", "m4a", "wma",
 ];
-const LEGACY_DOC_EXTS: &[&str] = &["doc", "xls", "ppt", "pages", "numbers", "key", "epub"];
+const LEGACY_DOC_EXTS: &[&str] = &["doc", "ppt", "pages", "numbers", "key", "epub"];
 
 #[tauri::command]
 pub async fn read_file(path: String) -> Result<String, String> {

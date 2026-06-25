@@ -618,9 +618,11 @@ export function getModuleBatchesForFile(
 export function encodeProductCatalogFolderContext(
   category: InsuranceCategoryType,
   productName: string,
-  batchModules: string[],
-  batchIndex: number,
+  batchModules?: string[],
+  batchIndex = 0,
 ): string {
+  const base = `product_catalog > ${category} > ${productName}`
+  if (!batchModules || batchModules.length === 0) return base
   const encoded = batchModules.join(",")
-  return `product_catalog > ${category} > ${productName} > batch:${batchIndex}:${encoded}`
+  return `${base} > batch:${batchIndex}:${encoded}`
 }

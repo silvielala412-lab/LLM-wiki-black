@@ -41,6 +41,8 @@ import { getLogger } from "@/lib/logger"
 const log = getLogger("upload")
 const logDel = getLogger("delete")
 
+type UploadResult = { path: string; name: string; size: number } | { error: string; name: string }
+
 export function SourcesView() {
   const { t } = useTranslation()
   const project = useWikiStore((s) => s.project)
@@ -95,6 +97,28 @@ export function SourcesView() {
     return s === "[object Object]" || !s ? "上传失败，请检查服务器连接" : s
   }
 
+  async function uploadFilesOneByOne(
+    files: File[],
+    destDir: string,
+    statusText: (file: File, index: number, total: number) => string,
+  ): Promise<UploadResult[]> {
+    const { uploadFile } = await import("@/commands/fs")
+    const results: UploadResult[] = []
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i]
+      setImportStatus(statusText(file, i + 1, files.length))
+      try {
+        results.push(await uploadFile(file, destDir))
+      } catch (err) {
+        const message = extractErrMsg(err)
+        results.push({ error: message, name: file.name })
+        log.warn("upload file failed", { dest: destDir, file: file.name, error: message })
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 0))
+    }
+    return results
+  }
+
   const loadSources = useCallback(async () => {
     if (!project) return
     const pp = normalizePath(project.path)
@@ -134,8 +158,11 @@ export function SourcesView() {
       const destDir = `${pp}/raw/sources/${lineName}/${versionName}`
       try {
         log.info("upload start", { dest: `${lineName}/${versionName}`, files: files.length })
-        const { uploadFiles } = await import("@/commands/fs")
-        const results = await uploadFiles(files, destDir)
+        const results = await uploadFilesOneByOne(
+          files,
+          destDir,
+          (file, index, total) => `正在逐个上传 ${lineName}-${versionName} ${index}/${total}: ${file.name}`,
+        )
         const importedPaths: string[] = results
           .filter((r): r is { path: string; name: string; size: number } => "path" in r)
           .map((r) => r.path)
@@ -175,30 +202,56 @@ export function SourcesView() {
     input.click()
   }
 
+  const PRODUCT_UPLOAD_ACCEPT = ".pdf,.md,.mdx,.txt,.docx,.xlsx,.xls,.csv,.json,.png,.jpg,.jpeg"
+  const PRODUCT_UPLOAD_EXTS = new Set(PRODUCT_UPLOAD_ACCEPT.split(",").map((ext) => ext.slice(1)))
+  const PRODUCT_BUNDLE_MANIFEST_NAME = "__product_bundle__.json"
+
+  function isSupportedProductUploadFile(file: File): boolean {
+    if (file.name.startsWith("~$")) return false
+    const ext = file.name.split(".").pop()?.toLowerCase() ?? ""
+    return PRODUCT_UPLOAD_EXTS.has(ext)
+  }
+
   /**
    * Upload files for a specific insurance product (product catalog domain).
    * Destination: raw/sources/产品/{category}/{productName}/
    * folderContext: "product_catalog > {category} > {productName}"
    * The ingest pipeline detects this folderContext and routes to product catalog extraction.
    */
-  async function handleProductUpload(category: InsuranceCategoryType, productName: string) {
+  async function handleProductUpload(category: InsuranceCategoryType, productName: string, mode: "files" | "folder" = "files") {
     if (!project || !productName.trim()) return
     const input = document.createElement("input")
     input.type = "file"
     input.multiple = true
-    input.accept = ".pdf,.md,.mdx,.txt,.docx,.xlsx,.png,.jpg,.jpeg"
+    input.accept = PRODUCT_UPLOAD_ACCEPT
+    if (mode === "folder") {
+      // @ts-expect-error — webkitdirectory is not in TS types but works in all modern browsers
+      input.webkitdirectory = true
+    }
     input.onchange = async () => {
-      const files = Array.from(input.files ?? [])
+      const selectedFiles = Array.from(input.files ?? [])
+      const files = selectedFiles.filter(isSupportedProductUploadFile)
       if (!files.length) return
       setImporting(true)
       setImportError(null)
       const pp = normalizePath(project.path)
       const destDir = `${pp}/raw/sources/产品/${category}/${productName.trim()}`
-      setImportStatus(`正在上传到 ${category} > ${productName}...`)
+      setImportStatus(
+        mode === "folder"
+          ? `正在上传产品文件夹到 ${category} > ${productName}...`
+          : `正在上传到 ${category} > ${productName}...`
+      )
       try {
-        log.info("product upload start", { dest: `产品/${category}/${productName}`, files: files.length })
-        const { uploadFiles } = await import("@/commands/fs")
-        const results = await uploadFiles(files, destDir)
+        log.info("product upload start", { dest: `产品/${category}/${productName}`, files: files.length, mode })
+        const { writeFile } = await import("@/commands/fs")
+        const results = await uploadFilesOneByOne(
+          files,
+          destDir,
+          (file, index, total) =>
+            mode === "folder"
+              ? `正在逐个上传产品文件夹 ${index}/${total}: ${file.name}`
+              : `正在逐个上传 ${index}/${total}: ${file.name}`,
+        )
         const importedPaths: string[] = results
           .filter((r): r is { path: string; name: string; size: number } => "path" in r)
           .map((r) => r.path)
@@ -212,15 +265,45 @@ export function SourcesView() {
         await loadSources()
         const canIngest = !!(llmConfig.apiKey || llmConfig.provider === "ollama" || llmConfig.provider === "custom")
         if (canIngest && importedPaths.length > 0) {
-          // Single task per file — the new section-scan extractor handles
-          // splitting and parallel extraction internally. No more 7-14 batch tasks.
           const tasks_pc: Array<{ sourcePath: string; folderContext: string }> = []
-          for (const absPath of importedPaths) {
-            const sourcePath = absPath.startsWith(pp + "/") ? absPath.slice(pp.length + 1) : absPath
+          const folderContext = encodeProductCatalogFolderContext(category, productName.trim(), [], 0)
+          if (mode === "folder" || importedPaths.length > 1) {
+            const uploadedByPath = new Map(
+              results
+                .filter((r): r is { path: string; name: string; size: number } => "path" in r)
+                .map((r) => [normalizePath(r.path), r])
+            )
+            const manifestPath = `${destDir}/${PRODUCT_BUNDLE_MANIFEST_NAME}`
+            const manifest = {
+              kind: "product_catalog_bundle",
+              version: 1,
+              insurance_category: category,
+              product_name: productName.trim(),
+              created_at: new Date().toISOString(),
+              upload_mode: mode,
+              files: importedPaths.map((absPath, index) => {
+                const normalized = normalizePath(absPath)
+                const uploaded = uploadedByPath.get(normalized)
+                const selected = files[index]
+                return {
+                  name: uploaded?.name ?? selected?.name ?? getFileName(normalized),
+                  path: normalized.startsWith(pp + "/") ? normalized.slice(pp.length + 1) : normalized,
+                  size: uploaded?.size ?? selected?.size ?? 0,
+                  original_relative_path: (selected as File & { webkitRelativePath?: string } | undefined)?.webkitRelativePath ?? "",
+                }
+              }),
+            }
+            await writeFile(manifestPath, JSON.stringify(manifest, null, 2))
+            const manifestSourcePath = manifestPath.startsWith(pp + "/") ? manifestPath.slice(pp.length + 1) : manifestPath
             tasks_pc.push({
-              sourcePath,
-              folderContext: encodeProductCatalogFolderContext(category, productName.trim(), [], 0),
+              sourcePath: manifestSourcePath,
+              folderContext,
             })
+          } else {
+            for (const absPath of importedPaths) {
+              const sourcePath = absPath.startsWith(pp + "/") ? absPath.slice(pp.length + 1) : absPath
+              tasks_pc.push({ sourcePath, folderContext })
+            }
           }
           log.info("product enqueue batch", { project: project.id, files: importedPaths.length, tasks: tasks_pc.length })
           enqueueBatch(project.id, tasks_pc).catch((err) => {
@@ -258,8 +341,11 @@ export function SourcesView() {
       const destDir = `${pp}/raw/sources`
       try {
         log.info("upload start", { dest: "raw/sources", files: files.length })
-        const { uploadFiles } = await import("@/commands/fs")
-        const results = await uploadFiles(files, destDir)
+        const results = await uploadFilesOneByOne(
+          files,
+          destDir,
+          (file, index, total) => `正在逐个上传 ${index}/${total}: ${file.name}`,
+        )
         const importedPaths: string[] = results
           .filter((r): r is { path: string; name: string; size: number } => "path" in r)
           .map((r) => r.path)
@@ -316,7 +402,6 @@ export function SourcesView() {
       setImportStatus(`正在分析文件夹结构 (${files.length} 个文件)...`)
       const pp = normalizePath(project.path)
       try {
-      const { uploadFiles } = await import("@/commands/fs")
       const { SERVICE_HIERARCHY, resolveCanonicalVersionName } = await import("@/lib/insurance-schema-registry")
 
       /** Try to match a filename or relative path against known service lines/versions */
@@ -418,7 +503,11 @@ export function SourcesView() {
         const destDir = `${pp}/raw/sources/${grp.lineName}/${grp.versionName}`
         setImportStatus(`正在上传到 ${grp.lineName}-${grp.versionName} (${grp.files.length} 个文件)...`)
         try {
-          const results = await uploadFiles(grp.files, destDir)
+          const results = await uploadFilesOneByOne(
+            grp.files,
+            destDir,
+            (file, index, total) => `正在逐个上传 ${grp.lineName}-${grp.versionName} ${index}/${total}: ${file.name}`,
+          )
           for (const r of results) {
             if ("path" in r) {
               successCount++
@@ -442,7 +531,11 @@ export function SourcesView() {
           const destDir = `${pp}/raw/sources/${grp.lineName}/${versionName}`
           setImportStatus(`正在上传通用手册到 ${grp.lineName}-${versionName} (${grp.files.length} 个文件)...`)
           try {
-            const results = await uploadFiles(grp.files, destDir)
+            const results = await uploadFilesOneByOne(
+              grp.files,
+              destDir,
+              (file, index, total) => `正在逐个上传 ${grp.lineName}-${versionName} ${index}/${total}: ${file.name}`,
+            )
             for (const r of results) {
               if ("path" in r) {
                 successCount++
@@ -464,7 +557,11 @@ export function SourcesView() {
       if (unclassified.length > 0) {
         setImportStatus(`正在上传 ${unclassified.length} 个未识别文件...`)
         try {
-          const results = await uploadFiles(unclassified, `${pp}/raw/sources`)
+          const results = await uploadFilesOneByOne(
+            unclassified,
+            `${pp}/raw/sources`,
+            (file, index, total) => `正在逐个上传未分类文件 ${index}/${total}: ${file.name}`,
+          )
           for (const r of results) {
             if ("path" in r) {
               successCount++
@@ -883,7 +980,10 @@ export function SourcesView() {
                     const rebuildSuffix = result.mainFilesRebuilt > 0
                       ? `，刷新 ${result.mainFilesRebuilt} 个主文件`
                       : ""
-                    setImportStatus(`✓ 精炼完成：${result.refined}/${result.totalModules} 个模块更新，补充 ${result.fieldsUpdated} 个字段${rebuildSuffix}`)
+                    const fieldGapSuffix = result.fieldGapsAttempted
+                      ? `，字段缺口补抽 ${result.fieldGapsRefined ?? 0}/${result.fieldGapsAttempted} 个`
+                      : ""
+                    setImportStatus(`✓ 精炼完成：${result.refined}/${result.totalModules} 个模块更新${fieldGapSuffix}，补充 ${result.fieldsUpdated} 个字段${rebuildSuffix}`)
                     await loadSources()
                   } catch (err) {
                     console.error("Refine failed:", err)
@@ -1502,7 +1602,7 @@ function ProductCatalogPanel({
   importing,
 }: {
   sources: FileNode[]
-  onProductUpload: (category: InsuranceCategoryType, productName: string) => void
+  onProductUpload: (category: InsuranceCategoryType, productName: string, mode?: "files" | "folder") => void
   onOpen: (node: FileNode) => void
   onIngest: (node: FileNode) => void
   importing: boolean
@@ -1592,11 +1692,21 @@ function ProductCatalogPanel({
           <Button
             size="sm"
             disabled={importing || !productName.trim()}
-            onClick={() => onProductUpload(selectedCategory, productName)}
+            onClick={() => onProductUpload(selectedCategory, productName, "files")}
             className="shrink-0"
           >
             <Upload className="mr-1 h-3.5 w-3.5" />
             上传文件
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={importing || !productName.trim()}
+            onClick={() => onProductUpload(selectedCategory, productName, "folder")}
+            className="shrink-0"
+          >
+            <Folder className="mr-1 h-3.5 w-3.5" />
+            上传文件夹
           </Button>
         </div>
 

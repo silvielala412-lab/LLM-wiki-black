@@ -10,6 +10,7 @@ import { getFileName, normalizePath } from "@/lib/path-utils"
 import { cascadeDeleteWikiPage } from "@/lib/wiki-page-delete"
 import { ConfirmDialog } from "@/components/ui/confirm-dialog"
 import { useAuthStore } from "@/stores/auth-store"
+import { syncProductFieldPageAfterEdit } from "@/lib/product-catalog-sync"
 
 const LARGE_PREVIEW_CHAR_LIMIT = 160000
 
@@ -25,6 +26,7 @@ export function PreviewPanel() {
   const setSelectedFile = useWikiStore((s) => s.setSelectedFile)
   const setFileTree = useWikiStore((s) => s.setFileTree)
   const bumpDataVersion = useWikiStore((s) => s.bumpDataVersion)
+  const dataVersion = useWikiStore((s) => s.dataVersion)
   const project = useWikiStore((s) => s.project)
   const username = useAuthStore((s) => s.user?.username ?? "unknown")
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -51,7 +53,7 @@ export function PreviewPanel() {
         setFileContent(content)
       })
       .catch((err) => { lastLoadedRef.current = ""; setPreviewTruncated(false); setFileContent(`Error: ${err}`) })
-  }, [selectedFile, setFileContent])
+  }, [selectedFile, dataVersion, setFileContent])
 
   const handleSave = useCallback((markdown: string) => {
     if (!selectedFile) return
@@ -59,10 +61,21 @@ export function PreviewPanel() {
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current)
     saveTimerRef.current = setTimeout(() => {
       writeFile(selectedFile, markdown)
-        .then(() => { lastLoadedRef.current = markdown })
+        .then(async () => {
+          let savedContent = markdown
+          if (project?.path) {
+            const syncResult = await syncProductFieldPageAfterEdit(project.path, selectedFile, markdown)
+            savedContent = syncResult.content
+            if (syncResult.isProductFieldPage) {
+              setFileContent(savedContent)
+              bumpDataVersion()
+            }
+          }
+          lastLoadedRef.current = savedContent
+        })
         .catch((err) => console.error("Failed to save:", err))
     }, 1000)
-  }, [selectedFile])
+  }, [selectedFile, project, setFileContent, bumpDataVersion])
 
   useEffect(() => () => { if (saveTimerRef.current) clearTimeout(saveTimerRef.current) }, [])
 

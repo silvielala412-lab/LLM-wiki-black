@@ -4,6 +4,7 @@ import {
   AlertTriangle,
   Copy,
   FileQuestion,
+  FileText,
   CheckCircle2,
   Lightbulb,
   MessageSquare,
@@ -11,6 +12,7 @@ import {
   Check,
   Trash2,
   HelpCircle,
+  ArrowRight,
   ShieldCheck,
   ShieldAlert,
   ShieldX,
@@ -22,6 +24,8 @@ import { writeFile, readFile, listDirectory, deleteFile } from "@/commands/fs"
 import { normalizePath } from "@/lib/path-utils"
 import { ReviewPanel as GovernanceReviewPanel } from "./review-panel"
 import { EvolutionPanel } from "./evolution-panel"
+import { useGovernanceStore } from "@/stores/governance-store"
+import { applyProductFieldValueUpdate } from "@/lib/product-catalog-sync"
 
 const typeConfig: Record<ReviewItem["type"], { icon: typeof AlertTriangle; label: string; color: string }> = {
   contradiction: { icon: AlertTriangle, label: "Contradiction", color: "text-amber-500" },
@@ -31,6 +35,79 @@ const typeConfig: Record<ReviewItem["type"], { icon: typeof AlertTriangle; label
   suggestion: { icon: Lightbulb, label: "Suggestion", color: "text-emerald-500" },
 }
 
+type ProductFieldConflict = NonNullable<ReviewItem["conflict"]>
+
+function isKnowledgeReviewItem(item: ReviewItem): boolean {
+  return item.type === "contradiction" || item.type === "confirm"
+}
+
+function extractReviewLine(description: string, label: string): string {
+  const match = description.match(new RegExp(`^${label}[:：]\\s*(.+)$`, "m"))
+  return match?.[1]?.trim() ?? ""
+}
+
+function parseLegacyProductConflict(item: ReviewItem): ProductFieldConflict | null {
+  if (!item.title.includes("产品字段冲突") && !item.title.includes("产品身份冲突")) return null
+  const existingValue = extractReviewLine(item.description, "现有值")
+  const incomingValue = extractReviewLine(item.description, "新增值")
+  const fieldName = extractReviewLine(item.description, "字段")
+  const affectedPath = extractReviewLine(item.description, "页面") || item.affectedPages?.[0] || ""
+  if (!existingValue && !incomingValue) return null
+
+  const productLine = extractReviewLine(item.description, "产品")
+  const separator = productLine.indexOf("-")
+  const category = separator > 0 ? productLine.slice(0, separator) : ""
+  const productName = separator > 0 ? productLine.slice(separator + 1) : productLine
+  const sourceFileName = item.sourcePath ||
+    item.description.match(/增量上传文件「([^」]+)」/)?.[1]?.trim() ||
+    "增量上传文件"
+
+  return {
+    kind: "product-field",
+    category,
+    productName,
+    fieldName: fieldName || item.title.replace(/^.*?：/, ""),
+    pageKind: item.title.includes("产品身份冲突") ? "产品身份" : "字段页",
+    existingValue,
+    incomingValue,
+    sourceFileName,
+    affectedPath,
+  }
+}
+
+function getProductConflict(item: ReviewItem): ProductFieldConflict | null {
+  return item.conflict ?? parseLegacyProductConflict(item)
+}
+
+function compactPath(path: string): string {
+  if (path.length <= 80) return path
+  const parts = path.replace(/\\/g, "/").split("/")
+  return parts.length > 2 ? `.../${parts.slice(-2).join("/")}` : `...${path.slice(-76)}`
+}
+
+async function openWikiPage(projectPath: string, relativeOrAbsolutePath: string): Promise<void> {
+  const pp = normalizePath(projectPath)
+  const normalized = normalizePath(relativeOrAbsolutePath)
+  const fullPath = normalized.startsWith(pp) ? normalized : `${pp}/${normalized}`
+  const content = await readFile(fullPath)
+  const store = useWikiStore.getState()
+  store.setSelectedFile(fullPath)
+  store.setFileContent(content)
+  store.setActiveView("wiki")
+}
+
+async function applyProductConflictIncomingValue(projectPath: string, conflict: ProductFieldConflict): Promise<void> {
+  const pp = normalizePath(projectPath)
+  const fieldPath = `${pp}/${normalizePath(conflict.affectedPath)}`
+  await applyProductFieldValueUpdate(pp, {
+    fieldPath,
+    category: conflict.category,
+    productName: conflict.productName,
+    fieldName: conflict.fieldName,
+    value: conflict.incomingValue,
+  })
+}
+
 export function ReviewView() {
   const items = useReviewStore((s) => s.items)
   const resolveItem = useReviewStore((s) => s.resolveItem)
@@ -38,10 +115,49 @@ export function ReviewView() {
   const clearResolved = useReviewStore((s) => s.clearResolved)
   const project = useWikiStore((s) => s.project)
   const setFileTree = useWikiStore((s) => s.setFileTree)
+  const governancePendingCount = useGovernanceStore((s) => s.pendingCount)
   const [tab, setTab] = useState<"governance" | "evolution" | "ai-suggestions">("governance")
 
   const handleResolve = useCallback(async (id: string, action: string) => {
     const pp = project ? normalizePath(project.path) : ""
+    const reviewItem = items.find((i) => i.id === id)
+    const productConflict = reviewItem ? getProductConflict(reviewItem) : null
+
+    if (project && productConflict) {
+      if (action === "manual-merge") {
+        try {
+          await openWikiPage(pp, productConflict.affectedPath)
+        } catch (err) {
+          console.error("Failed to open conflict page:", err)
+        }
+        return
+      }
+
+      if (action === "accept-incoming") {
+        try {
+          await applyProductConflictIncomingValue(pp, productConflict)
+          const tree = await listDirectory(pp)
+          setFileTree(tree)
+          useWikiStore.getState().bumpDataVersion()
+          resolveItem(id, "已采用新值")
+        } catch (err) {
+          console.error("Failed to apply incoming product field value:", err)
+          window.alert(`采用新值失败：${err instanceof Error ? err.message : String(err)}`)
+        }
+        return
+      }
+
+      if (action === "keep-existing") {
+        resolveItem(id, "已保留旧值")
+        return
+      }
+
+      if (action === "dismiss") {
+        dismissItem(id)
+        return
+      }
+    }
+
     // Deep Research — must be checked FIRST before any fuzzy matching
     if (action === "__deep_research__" && project) {
       const searchConfig = useWikiStore.getState().searchApiConfig
@@ -226,10 +342,15 @@ export function ReviewView() {
     } else {
       resolveItem(id, action)
     }
-  }, [project, items, resolveItem, setFileTree])
+  }, [project, items, resolveItem, dismissItem, setFileTree])
 
-  const pending = items.filter((i) => !i.resolved)
-  const resolved = items.filter((i) => i.resolved)
+  const knowledgeItems = items.filter(isKnowledgeReviewItem)
+  const aiItems = items.filter((i) => !isKnowledgeReviewItem(i))
+  const knowledgePending = knowledgeItems.filter((i) => !i.resolved)
+  const knowledgeResolved = knowledgeItems.filter((i) => i.resolved)
+  const aiPending = aiItems.filter((i) => !i.resolved)
+  const aiResolved = aiItems.filter((i) => i.resolved)
+  const knowledgeTabCount = knowledgePending.length + governancePendingCount
 
   return (
     <div className="flex h-full min-h-0 flex-col overflow-hidden">
@@ -244,6 +365,11 @@ export function ReviewView() {
           }`}
         >
           🛡 知识审核
+          {knowledgeTabCount > 0 && (
+            <span className="ml-1 rounded-full bg-amber-500 px-1.5 py-0.5 text-[10px] text-white">
+              {knowledgeTabCount}
+            </span>
+          )}
         </button>
         <button
           onClick={() => setTab("evolution")}
@@ -264,9 +390,9 @@ export function ReviewView() {
           }`}
         >
           💡 AI 建议
-          {pending.length > 0 && (
+          {aiPending.length > 0 && (
             <span className="ml-1 rounded-full bg-primary px-1.5 py-0.5 text-[10px] text-primary-foreground">
-              {pending.length}
+              {aiPending.length}
             </span>
           )}
         </button>
@@ -274,7 +400,13 @@ export function ReviewView() {
 
       {/* Governance tab */}
       {tab === "governance" && (
-        <div className="min-h-0 flex-1 overflow-hidden">
+        <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+          <KnowledgeReviewSection
+            pending={knowledgePending}
+            resolved={knowledgeResolved}
+            onResolve={handleResolve}
+            onDismiss={dismissItem}
+          />
           <GovernanceReviewPanel />
         </div>
       )}
@@ -289,7 +421,7 @@ export function ReviewView() {
       {/* AI Suggestions tab */}
       {tab === "ai-suggestions" && (
         <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-          {resolved.length > 0 && (
+          {aiResolved.length > 0 && (
             <div className="flex justify-end border-b px-3 py-1.5">
               <Button variant="ghost" size="sm" onClick={clearResolved} className="text-xs">
                 <Trash2 className="mr-1 h-3 w-3" />
@@ -298,20 +430,20 @@ export function ReviewView() {
             </div>
           )}
           <div className="min-h-0 flex-1 overflow-y-auto">
-            {items.length === 0 ? (
+            {aiItems.length === 0 ? (
               <div className="flex flex-col items-center justify-center gap-2 p-8 text-center text-sm text-muted-foreground">
                 <CheckCircle2 className="h-8 w-8 text-muted-foreground/30" />
-                <p>All clear — nothing to review</p>
+                <p>暂无 AI 建议</p>
               </div>
             ) : (
               <div className="flex flex-col gap-2 p-3">
-                {pending.map((item) => (
+                {aiPending.map((item) => (
                   <ReviewCard key={item.id} item={item} onResolve={handleResolve} onDismiss={dismissItem} />
                 ))}
-                {resolved.length > 0 && pending.length > 0 && (
-                  <div className="my-2 text-center text-xs text-muted-foreground">— Resolved —</div>
+                {aiResolved.length > 0 && aiPending.length > 0 && (
+                  <div className="my-2 text-center text-xs text-muted-foreground">已处理</div>
                 )}
-                {resolved.map((item) => (
+                {aiResolved.map((item) => (
                   <ReviewCard key={item.id} item={item} onResolve={handleResolve} onDismiss={dismissItem} />
                 ))}
               </div>
@@ -319,6 +451,53 @@ export function ReviewView() {
           </div>
         </div>
       )}
+    </div>
+  )
+}
+
+
+function KnowledgeReviewSection({
+  pending,
+  resolved,
+  onResolve,
+  onDismiss,
+}: {
+  pending: ReviewItem[]
+  resolved: ReviewItem[]
+  onResolve: (id: string, action: string) => void
+  onDismiss: (id: string) => void
+}) {
+  if (pending.length === 0 && resolved.length === 0) return null
+
+  return (
+    <div className="flex max-h-[58%] min-h-[240px] flex-col border-b bg-background">
+      <div className="flex items-center gap-2 border-b px-4 py-3">
+        <AlertTriangle className="h-4 w-4 text-amber-500" />
+        <div className="min-w-0 flex-1">
+          <h2 className="text-sm font-semibold">字段冲突审核</h2>
+          <p className="mt-0.5 text-[11px] text-muted-foreground">
+            增量上传发现的新旧字段差异。系统已保留旧值，等待管理员判断。
+          </p>
+        </div>
+        {pending.length > 0 && (
+          <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[11px] font-bold text-amber-700 dark:bg-amber-950/50 dark:text-amber-300">
+            {pending.length} 待处理
+          </span>
+        )}
+      </div>
+      <div className="min-h-0 flex-1 overflow-y-auto p-3">
+        <div className="flex flex-col gap-3">
+          {pending.map((item) => (
+            <ReviewCard key={item.id} item={item} onResolve={onResolve} onDismiss={onDismiss} />
+          ))}
+          {resolved.length > 0 && pending.length > 0 && (
+            <div className="text-center text-xs text-muted-foreground">已处理</div>
+          )}
+          {resolved.map((item) => (
+            <ReviewCard key={item.id} item={item} onResolve={onResolve} onDismiss={onDismiss} />
+          ))}
+        </div>
+      </div>
     </div>
   )
 }
@@ -336,6 +515,25 @@ function ReviewCard({
   const config = typeConfig[item.type]
   const Icon = config.icon
   const score = item.aiScore
+  const conflict = getProductConflict(item)
+  const project = useWikiStore((s) => s.project)
+  const displayTitle = conflict ? `字段冲突：${conflict.fieldName}` : item.title
+
+  const openAffectedPage = useCallback(async (page: string) => {
+    if (!project) return
+    const pp = normalizePath(project.path)
+    const normalized = normalizePath(page)
+    const fullPath = normalized.startsWith(pp) ? normalized : `${pp}/${normalized}`
+    try {
+      const content = await readFile(fullPath)
+      const store = useWikiStore.getState()
+      store.setSelectedFile(fullPath)
+      store.setFileContent(content)
+      store.setActiveView("wiki")
+    } catch (err) {
+      console.warn("Failed to open affected review page:", err)
+    }
+  }, [project])
 
   // Confidence bar color and verdict icon
   const verdictColor = !score ? "" :
@@ -357,7 +555,12 @@ function ReviewCard({
       <div className="mb-2 flex items-start justify-between gap-2">
         <div className="flex items-center gap-2">
           <Icon className={`h-4 w-4 shrink-0 ${config.color}`} />
-          <span className="font-medium">{item.title}</span>
+          <span className="font-medium">{displayTitle}</span>
+          {conflict && (
+            <span className="rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:bg-amber-950/50 dark:text-amber-300">
+              {conflict.pageKind}
+            </span>
+          )}
         </div>
         <button
           onClick={() => onDismiss(item.id)}
@@ -367,7 +570,15 @@ function ReviewCard({
         </button>
       </div>
 
-      <p className="mb-3 text-xs text-muted-foreground">{item.description}</p>
+      {conflict ? (
+        <ProductConflictDetails
+          conflict={conflict}
+          pages={item.affectedPages}
+          onOpenPage={openAffectedPage}
+        />
+      ) : (
+        <p className="mb-3 text-xs text-muted-foreground whitespace-pre-wrap">{item.description}</p>
+      )}
 
       {/* AI Score Panel */}
       {score && (
@@ -408,7 +619,7 @@ function ReviewCard({
         </div>
       )}
 
-      {item.affectedPages && item.affectedPages.length > 0 && (
+      {!conflict && item.affectedPages && item.affectedPages.length > 0 && (
         <div className="mb-3 text-xs text-muted-foreground">
           Pages: {item.affectedPages.join(", ")}
         </div>
@@ -444,6 +655,114 @@ function ReviewCard({
           {item.resolvedAction}
         </div>
       )}
+    </div>
+  )
+}
+
+function ProductConflictDetails({
+  conflict,
+  pages,
+  onOpenPage,
+}: {
+  conflict: ProductFieldConflict
+  pages?: string[]
+  onOpenPage: (page: string) => void
+}) {
+  const affectedPages = pages?.length ? pages : conflict.affectedPath ? [conflict.affectedPath] : []
+
+  return (
+    <div className="mb-3 space-y-3">
+      <div className="grid gap-2 text-[11px] text-muted-foreground sm:grid-cols-2">
+        <InfoPill label="产品" value={`${conflict.category ? `${conflict.category} / ` : ""}${conflict.productName}`} />
+        <InfoPill label="字段" value={conflict.fieldName} />
+        <InfoPill label="来源文件" value={conflict.sourceFileName} />
+        <InfoPill label="处理状态" value="保留旧值，等待人工审核" />
+      </div>
+
+      <div className="grid gap-2 lg:grid-cols-[1fr_auto_1fr]">
+        <ConflictValueBox
+          title="当前知识"
+          subtitle="已保留，未被自动覆盖"
+          value={conflict.existingValue}
+          tone="existing"
+        />
+        <div className="hidden items-center justify-center lg:flex">
+          <ArrowRight className="h-4 w-4 text-muted-foreground/60" />
+        </div>
+        <ConflictValueBox
+          title="增量抽取"
+          subtitle="来自本次上传文件"
+          value={conflict.incomingValue}
+          tone="incoming"
+        />
+      </div>
+
+      {affectedPages.length > 0 && (
+        <div className="rounded-md border bg-muted/20 px-2.5 py-2">
+          <div className="mb-1.5 flex items-center gap-1.5 text-[11px] font-medium text-muted-foreground">
+            <FileText className="h-3.5 w-3.5" />
+            影响页面
+          </div>
+          <div className="flex flex-wrap gap-1.5">
+            {affectedPages.map((page) => (
+              <button
+                key={page}
+                type="button"
+                onClick={() => onOpenPage(page)}
+                title={page}
+                className="max-w-full rounded border bg-background px-2 py-1 text-left text-[11px] text-foreground hover:bg-accent"
+              >
+                {compactPath(page)}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function InfoPill({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="min-w-0 rounded-md border bg-muted/20 px-2.5 py-1.5">
+      <div className="mb-0.5 text-[10px] font-medium text-muted-foreground">{label}</div>
+      <div className="truncate text-xs text-foreground" title={value}>{value || "-"}</div>
+    </div>
+  )
+}
+
+function ConflictValueBox({
+  title,
+  subtitle,
+  value,
+  tone,
+}: {
+  title: string
+  subtitle: string
+  value: string
+  tone: "existing" | "incoming"
+}) {
+  const toneClasses = tone === "existing"
+    ? "border-slate-200 bg-slate-50/80 dark:border-slate-800 dark:bg-slate-950/30"
+    : "border-amber-200 bg-amber-50/80 dark:border-amber-900/60 dark:bg-amber-950/20"
+  const badgeClasses = tone === "existing"
+    ? "bg-slate-200 text-slate-700 dark:bg-slate-800 dark:text-slate-200"
+    : "bg-amber-200 text-amber-800 dark:bg-amber-900 dark:text-amber-100"
+
+  return (
+    <div className={`min-w-0 rounded-md border p-3 ${toneClasses}`}>
+      <div className="mb-2 flex items-center justify-between gap-2">
+        <div>
+          <div className="text-xs font-semibold">{title}</div>
+          <div className="text-[10px] text-muted-foreground">{subtitle}</div>
+        </div>
+        <span className={`shrink-0 rounded-full px-1.5 py-0.5 text-[10px] font-medium ${badgeClasses}`}>
+          {tone === "existing" ? "旧值" : "新值"}
+        </span>
+      </div>
+      <div className="max-h-28 overflow-y-auto whitespace-pre-wrap break-words rounded bg-background/70 px-2 py-1.5 text-xs leading-relaxed">
+        {value || "-"}
+      </div>
     </div>
   )
 }

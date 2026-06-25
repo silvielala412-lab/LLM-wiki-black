@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from "react"
+import React, { useState, useEffect, useCallback, useRef } from "react"
 import { FileText, Users, Lightbulb, BookOpen, HelpCircle, GitMerge, BarChart3, ChevronRight, ChevronDown, Layout, Globe, ShieldCheck, CalendarClock, BriefcaseBusiness, Network, FolderOpen, Package } from "lucide-react"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { useWikiStore } from "@/stores/wiki-store"
@@ -7,6 +7,7 @@ import type { FileNode } from "@/types/wiki"
 import { normalizePath } from "@/lib/path-utils"
 import { SERVICE_HIERARCHY } from "@/lib/insurance-schema-registry"
 import { INSURANCE_CATEGORIES, type InsuranceCategoryType } from "@/lib/product-catalog-modules"
+import { getQueueSummary } from "@/lib/ingest-queue"
 
 interface WikiPageInfo {
   path: string; title: string; type: string; domain: string; tags: string[]; origin?: string
@@ -79,6 +80,21 @@ export function KnowledgeTree() {
   // Product catalog: list of files in wiki/product_catalog/
   const [productCatalogPages, setProductCatalogPages] = useState<WikiPageInfo[]>([])
   const [expandedProducts, setExpandedProducts] = useState<Set<string>>(new Set())
+  const queueWasActiveRef = useRef(false)
+
+  const loadProductCatalogPages = useCallback(async () => {
+    if (!project) return
+    const pp = normalizePath(project.path)
+    try {
+      const pcTree = await listDirectory(`${pp}/wiki/product_catalog`)
+      const pcInfos = flattenMdFiles(pcTree).map(f => parseInfo(f.path, f.name, ""))
+      setProductCatalogPages(pcInfos)
+      setPages(prev => [...prev.filter(p => !isProductCatalogPath(p.path)), ...pcInfos])
+    } catch {
+      setProductCatalogPages([])
+      setPages(prev => prev.filter(p => !isProductCatalogPath(p.path)))
+    }
+  }, [project])
 
   const loadPages = useCallback(async () => {
     if (!project) return
@@ -88,29 +104,34 @@ export function KnowledgeTree() {
       const mdFiles = flattenMdFiles(wikiTree)
       const infos: WikiPageInfo[] = []
       for (const f of mdFiles) {
+        if (isProductCatalogPath(f.path)) continue
         if (f.name === "index.md" || f.name === "log.md") continue
         if (!shouldRead(f.path)) { infos.push(parseInfo(f.path, f.name, "")); continue }
         try { infos.push(parseInfo(f.path, f.name, await readFile(f.path))) }
         catch { infos.push({ path: f.path, title: f.name.replace(".md",""), type:"other", domain:"general", tags:[] }) }
       }
-      setPages(infos)
-      // Load product catalog pages from wiki/product_catalog/
-      try {
-        const pcTree = await listDirectory(`${pp}/wiki/product_catalog`)
-        const pcFiles = flattenMdFiles(pcTree)
-        const pcInfos: WikiPageInfo[] = []
-        for (const f of pcFiles) {
-          try { pcInfos.push(parseInfo(f.path, f.name, await readFile(f.path))) }
-          catch { pcInfos.push({ path: f.path, title: f.name.replace(".md",""), type:"entity", domain:"product_catalog", tags:[] }) }
-        }
-        setProductCatalogPages(pcInfos)
-      } catch {
-        setProductCatalogPages([])
-      }
+      const pcInfos = mdFiles.filter(f => isProductCatalogPath(f.path)).map(f => parseInfo(f.path, f.name, ""))
+      setProductCatalogPages(pcInfos)
+      setPages([...infos, ...pcInfos])
     } catch { setPages([]) }
   }, [project])
 
   useEffect(() => { loadPages() }, [loadPages, fileTree])
+
+  useEffect(() => {
+    if (!project) return
+    const tick = () => {
+      const summary = getQueueSummary()
+      const active = summary.pending + summary.processing > 0
+      if (active || queueWasActiveRef.current) {
+        void loadProductCatalogPages()
+      }
+      queueWasActiveRef.current = active
+    }
+    tick()
+    const timer = window.setInterval(tick, 2500)
+    return () => window.clearInterval(timer)
+  }, [project, loadProductCatalogPages])
 
   const toggleCheck = useCallback((path: string, e: React.MouseEvent) => {
     e.stopPropagation()
@@ -364,6 +385,10 @@ function RawSourcesSection() {
 function shouldRead(path:string):boolean {
   const n=normalizePath(path)
   return !n.includes("/wiki/sources/")&&!n.includes("/wiki/audits/")&&!n.includes("/wiki/media/")
+}
+
+function isProductCatalogPath(path:string):boolean {
+  return normalizePath(path).includes("/wiki/product_catalog/")
 }
 
 function parseInfo(path:string,fileName:string,content:string):WikiPageInfo {

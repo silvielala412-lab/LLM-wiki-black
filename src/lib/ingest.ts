@@ -12,7 +12,7 @@ import { useWikiStore } from "@/stores/wiki-store"
 import { useChatStore } from "@/stores/chat-store"
 import { useActivityStore } from "@/stores/activity-store"
 import { useReviewStore, type ReviewItem } from "@/stores/review-store"
-import { getFileName, normalizePath } from "@/lib/path-utils"
+import { getFileName, normalizePath, isAbsolutePath } from "@/lib/path-utils"
 import { schemaGuidance } from "@/lib/knowledge-schema"
 import { normalizeSchemaFrontmatter, shouldNormalizeKnowledgePage } from "@/lib/knowledge-schema-normalizer"
 import { cleanupKnowledgeFrontmatter } from "@/lib/knowledge-frontmatter-cleanup"
@@ -302,6 +302,10 @@ type IngestProcessingMode = "direct" | "hierarchical-long-document"
 type IngestSourceOrigin = "raw" | "ocr-image" | "ocr-pdf"
 const ocrSourceContentCache = new Map<string, { content: string; origin: IngestSourceOrigin }>()
 
+function yieldToBrowser(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0))
+}
+
 function sourceFingerprint(content: string): string {
   let h1 = 0xdeadbeef ^ content.length
   let h2 = 0x41c6ce57 ^ content.length
@@ -332,22 +336,116 @@ interface FsEntry {
   children?: FsEntry[]
 }
 
-async function readExistingPdfOcrCache(projectPath: string, fileName: string): Promise<string | null> {
+const OCR_CACHE_SOURCE_META_NAME = "source.json"
+const OCR_CACHE_COMBINED_TEXT_NAME = "combined.md"
+
+interface PdfOcrCacheSourceMeta {
+  sourcePath?: string
+  fileName?: string
+  rawHash?: string
+  rawLength?: number
+  sourceSize?: number
+}
+
+function normalizeOcrSourcePath(path: string | undefined): string {
+  return normalizePath(path ?? "")
+}
+
+function ocrCacheComparableFileName(pathOrName: string | undefined): string {
+  return getFileName(normalizeOcrSourcePath(pathOrName)).trim().toLowerCase()
+}
+
+async function readPdfOcrCacheSourceMeta(cacheDir: string): Promise<PdfOcrCacheSourceMeta | null> {
+  try {
+    const raw = await readFile(`${cacheDir}/${OCR_CACHE_SOURCE_META_NAME}`)
+    const parsed = JSON.parse(raw) as PdfOcrCacheSourceMeta
+    return parsed && typeof parsed === "object" ? parsed : null
+  } catch {
+    return null
+  }
+}
+
+async function writePdfOcrCacheSourceMeta(
+  cacheDir: string | undefined,
+  meta: PdfOcrCacheSourceMeta,
+): Promise<void> {
+  if (!cacheDir) return
+  void writeFile(`${cacheDir}/${OCR_CACHE_SOURCE_META_NAME}`, JSON.stringify({
+      ...meta,
+      sourcePath: normalizeOcrSourcePath(meta.sourcePath),
+      updatedAt: new Date().toISOString(),
+    }, null, 2)).catch(() => {
+      // OCR cache metadata is only a reuse accelerator; never fail ingest for it.
+    })
+}
+
+async function readPdfOcrCacheCombinedText(cacheDir: string): Promise<string | null> {
+  try {
+    const cached = await readFile(`${cacheDir}/${OCR_CACHE_COMBINED_TEXT_NAME}`)
+    return cached.trim() ? cached : null
+  } catch {
+    return null
+  }
+}
+
+async function writePdfOcrCacheCombinedText(
+  cacheDir: string | undefined,
+  text: string,
+): Promise<void> {
+  if (!cacheDir || !text.trim()) return
+  void writeFile(`${cacheDir}/${OCR_CACHE_COMBINED_TEXT_NAME}`, text).catch(() => {
+    // Combined cache is an optimization. Page-level cache remains authoritative.
+  })
+}
+
+async function readExistingPdfOcrCache(
+  projectPath: string,
+  fileName: string,
+  sourcePath?: string,
+  sourceSize?: number,
+): Promise<string | null> {
   const cacheRoot = `${projectPath}/.llm-wiki/ocr-cache`
   const prefix = `${safeCacheName(fileName)}-`
   let dirs: FsEntry[] = []
+  let prefixMatched = false
   try {
     const entries = await listDirectory(cacheRoot) as FsEntry[]
     dirs = entries.filter((entry) => entry.is_dir && entry.name.startsWith(prefix))
+    prefixMatched = dirs.length > 0
+    // Tauri IPC can garble CJK filenames (e.g. "保险条款.pdf" → "淇濋櫓鏉℃.pdf").
+    // When the manifest stores garbled names but cache dirs have correct names,
+    // prefix matching fails. Scan all cache directories, but only reuse a cache
+    // whose source.json metadata still matches the requested PDF.
+    if (dirs.length === 0) {
+      dirs = entries.filter((entry) => entry.is_dir)
+      logOCR.debug("pdf-ocr cache prefix miss, scanning metadata-matched dirs", { prefix, allDirs: dirs.length })
+    }
   } catch {
     return null
   }
 
+  const normalizedSourcePath = normalizeOcrSourcePath(sourcePath)
+  const requestedFileName = ocrCacheComparableFileName(fileName)
+  const requestedSourceFileName = ocrCacheComparableFileName(sourcePath)
+  const candidates: Array<{ text: string; dir: FsEntry; meta: PdfOcrCacheSourceMeta | null; dirMatchedPrefix: boolean }> = []
+  const sizeCompatible = (meta: PdfOcrCacheSourceMeta | null) =>
+    typeof sourceSize !== "number" ||
+    typeof meta?.sourceSize !== "number" ||
+    meta.sourceSize === sourceSize
+
   for (const dir of dirs) {
+    const cacheDir = normalizePath(dir.path || `${cacheRoot}/${dir.name}`)
+    const dirMatchedPrefix = dir.name.startsWith(prefix)
+    const combined = await readPdfOcrCacheCombinedText(cacheDir)
+    if (combined) {
+      candidates.push({ text: combined, dir: { ...dir, path: cacheDir }, meta: await readPdfOcrCacheSourceMeta(cacheDir), dirMatchedPrefix })
+      continue
+    }
+
     let files = dir.children?.filter((entry) => !entry.is_dir && /^page-\d+\.md$/i.test(entry.name))
     if (!files) {
       try {
-        const entries = await listDirectory(dir.path) as FsEntry[]
+        const entries = await listDirectory(cacheDir) as FsEntry[]
         files = entries.filter((entry) => !entry.is_dir && /^page-\d+\.md$/i.test(entry.name))
       } catch {
         files = []
@@ -357,13 +455,43 @@ async function readExistingPdfOcrCache(projectPath: string, fileName: string): P
     const pages: string[] = []
     for (const file of files) {
       try {
-        const page = await readFile(file.path)
+        const page = await readFile(file.path || `${cacheDir}/${file.name}`)
         if (page.trim()) pages.push(page.trim())
       } catch {
         // Ignore a bad cache page; a later page can still be useful.
       }
     }
-    if (pages.length > 0) return pages.join("\n\n")
+    if (pages.length > 0) {
+      const text = pages.join("\n\n")
+      await writePdfOcrCacheCombinedText(cacheDir, text)
+      candidates.push({ text, dir: { ...dir, path: cacheDir }, meta: await readPdfOcrCacheSourceMeta(cacheDir), dirMatchedPrefix })
+    }
+  }
+
+  if (normalizedSourcePath) {
+    const exact = candidates.find((candidate) =>
+      normalizeOcrSourcePath(candidate.meta?.sourcePath) === normalizedSourcePath
+    )
+    if (exact) return exact.text
+  }
+
+  const metadataMatched = candidates.find((candidate) => {
+    const metaFileName = ocrCacheComparableFileName(candidate.meta?.fileName)
+    const metaSourceFileName = ocrCacheComparableFileName(candidate.meta?.sourcePath)
+    const exactNameMatch = metaFileName === requestedFileName ||
+      (!!requestedSourceFileName && metaSourceFileName === requestedSourceFileName)
+    const safeNameMatch = candidate.dirMatchedPrefix &&
+      !!metaFileName &&
+      safeCacheName(metaFileName) === safeCacheName(requestedFileName)
+    return sizeCompatible(candidate.meta) && (exactNameMatch || safeNameMatch)
+  })
+  if (metadataMatched) return metadataMatched.text
+
+  // If the cache dir itself matched this file's safe name, it is scoped to this
+  // PDF even when sourcePath metadata is missing or encoded differently.
+  if (prefixMatched) {
+    const prefixed = candidates.find((candidate) => candidate.dirMatchedPrefix && sizeCompatible(candidate.meta))
+    if (prefixed) return prefixed.text
   }
 
   return null
@@ -393,12 +521,19 @@ function shouldHashRawSource(path: string): boolean {
 
 async function readSourceCacheContent(sourcePath: string, fallbackContent: string): Promise<string> {
   if (!shouldHashRawSource(sourcePath)) return fallbackContent
-  try {
-    const file = await readFileAsBase64(sourcePath)
-    return file.base64
-  } catch {
-    return fallbackContent
-  }
+  // ── CRITICAL MEMORY MANAGEMENT ──────────────────────────────────────────────
+  // Do NOT return the full base64 payload here (~120 MB for a 39-page scanned
+  // PDF). This string would be stored in `sourceCacheContent` and then copied
+  // into `effectiveCacheContent`, keeping two 120 MB strings alive in
+  // `autoIngestImpl` for the full duration of OCR processing — on top of the
+  // ~120 MB `pages[]` array inside ocrImagePdf — causing a ~360-480 MB peak
+  // that crashes the browser tab with OOM.
+  //
+  // A lightweight fingerprint (path + raw content length) is sufficient for
+  // cache-key differentiation. `fallbackContent` is the already-loaded
+  // rawSourceContent — its length uniquely identifies the file version without
+  // holding any extra large string in memory.
+  return `file-fingerprint:${sourcePath}|len:${fallbackContent.length}`
 }
 
 function asJsonRecord(value: unknown): Record<string, unknown> | null {
@@ -426,6 +561,364 @@ function markdownTableCell(value: unknown): string {
   return String(text ?? "")
     .replace(/\r?\n/g, "<br>")
     .replace(/\|/g, "\\|")
+}
+
+const PRODUCT_CATALOG_BUNDLE_MANIFEST_NAME = "__product_bundle__.json"
+const PRODUCT_CATALOG_BUNDLE_EXTS = new Set([
+  "pdf", "md", "mdx", "txt", "docx", "xlsx", "xls", "csv", "json",
+  "png", "jpg", "jpeg",
+])
+
+interface ProductCatalogBundleFile {
+  name?: string
+  path?: string
+  size?: number
+  original_relative_path?: string
+}
+
+interface ProductCatalogBundleManifest {
+  kind?: string
+  files?: ProductCatalogBundleFile[]
+}
+
+function isProductCatalogBundleSourcePath(path: string): boolean {
+  return getFileName(path).toLowerCase() === PRODUCT_CATALOG_BUNDLE_MANIFEST_NAME
+}
+
+function isSupportedProductCatalogBundlePath(path: string): boolean {
+  const name = getFileName(path)
+  if (!name || name.startsWith("~$")) return false
+  if (name.toLowerCase() === PRODUCT_CATALOG_BUNDLE_MANIFEST_NAME) return false
+  const ext = name.split(".").pop()?.toLowerCase() ?? ""
+  return PRODUCT_CATALOG_BUNDLE_EXTS.has(ext)
+}
+
+function parseProductCatalogBundleManifest(sourceContent: string): ProductCatalogBundleManifest | null {
+  try {
+    const parsed = JSON.parse(sourceContent) as ProductCatalogBundleManifest
+    if (!parsed || parsed.kind !== "product_catalog_bundle" || !Array.isArray(parsed.files)) return null
+    return parsed
+  } catch {
+    return null
+  }
+}
+
+function toProjectAbsolutePath(projectPath: string, path: string): string {
+  const normalized = normalizePath(path)
+  return isAbsolutePath(normalized) ? normalized : `${projectPath}/${normalized}`
+}
+
+function toProjectRelativePath(projectPath: string, path: string): string {
+  const normalized = normalizePath(path)
+  const pp = normalizePath(projectPath)
+  return normalized.startsWith(pp + "/") ? normalized.slice(pp.length + 1) : normalized
+}
+
+function productMetaFactsMarkdown(sourceContent: string): string {
+  let record: Record<string, unknown> | null = null
+  try {
+    record = asJsonRecord(JSON.parse(sourceContent))
+  } catch {
+    return ""
+  }
+  if (!record) return ""
+
+  const rows: Array<[string, string]> = [
+    ["险种代码", stringField(record, ["actualPlanCode", "planCode", "productCode", "code"])],
+    ["险种名称", stringField(record, ["clauseName", "productName", "planName", "title", "name"])],
+    ["销售状态", stringField(record, ["planSalesStatus", "salesStatus", "status"])],
+    ["销售渠道", stringField(record, ["planSalesChannel", "salesChannel", "channel"])],
+    ["开始使用时间", stringField(record, ["startDate", "effectiveDate", "date"])],
+    ["产品类型", stringField(record, ["planPlanType", "productType", "type"])],
+    ["产品档次", stringField(record, ["productLevel", "level"])],
+    ["备案号", stringField(record, ["sccode", "recordCode", "regulatoryCode"])],
+    ["报备文件号", stringField(record, ["reportPreparedFileCode", "preparedFileCode"])],
+    ["销售地区", stringField(record, ["regionCode", "region"])],
+  ].filter(([, value]) => value)
+
+  if (rows.length === 0) return ""
+  return [
+    "## 确定性产品元数据映射",
+    "",
+    "| 字段 | 值 |",
+    "|---|---|",
+    ...rows.map(([field, value]) => `| ${markdownTableCell(field)} | ${markdownTableCell(value)} |`),
+  ].join("\n")
+}
+
+async function prepareSourceContentWithOcr(input: {
+  projectPath: string
+  sourcePath: string
+  fileName: string
+  rawSourceContent: string | null
+  sourceSize?: number
+  signal?: AbortSignal
+  activityId?: string
+  detailPrefix?: string
+}): Promise<{ sourceContent: string; sourceOrigin: IngestSourceOrigin }> {
+  const activity = useActivityStore.getState()
+  const { projectPath, sourcePath, fileName, sourceSize, signal, activityId, detailPrefix } = input
+  // ── Memory-critical: rawSourceContent can be 100-300 MB for scanned PDFs.
+  // Use a mutable ref so we can release it after OCR starts. Pre-compute
+  // any derived values (fingerprint, length, cacheKey) BEFORE the long-running
+  // OCR call so the massive string can be GC'd during processing.
+  let rawRef: string | null = input.rawSourceContent
+  input.rawSourceContent = null
+  if (!rawRef) return { sourceContent: "", sourceOrigin: "raw" }
+  const rawLength = rawRef.length
+  const rawCacheKey = `${sourcePath}|${rawLength}`
+  const pdfExtractionFailure = isPdfExtractionFailureText(rawRef)
+  const imagePdf = !pdfExtractionFailure && isImagePdf(rawRef)
+  // Pre-compute fingerprint only when needed (image PDF path uses it for cache dir)
+  const rawHash = imagePdf ? sourceFingerprint(rawRef) : ""
+
+  const updateDetail = (detail: string) => {
+    if (!activityId) return
+    activity.updateItem(activityId, { detail: detailPrefix ? `${detailPrefix}: ${detail}` : detail })
+  }
+
+  let sourceContent = imagePdf || pdfExtractionFailure ? "" : rawRef
+  let sourceOrigin: IngestSourceOrigin = "raw"
+
+  if (pdfExtractionFailure) {
+    const cachedOcr = await readExistingPdfOcrCache(projectPath, fileName, sourcePath, sourceSize)
+    if (cachedOcr) {
+      sourceContent = cachedOcr
+      sourceOrigin = "ocr-pdf"
+      ocrSourceContentCache.set(rawCacheKey, { content: sourceContent, origin: sourceOrigin })
+      updateDetail("Reusing persisted PDF OCR cache...")
+      logOCR.info("pdf-ocr persisted cache hit after PDF render failure", { file: fileName, chars: sourceContent.length })
+    } else {
+      const message = `${rawRef}. No reusable OCR cache found. Configure VISION_ENDPOINT/VISION_MODEL or fix pdftoppm/poppler before parsing.`
+      if (activityId) activity.updateItem(activityId, { status: "error", detail: message })
+      throw new Error(message)
+    }
+  } else if (imagePdf) {
+    const pdfOcrCacheDir = `${projectPath}/.llm-wiki/ocr-cache/${safeCacheName(fileName)}-${rawHash}`
+    const cached = ocrSourceContentCache.get(rawCacheKey)
+    if (cached) {
+      sourceContent = cached.content
+      sourceOrigin = cached.origin
+      rawRef = null  // release — we have the cached OCR text
+      updateDetail("Reusing cached PDF OCR text...")
+      logOCR.debug("pdf-ocr cache hit", { file: fileName, chars: sourceContent.length })
+      await writePdfOcrCacheSourceMeta(pdfOcrCacheDir, {
+        sourcePath,
+        fileName,
+        rawHash,
+        rawLength,
+        sourceSize,
+      })
+      await writePdfOcrCacheCombinedText(pdfOcrCacheDir, sourceContent)
+    } else {
+      updateDetail("Scanned PDF detected - running OCR...")
+      const visionCfg = buildVisionLlmConfig()
+      if (visionCfg) {
+        try {
+          // Pass rawRef to ocrImagePdf, then release our reference.
+          // ocrImagePdf also releases its `content` parameter after parsing.
+          sourceContent = await ocrImagePdf(rawRef!, visionCfg, {
+            signal,
+            cacheDir: pdfOcrCacheDir,
+            onProgress: (done, total) => updateDetail(`OCR: page ${done}/${total}...`),
+          })
+          rawRef = null  // release the ~120 MB base64 payload
+          sourceOrigin = "ocr-pdf"
+          ocrSourceContentCache.set(rawCacheKey, { content: sourceContent, origin: sourceOrigin })
+          await writePdfOcrCacheSourceMeta(pdfOcrCacheDir, {
+            sourcePath,
+            fileName,
+            rawHash,
+            rawLength,
+            sourceSize,
+          })
+          await writePdfOcrCacheCombinedText(pdfOcrCacheDir, sourceContent)
+          logOCR.info("pdf-ocr complete", { file: fileName, chars: sourceContent.length })
+        } catch (err) {
+          rawRef = null  // release even on error
+          logOCR.warn("pdf-ocr failed", { file: fileName, error: err instanceof Error ? err.message : String(err) })
+          if (activityId) {
+            activity.updateItem(activityId, {
+              status: "error",
+              detail: `PDF OCR failed: ${err instanceof Error ? err.message : err}. Configure VISION_ENDPOINT/VISION_MODEL.`,
+            })
+          }
+          sourceContent = `(Image PDF OCR failed. Configure VISION_ENDPOINT/VISION_MODEL. File: ${fileName})`
+        }
+      } else {
+        rawRef = null  // release
+        sourceContent = `(Image PDF OCR skipped. Configure VISION_ENDPOINT/VISION_MODEL. File: ${fileName})`
+        logOCR.warn("pdf-ocr skipped: no vision config", { file: fileName })
+      }
+    }
+  } else if (isImageSourcePath(sourcePath)) {
+    rawRef = null  // release — image OCR reads from disk, not from rawRef
+    const visionCfg = buildVisionLlmConfig()
+    if (visionCfg) {
+      try {
+        const image = await readFileAsBase64(sourcePath)
+        const imageCacheKey = `${sourcePath}|${image.base64.length}`
+        const cached = ocrSourceContentCache.get(imageCacheKey)
+        if (cached) {
+          sourceContent = cached.content
+          sourceOrigin = cached.origin
+          updateDetail("Reusing cached image OCR text...")
+          logOCR.debug("image-ocr cache hit", { file: fileName, chars: sourceContent.length })
+        } else {
+          updateDetail("Image file detected - running OCR...")
+          const ocrText = await ocrImageBytes(image.base64, image.mimeType, visionCfg, signal)
+          if (ocrText) {
+            sourceContent = `# OCR text extracted from ${fileName}\n\n${ocrText}`
+            sourceOrigin = "ocr-image"
+            ocrSourceContentCache.set(imageCacheKey, { content: sourceContent, origin: sourceOrigin })
+          }
+        }
+      } catch (err) {
+        console.warn(`[ingest:image-ocr] OCR failed for "${fileName}":`, err)
+      }
+    }
+  }
+
+  rawRef = null  // final safety release
+  return { sourceContent, sourceOrigin }
+}
+
+async function resolveProductCatalogExtractionSource(input: {
+  projectPath: string
+  sourcePath: string
+  fileName: string
+  sourceContent: string
+  effectiveCacheContent: string
+  category: InsuranceCategoryType
+  productName: string
+  activityId: string
+  signal?: AbortSignal
+}): Promise<{ sourceContent: string; sourceFileName: string; cacheContent: string }> {
+  const { projectPath, sourcePath, fileName, sourceContent, effectiveCacheContent, category, productName, activityId, signal } = input
+  const manifest = isProductCatalogBundleSourcePath(sourcePath)
+    ? parseProductCatalogBundleManifest(sourceContent)
+    : null
+
+  if (!manifest?.files?.length) {
+    return { sourceContent, sourceFileName: fileName, cacheContent: effectiveCacheContent }
+  }
+
+  const activity = useActivityStore.getState()
+  const parts: string[] = []
+  const cacheParts: string[] = [`manifest:${effectiveCacheContent}`]
+  const files = manifest.files.filter((file) => file.path && isSupportedProductCatalogBundlePath(file.path))
+
+  for (let i = 0; i < files.length; i++) {
+    await yieldToBrowser()
+    const file = files[i]
+    const relPath = toProjectRelativePath(projectPath, file.path!)
+    const absPath = toProjectAbsolutePath(projectPath, relPath)
+    const name = file.name || getFileName(absPath)
+    const sourceSize = typeof file.size === "number" ? file.size : undefined
+    activity.updateItem(activityId, {
+      detail: `Product catalog bundle: reading ${i + 1}/${files.length} ${name}`,
+    })
+
+    const cachedPdfOcr = /\.pdf$/i.test(name)
+      ? await readExistingPdfOcrCache(projectPath, name, absPath, sourceSize)
+      : null
+    if (cachedPdfOcr) {
+      activity.updateItem(activityId, {
+        detail: `Product catalog bundle: OCR cache hit ${i + 1}/${files.length} ${name}`,
+      })
+    } else if (/\.pdf$/i.test(name)) {
+      activity.updateItem(activityId, {
+        detail: `Product catalog bundle: reading raw PDF ${i + 1}/${files.length} ${name}`,
+      })
+    }
+    // ── Memory-critical: `raw` for a scanned PDF can be 100-300 MB of
+    // base64 page images. We compute the fingerprint early, then null
+    // out the reference before OCR so the GC can reclaim the memory.
+    let raw: string | null = cachedPdfOcr ?? await tryReadFile(absPath)
+    if (!raw.trim()) continue
+    const rawFingerprint = /\.pdf$/i.test(name) && isImagePdf(raw)
+      ? `image-pdf:${raw.length}`
+      : sourceFingerprint(raw)
+    cacheParts.push([
+      `\n---SOURCE_CACHE:${relPath}---`,
+      `name:${name}`,
+      `size:${sourceSize ?? ""}`,
+      `rawHash:${rawFingerprint}`,
+    ].join("\n"))
+
+    let prepared: { sourceContent: string; sourceOrigin: IngestSourceOrigin }
+    if (cachedPdfOcr) {
+      raw = null  // release — cachedPdfOcr is the text, not the base64 payload
+      prepared = { sourceContent: cachedPdfOcr, sourceOrigin: "ocr-pdf" as IngestSourceOrigin }
+      logOCR.info("pdf-ocr source cache hit before PDF read", { file: name, chars: cachedPdfOcr.length })
+    } else {
+      // Pass raw to OCR, then release immediately after the call returns.
+      // prepareSourceContentWithOcr will hold `raw` only during the OCR
+      // API calls; once it returns, the caller's ref is the last one.
+      const prepareInput = {
+          projectPath,
+          sourcePath: absPath,
+          fileName: name,
+          sourceSize,
+          rawSourceContent: raw,
+          signal,
+          activityId,
+          detailPrefix: `Bundle ${i + 1}/${files.length} ${name}`,
+        }
+      raw = null  // release caller-side reference before the async OCR work starts
+      prepared = await prepareSourceContentWithOcr(prepareInput)
+    }
+    log.info("product bundle source prepared", {
+      file: name,
+      index: i + 1,
+      total: files.length,
+      chars: prepared.sourceContent.length,
+      origin: prepared.sourceOrigin,
+    })
+    activity.updateItem(activityId, {
+      detail: `Product catalog bundle: prepared ${i + 1}/${files.length} ${name}`,
+    })
+    await yieldToBrowser()
+    const metaFacts = /\.json$/i.test(name) ? productMetaFactsMarkdown(prepared.sourceContent) : ""
+    parts.push([
+      `<!-- PRODUCT_SOURCE_BEGIN: ${name} -->`,
+      `# 来源文件：${name}`,
+      `路径：${relPath}`,
+      metaFacts,
+      prepared.sourceContent.trim(),
+      `<!-- PRODUCT_SOURCE_END: ${name} -->`,
+    ].filter(Boolean).join("\n\n"))
+    // ── Memory: release per-file OCR text immediately after it has been
+    // folded into parts[]. The section string in parts[] is a new object;
+    // clearing prepared.sourceContent lets the GC reclaim the original.
+    prepared.sourceContent = ""
+  }
+
+
+  if (parts.length === 0) {
+    return { sourceContent, sourceFileName: fileName, cacheContent: effectiveCacheContent }
+  }
+
+  const assembledSourceContent = parts.join("\n\n")
+  // ── Memory: individual section strings are now merged into assembledSourceContent.
+  // Releasing the array lets the GC reclaim each file's section string.
+  parts.length = 0
+  const assembledCacheContent = cacheParts.join("\n")
+  cacheParts.length = 0
+  activity.updateItem(activityId, {
+    detail: `Product catalog bundle: assembled ${files.length} files, entering extraction...`,
+  })
+  log.info("product bundle assembled", {
+    files: files.length,
+    chars: assembledSourceContent.length,
+    cacheChars: assembledCacheContent.length,
+  })
+
+  return {
+    sourceContent: assembledSourceContent,
+    sourceFileName: `${category}-${productName}-product-bundle-${files.length}files`,
+    cacheContent: assembledCacheContent,
+  }
 }
 
 function yamlInlineStringList(items: string[]): string {
@@ -3179,8 +3672,9 @@ async function autoIngestImpl(
     detail: "Reading source...",
     filesWritten: [],
   })
+  await yieldToBrowser()
 
-  const [rawSourceContent, schema, purpose, index, overview] = await Promise.all([
+  let [rawSourceContent, schema, purpose, index, overview] = await Promise.all([
     tryReadFile(sp),
     tryReadFile(`${pp}/schema.md`),
     tryReadFile(`${pp}/purpose.md`),
@@ -3193,100 +3687,68 @@ async function autoIngestImpl(
   // (which encodes batch index + module names). Without this, all batches for the
   // same PDF share the same hash → batch 0 writes its cache entry, batches 1-N
   // get a cache HIT and are skipped entirely.
-  const effectiveCacheContent = folderContext
+  let effectiveCacheContent = folderContext
     ? `${sourceCacheContent}\n<!-- folderContext:${folderContext} -->`
     : sourceCacheContent
 
   // ── Image-PDF OCR: detect scanned PDFs and run vision-model OCR ──
-  let sourceContent = rawSourceContent
-  let sourceOrigin: IngestSourceOrigin = "raw"
-  const rawCacheKey = `${sp}|${rawSourceContent.length}`
-  const pdfExtractionFailure = isPdfExtractionFailureText(rawSourceContent)
-  if (pdfExtractionFailure) {
-    const cachedOcr = await readExistingPdfOcrCache(pp, fileName)
-    if (cachedOcr) {
-      sourceContent = cachedOcr
-      sourceOrigin = "ocr-pdf"
-      ocrSourceContentCache.set(rawCacheKey, { content: sourceContent, origin: sourceOrigin })
-      activity.updateItem(activityId, { detail: "Reusing persisted PDF OCR cache..." })
-      logOCR.info("pdf-ocr persisted cache hit after PDF render failure", { file: fileName, chars: sourceContent.length })
-    } else {
-      const message = `${rawSourceContent}。未找到可复用 OCR 缓存，请先修复服务器 pdftoppm/poppler 或配置 OCR_ENDPOINT 后再解析。`
-      activity.updateItem(activityId, { status: "error", detail: message })
-      throw new Error(message)
-    }
-  } else if (isImagePdf(rawSourceContent)) {
-    const pdfOcrCacheDir = `${pp}/.llm-wiki/ocr-cache/${safeCacheName(fileName)}-${sourceFingerprint(rawSourceContent)}`
-    const cached = ocrSourceContentCache.get(rawCacheKey)
-    if (cached) {
-      sourceContent = cached.content
-      sourceOrigin = cached.origin
-      activity.updateItem(activityId, { detail: "Reusing cached PDF OCR text..." })
-      logOCR.debug("pdf-ocr cache hit", { file: fileName, chars: sourceContent.length })
-    } else {
-      activity.updateItem(activityId, { detail: "Scanned PDF detected — running OCR..." })
-      const visionCfg = buildVisionLlmConfig()
-      if (visionCfg) {
-      try {
-        sourceContent = await ocrImagePdf(rawSourceContent, visionCfg, {
-          signal,
-          cacheDir: pdfOcrCacheDir,
-          onProgress: (done, total) =>
-            activity.updateItem(activityId, {
-              detail: `OCR: page ${done}/${total}...`,
-            }),
+  const prepareRawInput = {
+    projectPath: pp,
+    sourcePath: sp,
+    fileName,
+    rawSourceContent,
+    signal,
+    activityId,
+  }
+  rawSourceContent = ""
+  const preparedRawSource = await prepareSourceContentWithOcr(prepareRawInput)
+  let sourceContent = preparedRawSource.sourceContent
+  let sourceOrigin: IngestSourceOrigin = preparedRawSource.sourceOrigin
+
+  // ── Auto-detect product catalog from source path ──────────────
+  // When files are placed directly into raw/sources/产品/{category}/{productName}/
+  // without going through the Sources UI, folderContext is empty.
+  // Auto-infer it so the product catalog extractor is used.
+  if (!folderContext) {
+    const pathMatch = sp.match(/[/\\]产品[/\\]([^/\\]+)[/\\]([^/\\]+)[/\\][^/\\]+\.(?:pdf|mdx?|txt|docx|xlsx?|csv|json|png|jpe?g)$/i)
+    if (pathMatch) {
+      const [, cat, prod] = pathMatch
+      if (INSURANCE_CATEGORIES.includes(cat as InsuranceCategoryType)) {
+        folderContext = encodeProductCatalogFolderContext(
+          cat as InsuranceCategoryType, prod, [], 0,
+        )
+        effectiveCacheContent = `${sourceCacheContent}\n<!-- folderContext:${folderContext} -->`
+        log.info("auto-detected product catalog context from path", {
+          category: cat, product: prod, folderContext,
         })
-        sourceOrigin = "ocr-pdf"
-        ocrSourceContentCache.set(rawCacheKey, { content: sourceContent, origin: sourceOrigin })
-        logOCR.info("pdf-ocr complete", { file: fileName, chars: sourceContent.length })
-      } catch (err) {
-        logOCR.warn("pdf-ocr failed", { file: fileName, error: err instanceof Error ? err.message : String(err) })
-        activity.updateItem(activityId, {
-          status: "error",
-          detail: `PDF OCR failed: ${err instanceof Error ? err.message : err}. Configure server VISION_ENDPOINT or Settings > OCR & Images.`,
-        })
-        // Non-fatal: fall through with empty content so the pipeline
-        // at least generates a stub source-summary page.
-        sourceContent = `(图片型 PDF — OCR 失败。请在服务器配置 VISION_ENDPOINT/VISION_MODEL，或在设置 > OCR 与图片中配置百炼视觉端点。文件: ${fileName})`
-      }
-      } else {
-      // Vision model not configured → friendly message in the wiki
-      sourceContent = `(图片型 PDF — 未配置可用视觉 OCR 模型。请配置服务器 VISION_ENDPOINT，或在设置 > OCR 与图片中配置百炼视觉端点。文件: ${fileName})`
-      logOCR.warn("pdf-ocr skipped: no vision config", { file: fileName })
       }
     }
-  } else if (isImageSourcePath(sp)) {
-    const visionCfg = buildVisionLlmConfig()
-    if (visionCfg) {
-      try {
-        const image = await readFileAsBase64(sp)
-        const imageCacheKey = `${sp}|${image.base64.length}`
-        const cached = ocrSourceContentCache.get(imageCacheKey)
-        if (cached) {
-          sourceContent = cached.content
-          sourceOrigin = cached.origin
-          activity.updateItem(activityId, { detail: "Reusing cached image OCR text..." })
-          logOCR.debug("image-ocr cache hit", { file: fileName, chars: sourceContent.length })
-        } else {
-          activity.updateItem(activityId, { detail: "Image file detected - running OCR..." })
-          const ocrText = await ocrImageBytes(image.base64, image.mimeType, visionCfg, signal)
-          if (ocrText) {
-            sourceContent = `# OCR text extracted from ${fileName}\n\n${ocrText}`
-            sourceOrigin = "ocr-image"
-            ocrSourceContentCache.set(imageCacheKey, { content: sourceContent, origin: sourceOrigin })
-          }
-        }
-      } catch (err) {
-        console.warn(`[ingest:image-ocr] OCR failed for "${fileName}":`, err)
-      }
-    }
+  }
+
+  const productCtxEarly = parseProductCatalogCtxFromFolderContext(folderContext)
+  let productExtractionFileName = fileName
+  if (productCtxEarly) {
+    const productSource = await resolveProductCatalogExtractionSource({
+      projectPath: pp,
+      sourcePath: sp,
+      fileName,
+      sourceContent,
+      effectiveCacheContent,
+      category: productCtxEarly.category,
+      productName: productCtxEarly.productName,
+      activityId,
+      signal,
+    })
+    sourceContent = productSource.sourceContent
+    productExtractionFileName = productSource.sourceFileName
+    effectiveCacheContent = productSource.cacheContent
   }
 
   const sourceBaseName = fileName.replace(/\.[^.]+$/, "")
   const sourceSummaryPath = `wiki/sources/${sourceBaseName}.md`
   const sourceSummaryFullPath = `${pp}/${sourceSummaryPath}`
 
-  if (isJsonSourcePath(sp)) {
+  if (isJsonSourcePath(sp) && !productCtxEarly) {
     try {
       return await fastIngestJsonSource(
         pp,
@@ -3394,45 +3856,35 @@ async function autoIngestImpl(
     return cachedFiles
   }
 
-  // ── Auto-detect product catalog from source path ──────────────
-  // When files are placed directly into raw/sources/产品/{category}/{productName}/
-  // without going through the Sources UI, folderContext is empty.
-  // Auto-infer it so the product catalog extractor is used.
-  if (!folderContext) {
-    const pathMatch = sp.match(/[/\\]产品[/\\]([^/\\]+)[/\\]([^/\\]+)[/\\][^/\\]+\.pdf$/i)
-    if (pathMatch) {
-      const [, cat, prod] = pathMatch
-      if (INSURANCE_CATEGORIES.includes(cat as InsuranceCategoryType)) {
-        folderContext = encodeProductCatalogFolderContext(
-          cat as InsuranceCategoryType, prod, [], 0,
-        )
-        log.info("auto-detected product catalog context from path", {
-          category: cat, product: prod, folderContext,
-        })
-      }
-    }
-  }
-
   // ── Product Catalog fast-path ─────────────────────────────────
   // Product catalog extraction uses a completely different pipeline:
   // section-scan + merge (see product-catalog-extractor.ts).
   // Bypass the generic analysis→generation→writeFileBlocks pipeline entirely.
-  const productCtxEarly = parseProductCatalogCtxFromFolderContext(folderContext)
   if (productCtxEarly) {
     const { runProductCatalogExtraction } = await import("@/lib/product-catalog-extractor")
+    const isProductBundle = isProductCatalogBundleSourcePath(sp)
+    const productBundleManifest = isProductBundle
+      ? parseProductCatalogBundleManifest(sourceContent)
+      : null
+    const productCatalogMode = isProductBundle
+      ? (productBundleManifest?.files?.length === 1 ? "incremental" : "rebuild")
+      : "incremental"
     activity.updateItem(activityId, {
-      detail: `Product catalog: starting section-scan extraction...`,
+      detail: productCatalogMode === "incremental"
+        ? `Product catalog: starting incremental extraction...`
+        : `Product catalog: starting full section-scan extraction...`,
     })
     try {
       const writtenPaths = await runProductCatalogExtraction(
         pp,
         sourceContent,
-        fileName,
+        productExtractionFileName,
         productCtxEarly.category as InsuranceCategoryType,
         productCtxEarly.productName,
         llmConfig,
         activityId,
         signal,
+        { mode: productCatalogMode },
       )
       // Save cache so re-imports are skipped
       if (writtenPaths.length > 0) {

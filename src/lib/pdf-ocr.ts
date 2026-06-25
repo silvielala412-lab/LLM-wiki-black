@@ -18,7 +18,7 @@ import { createDirectory, readFile, writeFile } from "@/commands/fs"
 
 const MARKER = "__PDF_IMAGE_PAGES__"
 const OCR_PAGE_TIMEOUT_MS = 180_000
-const OCR_PDF_PAGE_CONCURRENCY = 20
+const OCR_PDF_PAGE_CONCURRENCY = 3
 
 const TABLE_OCR_PROMPT = [
   "请对这张图片做高精度 OCR，直接输出可供知识库入库的原文。",
@@ -165,6 +165,7 @@ async function ocrPage(
       { temperature: 0 },
     )
   } finally {
+    pageBase64 = ""
     timed.cleanup()
   }
 
@@ -207,6 +208,7 @@ export async function ocrImageBytes(
       { temperature: 0 },
     )
   } finally {
+    imageBase64 = ""
     timed.cleanup()
   }
 
@@ -227,7 +229,18 @@ export async function ocrImagePdf(
   },
 ): Promise<string> {
   const payload = parseImagePdfPayload(content)
-  const { pages } = payload
+  // Release the raw content string (~120 MB for a 39-page PDF). JSON.parse
+  // inside parseImagePdfPayload created independent string copies in
+  // payload.pages[], so `content` is no longer needed. Reassigning the
+  // parameter allows GC to reclaim the massive string while OCR runs.
+  content = ""
+  // ── CRITICAL MEMORY MANAGEMENT ──────────────────────────────────
+  // `pages` holds ALL page images as base64 strings. For a 39-page
+  // scanned rate table PDF this can easily be 150-300 MB. We MUST
+  // null out each slot as soon as the page is processed (cached or
+  // OCR'd) so the GC can reclaim the base64 data. Without this the
+  // browser tab crashes with "Out of Memory" on large PDFs.
+  const pages: Array<string | null> = payload.pages
   const total = pages.length
   const results = new Array<string>(total)
   const concurrency = Math.min(total, OCR_PDF_PAGE_CONCURRENCY)
@@ -241,6 +254,8 @@ export async function ocrImagePdf(
     if (cachedPage) {
       results[pageIndex] = cachedPage
       completed++
+      // Page already cached — release its base64 immediately
+      pages[pageIndex] = null
     } else {
       pendingPages.push(pageIndex)
     }
@@ -252,8 +267,12 @@ export async function ocrImagePdf(
       if (pageIndex === undefined) return
 
       try {
+        const pageBase64 = pages[pageIndex]
+        // Release from array immediately — ocrPage will hold its own ref
+        // until the API call completes, then it too is released.
+        pages[pageIndex] = null
         const pageText = await ocrPage(
-          pages[pageIndex],
+          pageBase64 ?? "",
           pageIndex,
           total,
           visionConfig,
@@ -281,8 +300,16 @@ export async function ocrImagePdf(
 
   const pageTexts = results.filter((text): text is string => Boolean(text))
   if (pageTexts.length === 0) {
+    pages.length = 0
+    pendingPages.length = 0
+    results.length = 0
     return "(OCR 未能提取到任何文字，请确认视觉模型已正确配置)"
   }
 
-  return pageTexts.join("\n\n")
+  const combined = pageTexts.join("\n\n")
+  pages.length = 0
+  pendingPages.length = 0
+  results.length = 0
+  pageTexts.length = 0
+  return combined
 }

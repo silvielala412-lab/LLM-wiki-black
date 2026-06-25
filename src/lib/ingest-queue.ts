@@ -1,4 +1,4 @@
-import { readFile, writeFile } from "@/commands/fs"
+import { readFile, writeFile, listDirectory } from "@/commands/fs"
 import { getLogger } from "@/lib/logger"
 
 const log = getLogger("queue")
@@ -46,6 +46,7 @@ let sweepAbortController: AbortController | null = null
 /** Accumulates all entity titles written in this drain cycle for the deferred relation pass. */
 let sessionEntityTitles = new Set<string>()
 const PROCESSING_STALE_MS = 10 * 60 * 1000
+const SAVE_QUEUE_TIMEOUT_MS = 5_000
 /** Heartbeat timer ID — polls processNext every 15s to self-recover from any stuck state. */
 let heartbeatTimer: ReturnType<typeof setInterval> | null = null
 /**
@@ -56,6 +57,8 @@ let heartbeatTimer: ReturnType<typeof setInterval> | null = null
  * Different source files still run in parallel (up to MAX_PARALLEL).
  */
 let activeSourcePaths = new Set<string>()
+/** Heavy binary/OCR tasks are serialized to avoid browser memory spikes. */
+let activeSerialKeys = new Set<string>()
 
 // ── Persistence ───────────────────────────────────────────────────────────
 
@@ -67,8 +70,14 @@ async function saveQueue(projectPath: string): Promise<void> {
   try {
     // Only save pending and failed tasks (done tasks are removed)
     const toSave = queue.filter((t) => t.status !== "done")
-    await writeFile(queueFilePath(projectPath), JSON.stringify(toSave, null, 2))
-  } catch {
+    await Promise.race([
+      writeFile(queueFilePath(projectPath), JSON.stringify(toSave, null, 2)),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("saveQueue timed out")), SAVE_QUEUE_TIMEOUT_MS),
+      ),
+    ])
+  } catch (err) {
+    log.warn("saveQueue failed or timed out", { error: err instanceof Error ? err.message : String(err) })
     // non-critical
   }
 }
@@ -76,7 +85,10 @@ async function saveQueue(projectPath: string): Promise<void> {
 async function loadQueue(projectPath: string, projectId: string): Promise<IngestTask[]> {
   try {
     const raw = await readFile(queueFilePath(projectPath))
-    const tasks = JSON.parse(raw) as IngestTask[]
+    const cleaned = raw
+      .replace(/^\uFEFF/, "")
+      .replace(/^\u00EF\u00BB\u00BF/, "")
+    const tasks = JSON.parse(cleaned) as IngestTask[]
     // Backfill projectId for tasks persisted before the field existed.
     // Files live inside a specific project, so every task in this file
     // belongs to `projectId` regardless of what's on disk.
@@ -84,7 +96,11 @@ async function loadQueue(projectPath: string, projectId: string): Promise<Ingest
       ...t,
       projectId: t.projectId ?? projectId,
     }))
-  } catch {
+  } catch (err) {
+    log.warn("loadQueue failed", {
+      path: queueFilePath(projectPath),
+      error: err instanceof Error ? err.message : String(err),
+    })
     return []
   }
 }
@@ -103,6 +119,25 @@ function sourceFileName(sourcePath: string): string {
   return sourcePath.replace(/\\/g, "/").split("/").pop() ?? sourcePath
 }
 
+function productCatalogSerialKey(folderContext: string | undefined): string | null {
+  if (!folderContext) return null
+  const parts = folderContext.split(">").map((part) => part.trim()).filter(Boolean)
+  if (parts[0] !== "product_catalog" || !parts[1] || !parts[2]) return null
+  return `product_catalog:${parts[1]}:${parts[2]}`
+}
+
+function taskSerialKey(task: Pick<IngestTask, "sourcePath" | "folderContext">): string | null {
+  const ext = sourceExtension(task.sourcePath)
+  const name = sourceFileName(task.sourcePath).toLowerCase()
+  if (
+    name === "__product_bundle__.json" ||
+    ["pdf", "png", "jpg", "jpeg", "webp", "gif", "bmp", "tiff", "tif"].includes(ext)
+  ) {
+    return "ocr-binary"
+  }
+  return productCatalogSerialKey(task.folderContext)
+}
+
 async function readSourceContentForCache(sourceFullPath: string): Promise<string> {
   const ext = sourceExtension(sourceFullPath)
   if (["png", "jpg", "jpeg", "webp", "gif", "bmp", "tiff", "tif", "pdf"].includes(ext)) {
@@ -114,6 +149,18 @@ async function readSourceContentForCache(sourceFullPath: string): Promise<string
 }
 
 async function taskAlreadyCompleted(projectPath: string, task: IngestTask): Promise<boolean> {
+  const ext = sourceExtension(task.sourcePath)
+  const name = sourceFileName(task.sourcePath).toLowerCase()
+  // Keep startup restore cheap. Large binary tasks and product bundles do
+  // their own cache checks inside autoIngest; reading them here can recreate
+  // the browser OOM during queue recovery.
+  if (
+    name === "__product_bundle__.json" ||
+    ["png", "jpg", "jpeg", "webp", "gif", "bmp", "tiff", "tif", "pdf"].includes(ext)
+  ) {
+    return false
+  }
+
   const pp = normalizePath(projectPath)
   const fullSourcePath = isAbsolutePath(task.sourcePath)
     ? normalizePath(task.sourcePath)
@@ -284,6 +331,9 @@ export async function cancelTask(taskId: string): Promise<void> {
       await cleanupWrittenFiles(currentProjectPath, taskFiles)
       log.info("cancel: cleaned up written files", { file: task.sourcePath, files: taskFiles.length })
     }
+    activeSourcePaths.delete(task.sourcePath)
+    const serialKey = taskSerialKey(task)
+    if (serialKey) activeSerialKeys.delete(serialKey)
     activeCount = Math.max(0, activeCount - 1)
   }
 
@@ -316,6 +366,8 @@ export async function cancelAllTasks(): Promise<number> {
     ctrl.abort()
   }
   abortControllers.clear()
+  activeSourcePaths.clear()
+  activeSerialKeys.clear()
   activeCount = 0
 
   // Cleanup all written files from running tasks
@@ -371,6 +423,7 @@ export function clearQueueState(): void {
   abortControllers = new Map()
   writtenFilesByTask = new Map()
   activeSourcePaths = new Set()
+  activeSerialKeys = new Set()
   sweepAbortController = null
   processedSinceDrain = false
 }
@@ -395,6 +448,7 @@ export async function pauseQueue(): Promise<void> {
   abortControllers.clear()
   writtenFilesByTask.clear()
   activeSourcePaths.clear()
+  activeSerialKeys.clear()
   activeCount = 0
 
   if (sweepAbortController) {
@@ -447,16 +501,7 @@ export function activateProject(projectId: string, projectPath: string): void {
 function startHeartbeat(): void {
   if (heartbeatTimer !== null) return          // already running
   heartbeatTimer = setInterval(() => {
-    if (!currentProjectId) return
-    const hasPending = queue.some((t) => t.status === "pending")
-    const hasProcessing = queue.some((t) => t.status === "processing")
-    if (hasPending && activeCount === 0) {
-      log.warn("heartbeat: queue stalled, restarting", { pending: queue.filter(t => t.status==="pending").length })
-      processNext(currentProjectId)
-    } else if (!hasPending && !hasProcessing) {
-      // Nothing left — stop beating to avoid wasting resources
-      stopHeartbeat()
-    }
+    ensureQueueProcessing("heartbeat")
   }, 15_000)
 }
 
@@ -465,6 +510,51 @@ function stopHeartbeat(): void {
     clearInterval(heartbeatTimer)
     heartbeatTimer = null
   }
+}
+
+/**
+ * Self-heal after browser reload/HMR/OOM recovery. The visible queue row can
+ * survive after the async worker that owned it has disappeared, leaving no
+ * real promise running. When there is no active worker, requeue orphans and
+ * kick the queue.
+ */
+export function ensureQueueProcessing(reason = "ensure"): void {
+  if (!currentProjectId || !currentProjectPath) return
+
+  const pending = queue.filter((t) => t.status === "pending")
+  const processing = queue.filter((t) => t.status === "processing")
+  if (pending.length === 0 && processing.length === 0) {
+    stopHeartbeat()
+    return
+  }
+
+  if (activeCount > 0) return
+
+  if (activeSourcePaths.size > 0 || activeSerialKeys.size > 0 || abortControllers.size > 0 || writtenFilesByTask.size > 0) {
+    abortControllers.clear()
+    writtenFilesByTask.clear()
+    activeSourcePaths.clear()
+    activeSerialKeys.clear()
+  }
+
+  if (processing.length > 0) {
+    for (const task of processing) {
+      task.status = "pending"
+      task.startedAt = undefined
+      task.error = null
+    }
+    log.warn("ensure: orphaned processing tasks requeued", {
+      reason,
+      count: processing.length,
+    })
+    void saveQueue(currentProjectPath)
+  }
+
+  log.warn("ensure: queue stalled, restarting", {
+    reason,
+    pending: pending.length + processing.length,
+  })
+  void processNext(currentProjectId)
 }
 
 export async function restoreQueue(
@@ -478,12 +568,19 @@ export async function restoreQueue(
   activeCount = 0
   abortControllers = new Map()
   writtenFilesByTask = new Map()
+  activeSourcePaths = new Set()
+  activeSerialKeys = new Set()
   currentProjectId = projectId
   currentProjectPath = pp
 
+  log.info("restore: start", { project: projectId, path: pp })
   const saved = await loadQueue(pp, projectId)
 
-  if (saved.length === 0) return
+  if (saved.length === 0) {
+    log.info("restore: empty", { project: projectId })
+    stopHeartbeat()
+    return
+  }
 
   // Drop any cross-project contamination (shouldn't happen in practice
   // but defends against a corrupt queue file).
@@ -492,11 +589,23 @@ export async function restoreQueue(
     log.warn("restore: dropped cross-project tasks", { dropped: saved.length - mine.length })
   }
 
-  // Reset any "processing" tasks back to "pending" (interrupted by app close)
+  // Reset any "processing" tasks back to "pending" (interrupted by app close).
+  // Product bundle tasks are resumable because PDF OCR is persisted page-by-page
+  // and cache writes are non-blocking; marking them failed leaves the UI stuck.
   let restored = 0
   for (const task of mine) {
     if (task.status === "processing") {
       task.status = "pending"
+      task.error = null
+      task.startedAt = undefined
+      restored++
+    } else if (
+      task.status === "failed" &&
+      sourceFileName(task.sourcePath).toLowerCase() === "__product_bundle__.json" &&
+      task.error === "Bundle interrupted (possible OOM). Retry manually."
+    ) {
+      task.status = "pending"
+      task.error = null
       task.startedAt = undefined
       restored++
     }
@@ -520,13 +629,19 @@ export async function restoreQueue(
 
   if (pending > 0 || restored > 0) {
     log.info("restored", { pending, failed, restored, completed })
-    processNext(projectId)
+    ensureQueueProcessing("restore")
+  } else {
+    stopHeartbeat()
   }
 }
 
 // ── Processing ────────────────────────────────────────────────────────────
 
 const MAX_RETRIES = 3
+
+function deferToEventLoop(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0))
+}
 
 function retryDelayMs(message: string, retryCount: number): number {
   if (!/(503|Service Unavailable|service is too busy|rate limit|429)/i.test(message)) return 0
@@ -556,6 +671,9 @@ function startProcessingWatchdog(projectId: string, taskId: string, startedAt: n
     task.status = "pending"
     task.startedAt = undefined
     task.error = `Processing timed out after ${Math.round(PROCESSING_STALE_MS / 60000)} minutes; requeued automatically`
+    activeSourcePaths.delete(task.sourcePath)
+    const serialKey = taskSerialKey(task)
+    if (serialKey) activeSerialKeys.delete(serialKey)
     activeCount = Math.max(0, activeCount - 1)
 
     log.warn("watchdog: task timed out, requeued", { file: task.sourcePath, ageMs })
@@ -623,6 +741,17 @@ async function onQueueDrained(projectId: string, projectPath: string): Promise<v
       sweepAbortController = null
     }
   }
+
+  try {
+    if (currentProjectId === projectId) {
+      const tree = await listDirectory(projectPath)
+      const store = useWikiStore.getState()
+      store.setFileTree(tree)
+      store.bumpDataVersion()
+    }
+  } catch (err) {
+    log.warn("drain: refresh file tree failed", { error: err instanceof Error ? err.message : String(err) })
+  }
 }
 
 async function processNext(projectId: string): Promise<void> {
@@ -630,14 +759,17 @@ async function processNext(projectId: string): Promise<void> {
   if (activeCount >= MAX_PARALLEL) return
   if (currentProjectId !== projectId) return
 
-  const next = queue.find(
-    (t) =>
+  const next = queue.find((t) => {
+    const serialKey = taskSerialKey(t)
+    return (
       t.projectId === projectId &&
       t.status === "pending" &&
       // Per-sourcePath serialization: only one batch per source file runs at a time.
-      // Different source files still run concurrently.
-      !activeSourcePaths.has(t.sourcePath),
-  )
+      // Heavy OCR/product tasks also share a serial key to avoid memory spikes.
+      !activeSourcePaths.has(t.sourcePath) &&
+      (!serialKey || !activeSerialKeys.has(serialKey))
+    )
+  })
   if (!next) {
     // Queue fully drained — trigger review cleanup when all tasks also finish
     if (activeCount === 0) {
@@ -663,11 +795,13 @@ async function processNext(projectId: string): Promise<void> {
   }
 
   // Mark task as processing and increment active count
+  const serialKey = taskSerialKey(next)
   activeCount++
   activeSourcePaths.add(next.sourcePath)
+  if (serialKey) activeSerialKeys.add(serialKey)
   next.status = "processing"
   next.startedAt = Date.now()
-  await saveQueue(pp)
+  void saveQueue(pp)
 
   // Kick off another task immediately to fill remaining parallel slots
   processNext(projectId)
@@ -678,6 +812,8 @@ async function processNext(projectId: string): Promise<void> {
   if (!llmConfig.apiKey && llmConfig.provider !== "ollama" && llmConfig.provider !== "custom") {
     next.status = "failed"
     next.error = "LLM not configured — set API key in Settings"
+    activeSourcePaths.delete(next.sourcePath)
+    if (serialKey) activeSerialKeys.delete(serialKey)
     activeCount = Math.max(0, activeCount - 1)
     await saveQueue(pp)
     processNext(projectId)
@@ -698,9 +834,11 @@ async function processNext(projectId: string): Promise<void> {
   startProcessingWatchdog(projectId, taskId, next.startedAt, pp)
 
   // Run the ingest task asynchronously (non-blocking — allows parallel tasks)
-  ;(async () => {
+  setTimeout(() => {
+    void (async () => {
     let delayBeforeNextMs = 0
     try {
+      await deferToEventLoop()
       const { autoIngest } = await import("./ingest")
       const writtenFiles = await autoIngest(
         pp,
@@ -730,6 +868,7 @@ async function processNext(projectId: string): Promise<void> {
       abortControllers.delete(taskId)
       writtenFilesByTask.delete(taskId)
       activeSourcePaths.delete(next.sourcePath)
+      if (serialKey) activeSerialKeys.delete(serialKey)
       queue = queue.filter((t) => t.id !== taskId)
       processedSinceDrain = true
       await saveQueue(pp)
@@ -740,6 +879,7 @@ async function processNext(projectId: string): Promise<void> {
       abortControllers.delete(taskId)
       writtenFilesByTask.delete(taskId)
       activeSourcePaths.delete(next.sourcePath)
+      if (serialKey) activeSerialKeys.delete(serialKey)
       const message = err instanceof Error ? err.message : String(err)
       next.retryCount++
       next.error = message
@@ -760,6 +900,8 @@ async function processNext(projectId: string): Promise<void> {
 
       await saveQueue(pp).catch((e) => log.warn("saveQueue failed in catch", { error: String(e) }))
     } finally {
+      activeSourcePaths.delete(next.sourcePath)
+      if (serialKey) activeSerialKeys.delete(serialKey)
       activeCount = Math.max(0, activeCount - 1)
       if (delayBeforeNextMs > 0) {
         log.debug("retry: waiting", { delayMs: delayBeforeNextMs })
@@ -768,5 +910,6 @@ async function processNext(projectId: string): Promise<void> {
         processNext(projectId)
       }
     }
-  })()
+    })()
+  }, 0)
 }

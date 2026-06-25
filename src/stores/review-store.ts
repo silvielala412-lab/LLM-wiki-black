@@ -14,6 +14,17 @@ export interface ReviewItem {
   sourcePath?: string
   affectedPages?: string[]
   searchQueries?: string[]
+  conflict?: {
+    kind: "product-field"
+    category: string
+    productName: string
+    fieldName: string
+    pageKind: string
+    existingValue: string
+    incomingValue: string
+    sourceFileName: string
+    affectedPath: string
+  }
   options: ReviewOption[]
   resolved: boolean
   resolvedAction?: string
@@ -87,6 +98,7 @@ export const useReviewStore = create<ReviewState>((set) => ({
             sourcePath: incoming.sourcePath ?? old.sourcePath,
             affectedPages: mergedPages.length > 0 ? mergedPages : undefined,
             searchQueries: mergedQueries.length > 0 ? mergedQueries : undefined,
+            conflict: incoming.conflict ?? old.conflict,
           }
         } else {
           const newItem = {
