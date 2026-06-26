@@ -139,6 +139,7 @@ impl LlmServerConfig {
 #[derive(Clone)]
 pub struct AppState {
     pub data_root: PathBuf,
+    pub allowed_data_roots: Vec<PathBuf>,
     pub llm_config: LlmServerConfig,
     /// Shared HTTP client — reuse connection pools across requests.
     pub http_client: reqwest::Client,
@@ -146,10 +147,40 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(data_root: PathBuf, llm_config: LlmServerConfig) -> Self {
+        let allowed_data_roots = allowed_data_roots(&data_root);
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(300)) // 5 min for large PDFs
             .build()
             .expect("Failed to build HTTP client");
-        Self { data_root, llm_config, http_client }
+        Self { data_root, allowed_data_roots, llm_config, http_client }
     }
+}
+
+fn allowed_data_roots(primary: &PathBuf) -> Vec<PathBuf> {
+    let mut roots = vec![primary.clone()];
+
+    if let Ok(extra) = std::env::var("WIKI_EXTRA_DATA_PATHS") {
+        roots.extend(
+            extra
+                .split(';')
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from),
+        );
+    }
+
+    if let Ok(cwd) = std::env::current_dir() {
+        for ancestor in cwd.ancestors().take(4) {
+            roots.push(ancestor.join("wiki-data"));
+        }
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    roots
+        .into_iter()
+        .filter(|root| {
+            let key = root.to_string_lossy().replace('\\', "/").to_lowercase();
+            seen.insert(key)
+        })
+        .collect()
 }

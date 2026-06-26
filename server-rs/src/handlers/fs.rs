@@ -19,36 +19,75 @@ use crate::{error::Result, state::AppState};
 
 // ── Path safety ──────────────────────────────────────────────────────────────
 
-/// Ensure `path` is within `root`. Returns the canonical absolute path.
+/// Normalize `.` and `..` components without requiring the target to exist.
+fn normalize_path(path: PathBuf) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        use std::path::Component;
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            c => normalized.push(c),
+        }
+    }
+    normalized
+}
+
+fn comparable_path(path: &Path) -> String {
+    let value = path.to_string_lossy().replace('\\', "/");
+    #[cfg(windows)]
+    {
+        value.to_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        value
+    }
+}
+
+fn path_is_inside(candidate: &Path, root: &Path) -> bool {
+    let candidate_key = comparable_path(candidate).trim_end_matches('/').to_string();
+    let root_key = comparable_path(root).trim_end_matches('/').to_string();
+    candidate_key == root_key || candidate_key.starts_with(&format!("{root_key}/"))
+}
+
+/// Ensure `path` is within an allowed data root. Returns the normalized absolute path.
 /// Rejects path traversal attempts (../../etc/passwd etc.).
-fn guard_path(path: &str, root: &Path) -> anyhow::Result<PathBuf> {
+fn guard_path(path: &str, roots: &[PathBuf]) -> anyhow::Result<PathBuf> {
     // Resolve the path without requiring it to exist (for write operations)
     // by joining to root and then normalising `.` / `..` segments manually.
+    let root = roots.first().map(PathBuf::as_path).unwrap_or_else(|| Path::new("."));
     let joined = if Path::new(path).is_absolute() {
         PathBuf::from(path)
     } else {
         root.join(path)
     };
 
-    // Remove `.` / `..` without requiring the path to exist
-    let mut canonical = PathBuf::new();
-    for component in joined.components() {
-        use std::path::Component;
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => { canonical.pop(); }
-            c => canonical.push(c),
+    let canonical = normalize_path(joined);
+
+    for allowed_root in roots {
+        let root_abs = if allowed_root.is_absolute() {
+            allowed_root.clone()
+        } else {
+            std::env::current_dir()?.join(allowed_root)
+        };
+        let normalized_root = normalize_path(root_abs);
+        if path_is_inside(&canonical, &normalized_root) {
+            return Ok(canonical);
         }
     }
 
-    // Must stay inside data_root
-    if !canonical.starts_with(root) {
-        anyhow::bail!(
-            "Path '{}' is outside the allowed data directory",
-            path
-        );
-    }
-    Ok(canonical)
+    anyhow::bail!(
+        "Path '{}' is outside the allowed data directories: {}",
+        path,
+        roots
+            .iter()
+            .map(|root| root.to_string_lossy().to_string())
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
 }
 
 // ── Known file type categories (same as Tauri) ──────────────────────────────
@@ -685,7 +724,7 @@ pub async fn write_file(
     State(state): State<Arc<AppState>>,
     Json(body): Json<WriteBody>,
 ) -> Result<Json<Value>> {
-    guard_path(&body.path, &state.data_root)?;
+    guard_path(&body.path, &state.allowed_data_roots)?;
     let p = Path::new(&body.path);
     if let Some(parent) = p.parent() {
         fs::create_dir_all(parent)?;
@@ -710,7 +749,7 @@ pub async fn delete_file(
     State(state): State<Arc<AppState>>,
     Json(body): Json<PathBody>,
 ) -> Result<Json<Value>> {
-    guard_path(&body.path, &state.data_root)?;
+    guard_path(&body.path, &state.allowed_data_roots)?;
     let p = Path::new(&body.path);
     if p.is_dir() {
         fs::remove_dir_all(&body.path)?;

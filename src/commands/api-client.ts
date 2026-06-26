@@ -9,11 +9,30 @@
  * In production FastAPI serves both the API and the React build.
  */
 
+import { isFileMissingErrorContent, extractFileMissingErrorMessage } from "@/lib/fs-errors"
+
 const API_BASE = "/api"
 
 // ── Generic fetch helpers ─────────────────────────────────────────────────────
 
 const API_TIMEOUT_MS = 30_000   // 30 s — prevents indefinite hangs
+
+async function readApiError(res: Response): Promise<string> {
+  const text = await res.text().catch(() => res.statusText)
+  if (!text) return res.statusText || `HTTP ${res.status}`
+  try {
+    const parsed = JSON.parse(text) as { error?: unknown; message?: unknown }
+    const message = typeof parsed.error === "string"
+      ? parsed.error
+      : typeof parsed.message === "string"
+        ? parsed.message
+        : ""
+    if (message.trim()) return message.trim()
+  } catch {
+    // Plain-text error body.
+  }
+  return text
+}
 
 async function post<T>(path: string, body: unknown, timeoutMs = API_TIMEOUT_MS): Promise<T> {
   const controller = new AbortController()
@@ -26,8 +45,7 @@ async function post<T>(path: string, body: unknown, timeoutMs = API_TIMEOUT_MS):
       signal: controller.signal,
     })
     if (!res.ok) {
-      const text = await res.text().catch(() => res.statusText)
-      throw new Error(text)
+      throw new Error(await readApiError(res))
     }
     // 204 No Content or empty body
     const ct = res.headers.get("content-type") ?? ""
@@ -48,7 +66,7 @@ async function get<T>(path: string, timeoutMs = API_TIMEOUT_MS): Promise<T> {
   const timer = setTimeout(() => controller.abort(), timeoutMs)
   try {
     const res = await fetch(`${API_BASE}${path}`, { signal: controller.signal })
-    if (!res.ok) throw new Error(await res.text().catch(() => res.statusText))
+    if (!res.ok) throw new Error(await readApiError(res))
     return res.json() as Promise<T>
   } catch (err) {
     if (err instanceof DOMException && err.name === "AbortError") {
@@ -62,8 +80,17 @@ async function get<T>(path: string, timeoutMs = API_TIMEOUT_MS): Promise<T> {
 
 // ── File System ───────────────────────────────────────────────────────────────
 
+export interface FileBase64 {
+  base64: string
+  mimeType: string
+}
+
 export async function readFile(path: string): Promise<string> {
-  return post<string>("/fs/read", { path })
+  const content = await post<string>("/fs/read", { path })
+  if (typeof content === "string" && isFileMissingErrorContent(content)) {
+    throw new Error(extractFileMissingErrorMessage(content) ?? "File does not exist")
+  }
+  return content
 }
 
 export async function writeFile(path: string, contents: string): Promise<void> {
@@ -98,8 +125,8 @@ export async function preprocessFile(path: string): Promise<string> {
   return post<string>("/fs/preprocess", { path })
 }
 
-export async function readFileAsBase64(path: string): Promise<{ base64: string; mimeType: string }> {
-  return post<{ base64: string; mimeType: string }>("/fs/read-base64", { path })
+export async function readFileAsBase64(path: string): Promise<FileBase64> {
+  return post<FileBase64>("/fs/read-base64", { path })
 }
 
 export async function findRelatedWikiPages(

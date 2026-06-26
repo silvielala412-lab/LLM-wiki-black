@@ -56,6 +56,7 @@ async fn main() -> anyhow::Result<()> {
     ));
 
     info!("Wiki data root: {data_root}");
+    info!("Allowed wiki data roots: {:?}", state.allowed_data_roots);
     info!("Serving frontend from: {static_dir}");
 
     // CORS — allow all for intranet

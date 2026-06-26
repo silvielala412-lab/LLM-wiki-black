@@ -1,10 +1,10 @@
-import { useState, useEffect, useCallback, useRef } from "react"
+import { useState, useEffect, useCallback } from "react"
 import { Plus, FileText, RefreshCw, BookOpen, Trash2, Folder, ChevronRight, ChevronDown, Layers, Upload, GitMerge, LayoutList, ShieldCheck } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { useWikiStore } from "@/stores/wiki-store"
-import { copyFile, listDirectory, readFile, writeFile, deleteFile, findRelatedWikiPages, preprocessFile, fileExists } from "@/commands/fs"
+import { listDirectory, readFile, writeFile, deleteFile, findRelatedWikiPages, fileExists } from "@/commands/fs"
 import type { FileNode } from "@/types/wiki"
 import { enqueueIngest, enqueueBatch } from "@/lib/ingest-queue"
 import { useTranslation } from "react-i18next"
@@ -24,24 +24,396 @@ import {
   decideDeleteClick,
 } from "@/lib/sources-tree-delete"
 import { SERVICE_HIERARCHY } from "@/lib/insurance-schema-registry"
-import type { ServiceHierarchySeries } from "@/lib/insurance-schema-registry"
 import {
   INSURANCE_CATEGORIES,
   PRODUCT_FIELDS,
   PRODUCT_CATALOG_MODULES,
   type InsuranceCategoryType,
-  buildProductModuleTitle,
-  getRequiredModules,
-  calcModuleCompleteness,
-  parseProductModuleTitle,
   encodeProductCatalogFolderContext,
 } from "@/lib/product-catalog-modules"
 import { getLogger } from "@/lib/logger"
+import { clearProductFieldValueForDeletedSource } from "@/lib/product-catalog-sync"
+import { runConceptAggregator } from "@/lib/concept-aggregator"
 
 const log = getLogger("upload")
 const logDel = getLogger("delete")
 
 type UploadResult = { path: string; name: string; size: number } | { error: string; name: string }
+type ProductSourceContext = { category: string; productName: string; sourceFolder: string }
+const PRODUCT_SOURCE_METADATA_FILES = new Set(["product_meta.json"])
+
+function uniqueSourceRefs(refs: string[]): string[] {
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const ref of refs) {
+    const normalized = ref.trim()
+    const key = normalized.toLowerCase()
+    if (!normalized || seen.has(key)) continue
+    seen.add(key)
+    out.push(normalized)
+  }
+  return out
+}
+
+function utf8AsLegacyGbk(value: string): string | null {
+  try {
+    return new TextDecoder("gbk").decode(new TextEncoder().encode(value))
+  } catch {
+    return null
+  }
+}
+
+function textVariants(value: string): string[] {
+  return uniqueSourceRefs([value, utf8AsLegacyGbk(value) ?? ""])
+}
+
+function sourceDeleteRefs(projectPath: string, node: FileNode): string[] {
+  const pp = normalizePath(projectPath)
+  const sourcePath = normalizePath(node.path)
+  const relativePath = sourcePath.startsWith(`${pp}/`)
+    ? sourcePath.slice(pp.length + 1)
+    : sourcePath
+  return uniqueSourceRefs([
+    ...textVariants(relativePath),
+    ...textVariants(node.name),
+  ])
+}
+
+function decidePageFateForSourceRefs(sourcesList: string[], refs: string[]) {
+  for (const ref of refs) {
+    const decision = decidePageFate(sourcesList, ref)
+    if (decision.action !== "skip") return decision
+  }
+  return decidePageFate(sourcesList, refs[0] ?? "")
+}
+
+function isProductRootSegment(value: string): boolean {
+  return textVariants("产品").some(candidate => candidate === value)
+}
+
+function parseProductSourceContext(projectPath: string, path: string): ProductSourceContext | null {
+  const pp = normalizePath(projectPath).replace(/\/$/, "")
+  const normalized = normalizePath(path)
+  const rel = normalized.startsWith(`${pp}/`) ? normalized.slice(pp.length + 1) : normalized
+  const parts = rel.split("/").filter(Boolean)
+  for (let i = 0; i < parts.length - 4; i++) {
+    if (parts[i] !== "raw" || parts[i + 1] !== "sources" || !isProductRootSegment(parts[i + 2])) continue
+    const category = parts[i + 3]
+    const productName = parts[i + 4]
+    if (!category || !productName) return null
+    return {
+      category,
+      productName,
+      sourceFolder: `${pp}/${parts.slice(0, i + 5).join("/")}`,
+    }
+  }
+  return null
+}
+
+function collectProductSourceContexts(projectPath: string, node: FileNode): ProductSourceContext[] {
+  const contexts: ProductSourceContext[] = []
+  const seen = new Set<string>()
+  const visit = (current: FileNode) => {
+    const context = parseProductSourceContext(projectPath, current.path)
+    if (context) {
+      const key = `${context.category}\n${context.productName}\n${context.sourceFolder}`.toLowerCase()
+      if (!seen.has(key)) {
+        seen.add(key)
+        contexts.push(context)
+      }
+    }
+    if (current.is_dir && current.children) {
+      for (const child of current.children) visit(child)
+    }
+  }
+  visit(node)
+  return contexts
+}
+
+function productKeyVariants(context: ProductSourceContext): string[] {
+  const keys: string[] = []
+  for (const category of textVariants(context.category)) {
+    for (const productName of textVariants(context.productName)) {
+      keys.push(`${category}-${productName}`)
+    }
+  }
+  return uniqueSourceRefs(keys)
+}
+
+function matchesProductArtifact(fileName: string, context: ProductSourceContext): boolean {
+  const stem = fileName.replace(/\.md$/i, "")
+  return productKeyVariants(context).some(key => stem === key || stem.startsWith(`${key}-`))
+}
+
+async function productSourceFolderHasFiles(context: ProductSourceContext): Promise<boolean> {
+  try {
+    const tree = await listDirectory(context.sourceFolder) as FileNode[]
+    const hasVisibleFile = (node: FileNode): boolean => {
+      if (node.name.startsWith(".")) return false
+      if (!node.is_dir && PRODUCT_SOURCE_METADATA_FILES.has(node.name.toLowerCase())) return false
+      if (!node.is_dir) return true
+      return node.children?.some(hasVisibleFile) ?? false
+    }
+    return tree.some(hasVisibleFile)
+  } catch {
+    return false
+  }
+}
+
+async function cleanupEmptyProductSourceFolder(context: ProductSourceContext) {
+  if (await productSourceFolderHasFiles(context)) return false
+  try {
+    await deleteFile(context.sourceFolder)
+    return true
+  } catch (err) {
+    console.warn("[SourcesView] Failed to remove empty product source folder:", context.sourceFolder, err)
+    return false
+  }
+}
+
+function normalizePathKey(path: string): string {
+  return normalizePath(path).replace(/\/+$/, "").toLowerCase()
+}
+
+function isWithinDeletedPaths(path: string | null | undefined, deletedPaths: string[]): boolean {
+  if (!path || deletedPaths.length === 0) return false
+  const normalized = normalizePathKey(path)
+  return deletedPaths.some((deletedPath) => {
+    const deleted = normalizePathKey(deletedPath)
+    return normalized === deleted || normalized.startsWith(`${deleted}/`)
+  })
+}
+
+function pruneDeletedSourceNodes(nodes: FileNode[], deletedPaths: string[]): FileNode[] {
+  if (deletedPaths.length === 0) return nodes
+  return nodes
+    .filter((node) => !isWithinDeletedPaths(node.path, deletedPaths))
+    .map((node) => {
+      if (node.is_dir && node.children) {
+        return { ...node, children: pruneDeletedSourceNodes(node.children, deletedPaths) }
+      }
+      return node
+    })
+    .filter((node) => !node.is_dir || (node.children && node.children.length > 0))
+}
+
+async function runLimited<T>(
+  items: readonly T[],
+  limit: number,
+  worker: (item: T, index: number) => Promise<void>,
+): Promise<void> {
+  let nextIndex = 0
+  const workerCount = Math.min(Math.max(1, limit), items.length)
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (nextIndex < items.length) {
+      const current = nextIndex++
+      await worker(items[current], current)
+    }
+  }))
+}
+
+async function cleanupSourceFileCaches(pp: string, files: readonly FileNode[]) {
+  await runLimited(files, 6, async (file) => {
+    try {
+      await deleteFile(`${pp}/raw/sources/.cache/${file.name}.txt`)
+    } catch {
+      // cache file may not exist
+    }
+    try {
+      await removeFromIngestCache(pp, file.name)
+    } catch {
+      // non-critical
+    }
+  })
+}
+
+function productSourceRefForContext(context: ProductSourceContext, fileName: string): string {
+  return `raw/sources/产品/${context.category}/${context.productName}/${fileName}`
+}
+
+function removeProductSourceBlock(content: string, fileName: string): string {
+  const escaped = fileName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+  const block = new RegExp(
+    `\\n?<!-- PRODUCT_SOURCE_BEGIN:\\s*${escaped}\\s*-->[\\s\\S]*?<!-- PRODUCT_SOURCE_END:\\s*${escaped}\\s*-->\\n?`,
+    "g",
+  )
+  return content.replace(block, "\n").replace(/\n{3,}/g, "\n\n")
+}
+
+async function cleanupProductSourceTextForDeletedSource(
+  pp: string,
+  context: ProductSourceContext,
+  fileName: string,
+): Promise<string[]> {
+  const touched: string[] = []
+  const dir = `${pp}/wiki/source_text`
+  try {
+    const tree = await listDirectory(dir) as FileNode[]
+    for (const file of flattenMdFiles(tree)) {
+      if (!matchesProductArtifact(file.name, context)) continue
+      try {
+        const content = await readFile(file.path)
+        if (new RegExp(`^source_file:\\s*["']?${fileName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}["']?\\s*$`, "m").test(content)) {
+          await deleteFile(file.path)
+          touched.push(file.path)
+          continue
+        }
+        const updated = removeProductSourceBlock(content, fileName)
+        if (updated !== content) {
+          await writeFile(file.path, updated)
+          touched.push(file.path)
+        }
+      } catch (err) {
+        console.warn("[SourcesView] Failed to clean product source_text page:", file.path, err)
+      }
+    }
+  } catch {
+    // source_text may not exist
+  }
+  return touched
+}
+
+async function cleanupProductFieldPagesForDeletedSource(
+  pp: string,
+  context: ProductSourceContext,
+  deletingRefs: readonly string[],
+): Promise<string[]> {
+  const touched: string[] = []
+  try {
+    const tree = await listDirectory(`${pp}/wiki/product_catalog`) as FileNode[]
+    const productPages = flattenMdFiles(tree).filter(file => matchesProductArtifact(file.name, context))
+    await runLimited(productPages, 4, async (file) => {
+      try {
+        const result = await clearProductFieldValueForDeletedSource(
+          pp,
+          file.path,
+          deletingRefs,
+          { skipDerivedRefresh: true },
+        )
+        if (result.touchedPaths.length > 0) touched.push(...result.touchedPaths)
+      } catch (err) {
+        console.warn("[SourcesView] Failed to clean field value for deleted source:", file.path, err)
+      }
+    })
+  } catch {
+    // product catalog may not exist
+  }
+  return Array.from(new Set(touched))
+}
+
+async function cleanupDeletedWikiRefs(pp: string, deletedInfos: DeletedPageInfo[]) {
+  const deletedKeys = buildDeletedKeys(deletedInfos)
+  if (deletedKeys.size === 0) return
+
+  try {
+    const wikiTree = await listDirectory(`${pp}/wiki`) as FileNode[]
+    const allMdFiles = flattenMdFiles(wikiTree)
+    for (const file of allMdFiles) {
+      try {
+        const content = await readFile(file.path)
+        const isIndex = file.path === `${pp}/wiki/index.md` || file.name === "index.md"
+        const afterListing = isIndex ? cleanIndexListing(content, deletedKeys) : content
+        const updated = stripDeletedWikilinks(afterListing, deletedKeys)
+        if (updated !== content) await writeFile(file.path, updated)
+      } catch {
+        // best-effort cleanup
+      }
+    }
+  } catch {
+    // non-critical
+  }
+}
+
+function removeProductKeyFromInlineList(line: string, productKeys: string[]): string {
+  const match = line.match(/^(related_products:\s*)\[([^\]]*)\](.*)$/)
+  if (!match) return line
+  const keys = new Set(productKeys.map(key => key.toLowerCase()))
+  const values = match[2]
+    .split(",")
+    .map(item => item.trim().replace(/^["']|["']$/g, ""))
+    .filter(Boolean)
+    .filter(item => !keys.has(item.toLowerCase()))
+  return `${match[1]}[${values.map(value => JSON.stringify(value)).join(", ")}]${match[3] ?? ""}`
+}
+
+function stripProductReferencesFromConcept(content: string, context: ProductSourceContext): string {
+  const productKeys = productKeyVariants(context)
+  const productNames = textVariants(context.productName)
+  const categories = textVariants(context.category)
+  return content
+    .split(/\r?\n/)
+    .filter((line) => {
+      const hasProduct = productNames.some(product => product && line.includes(product))
+      if (!hasProduct) return true
+      const hasCategory = categories.some(category => category && line.includes(category))
+      const hasProductKey = productKeys.some(key => key && line.includes(key))
+      const hasProductCatalogLink = line.includes("wiki/product_catalog/") || line.includes("../product_catalog/")
+      return !(hasCategory || hasProductKey || hasProductCatalogLink)
+    })
+    .map(line => removeProductKeyFromInlineList(line, productKeys))
+    .join("\n")
+}
+
+async function stripProductReferencesFromConcepts(pp: string, context: ProductSourceContext) {
+  try {
+    const tree = await listDirectory(`${pp}/wiki/concepts`) as FileNode[]
+    for (const file of flattenMdFiles(tree)) {
+      try {
+        const content = await readFile(file.path)
+        const updated = stripProductReferencesFromConcept(content, context)
+        if (updated !== content) await writeFile(file.path, updated)
+      } catch {
+        // best-effort cleanup
+      }
+    }
+  } catch {
+    // no concepts directory
+  }
+}
+
+async function cleanupProductCatalogArtifactsForDeletedSource(
+  pp: string,
+  context: ProductSourceContext,
+  options: { refreshConcepts?: boolean } = {},
+): Promise<string[]> {
+  const deletedPaths: string[] = []
+  const deletedInfos: DeletedPageInfo[] = []
+  const dirs = [`${pp}/wiki/product_catalog`, `${pp}/wiki/source_text`]
+
+  for (const dir of dirs) {
+    try {
+      const tree = await listDirectory(dir) as FileNode[]
+      for (const file of flattenMdFiles(tree)) {
+        if (!matchesProductArtifact(file.name, context)) continue
+        try {
+          const content = await readFile(file.path).catch(() => "")
+          deletedInfos.push({
+            slug: getFileName(file.path).replace(/\.md$/i, ""),
+            title: extractFrontmatterTitle(content),
+          })
+          const { cascadeDeleteWikiPage } = await import("@/lib/wiki-page-delete")
+          await cascadeDeleteWikiPage(pp, file.path)
+          deletedPaths.push(file.path)
+        } catch (err) {
+          console.warn("[SourcesView] Failed to delete product artifact:", file.path, err)
+        }
+      }
+    } catch {
+      // directory may not exist
+    }
+  }
+
+  await cleanupDeletedWikiRefs(pp, deletedInfos)
+  await stripProductReferencesFromConcepts(pp, context)
+  if (options.refreshConcepts !== false) {
+    try {
+      await runConceptAggregator(pp)
+    } catch (err) {
+      console.warn("[SourcesView] Failed to refresh concepts after product cleanup:", err)
+    }
+  }
+  return deletedPaths
+}
 
 export function SourcesView() {
   const { t } = useTranslation()
@@ -56,6 +428,7 @@ export function SourcesView() {
   const [importStatus, setImportStatus] = useState<string | null>(null)
   const [importError, setImportError] = useState<string | null>(null)
   const [ingestingPath, setIngestingPath] = useState<string | null>(null)
+  const [deletingPath, setDeletingPath] = useState<string | null>(null)
   /** "files" = classic flat file tree; "hierarchy" = 5-level service hierarchy upload; "products" = insurance product catalog upload */
   const [viewMode, setViewMode] = useState<"files" | "hierarchy" | "products">("files")
   /**
@@ -123,7 +496,7 @@ export function SourcesView() {
     if (!project) return
     const pp = normalizePath(project.path)
     try {
-      const tree = await listDirectory(`${pp}/raw/sources`)
+      const tree = await listDirectory(`${pp}/raw/sources`) as FileNode[]
       // Filter out hidden files/dirs and cache
       const filtered = filterTree(tree)
       setSources(filtered)
@@ -225,7 +598,6 @@ export function SourcesView() {
     input.multiple = true
     input.accept = PRODUCT_UPLOAD_ACCEPT
     if (mode === "folder") {
-      // @ts-expect-error — webkitdirectory is not in TS types but works in all modern browsers
       input.webkitdirectory = true
     }
     input.onchange = async () => {
@@ -391,7 +763,6 @@ export function SourcesView() {
     if (!project) return
     const input = document.createElement("input")
     input.type = "file"
-    // @ts-expect-error — webkitdirectory is not in TS types but works in all modern browsers
     input.webkitdirectory = true
     input.multiple = true
     input.onchange = async () => {
@@ -620,32 +991,46 @@ export function SourcesView() {
   }
 
   async function handleDelete(node: FileNode) {
-    if (!project) return
+    if (!project || deletingPath) return
     const pp = normalizePath(project.path)
     // Confirmation now lives in the SourceTree component as a
     // two-stage button (click once = "Confirm", click again =
     // delete). Reaching this handler means the user has already
     // confirmed via the inline UI, so we proceed unconditionally.
+    setDeletingPath(node.path)
     try {
       logDel.info("cascade delete start", { file: node.path })
       const result = await deleteSourceWithCascade(pp, node)
-      // Step 8: Refresh everything (UI side — must run with parent
-      // context, hence kept here rather than inside the helper).
-      await loadSources()
-      const tree = await listDirectory(pp)
-      setFileTree(tree)
-      useWikiStore.getState().bumpDataVersion()
+      const deletedPaths = [...result.deletedSourcePaths, ...result.deletedWikiPaths]
+      setSources((current) => pruneDeletedSourceNodes(current, result.deletedSourcePaths))
       if (
         selectedFile === node.path ||
-        result.deletedWikiPaths.includes(selectedFile ?? "")
+        isWithinDeletedPaths(selectedFile, deletedPaths)
       ) {
         setSelectedFile(null)
+        setFileContent("")
       }
-      logDel.info("cascade delete done", { file: node.path, wikiPagesRemoved: result.deletedWikiPaths.length })
+      // Step 8: Refresh everything (UI side — must run with parent
+      // context, hence kept here rather than inside the helper).
+      useWikiStore.getState().bumpDataVersion()
+      await loadSources()
+      try {
+        const tree = await listDirectory(pp) as FileNode[]
+        setFileTree(tree)
+      } catch (err) {
+        console.warn("[SourcesView] Failed to refresh file tree after delete:", err)
+      }
+      logDel.info("cascade delete done", {
+        file: node.path,
+        sourceNodesRemoved: result.deletedSourcePaths.length,
+        wikiPagesRemoved: result.deletedWikiPaths.length,
+      })
     } catch (err) {
       logDel.error("delete failed", { file: node.path, error: err instanceof Error ? err.message : String(err) })
       console.error("Failed to delete source:", err)
       window.alert(`Failed to delete: ${err}`)
+    } finally {
+      setDeletingPath(null)
     }
   }
 
@@ -664,45 +1049,97 @@ export function SourcesView() {
    * nothing failure that leaves the tree half-deleted.
    */
   async function handleDeleteFolder(folder: FileNode) {
-    if (!project) return
+    if (!project || deletingPath) return
     const pp = normalizePath(project.path)
+    setDeletingPath(folder.path)
     try {
       const allFiles = collectAllFilesIncludingDot(folder)
-      logDel.info("folder delete start", { folder: folder.path, fileCount: allFiles.length })
+      const productContexts = collectProductSourceContexts(pp, folder)
+      logDel.info("folder delete start", { folder: folder.path, fileCount: allFiles.length, productCount: productContexts.length })
       const allDeletedWikiPaths: string[] = []
-      for (const file of allFiles) {
+      const allDeletedSourcePaths: string[] = [folder.path]
+      const productOnlyFolder = productContexts.length > 0 &&
+        allFiles.every((file) => parseProductSourceContext(pp, file.path))
+
+      if (productOnlyFolder) {
+        await cleanupSourceFileCaches(pp, allFiles)
+        let rawFolderRemoved = false
         try {
-          const r = await deleteSourceWithCascade(pp, file)
-          allDeletedWikiPaths.push(...r.deletedWikiPaths)
+          logDel.info("product folder fast remove", { folder: folder.path, fileCount: allFiles.length, productCount: productContexts.length })
+          await deleteFile(folder.path)
+          rawFolderRemoved = true
         } catch (err) {
-          logDel.warn("file delete error (skipped)", { file: file.path, error: err instanceof Error ? err.message : String(err) })
-          console.warn(`Failed to delete ${file.path} during folder delete:`, err)
+          logDel.warn("product folder remove error", { folder: folder.path, error: err instanceof Error ? err.message : String(err) })
+          console.warn(`Failed to remove product folder ${folder.path}:`, err)
+        }
+        if (rawFolderRemoved) {
+          allDeletedSourcePaths.push(...allFiles.map(file => file.path))
+          allDeletedSourcePaths.push(...productContexts.map(context => context.sourceFolder))
+          for (const context of productContexts) {
+            const deleted = await cleanupProductCatalogArtifactsForDeletedSource(pp, context, { refreshConcepts: false })
+            allDeletedWikiPaths.push(...deleted)
+          }
+          try {
+            await runConceptAggregator(pp)
+          } catch (err) {
+            console.warn("[SourcesView] Failed to refresh concepts after product folder delete:", err)
+          }
+        }
+      } else {
+        for (const file of allFiles) {
+          try {
+            const r = await deleteSourceWithCascade(pp, file)
+            allDeletedWikiPaths.push(...r.deletedWikiPaths)
+            allDeletedSourcePaths.push(...r.deletedSourcePaths)
+          } catch (err) {
+            logDel.warn("file delete error (skipped)", { file: file.path, error: err instanceof Error ? err.message : String(err) })
+            console.warn(`Failed to delete ${file.path} during folder delete:`, err)
+          }
+        }
+        // Now remove the folder (and any leftover empty subdirs / dot
+        // cache dirs) in one shot. Files we just deleted above are
+        // gone; this call mostly tears down empty directories.
+        try {
+          logDel.info("folder remove", { folder: folder.path })
+          await deleteFile(folder.path)
+        } catch (err) {
+          logDel.warn("folder remove error", { folder: folder.path, error: err instanceof Error ? err.message : String(err) })
+          console.warn(`Failed to remove folder ${folder.path}:`, err)
+        }
+        for (const context of productContexts) {
+          const deleted = await cleanupProductCatalogArtifactsForDeletedSource(pp, context, { refreshConcepts: false })
+          allDeletedWikiPaths.push(...deleted)
+        }
+        if (productContexts.length > 0) {
+          try {
+            await runConceptAggregator(pp)
+          } catch (err) {
+            console.warn("[SourcesView] Failed to refresh concepts after mixed folder delete:", err)
+          }
         }
       }
-      // Now remove the folder (and any leftover empty subdirs / dot
-      // cache dirs) in one shot. Files we just deleted above are
-      // gone; this call mostly tears down empty directories.
-      try {
-        logDel.info("folder remove", { folder: folder.path })
-        await deleteFile(folder.path)
-      } catch (err) {
-        logDel.warn("folder remove error", { folder: folder.path, error: err instanceof Error ? err.message : String(err) })
-        console.warn(`Failed to remove folder ${folder.path}:`, err)
-      }
-      await loadSources()
-      const tree = await listDirectory(pp)
-      setFileTree(tree)
-      useWikiStore.getState().bumpDataVersion()
+      const deletedSourcePaths = Array.from(new Set(allDeletedSourcePaths))
+      setSources((current) => pruneDeletedSourceNodes(current, deletedSourcePaths))
       if (
-        selectedFile?.startsWith(folder.path + "/") ||
-        allDeletedWikiPaths.includes(selectedFile ?? "")
+        isWithinDeletedPaths(selectedFile, [...deletedSourcePaths, ...allDeletedWikiPaths])
       ) {
         setSelectedFile(null)
+        setFileContent("")
+      }
+      useWikiStore.getState().bumpDataVersion()
+      await loadSources()
+      try {
+        const tree = await listDirectory(pp) as FileNode[]
+        setFileTree(tree)
+      } catch (err) {
+        console.warn("[SourcesView] Failed to refresh file tree after folder delete:", err)
       }
     } catch (err) {
       logDel.error("folder delete failed", { folder: folder.path, error: err instanceof Error ? err.message : String(err) })
       console.error("Failed to delete folder:", err)
       window.alert(`Failed to delete folder: ${err}`)
+    } finally {
+      setDeletingPath(null)
     }
   }
 
@@ -717,10 +1154,79 @@ export function SourcesView() {
   async function deleteSourceWithCascade(
     pp: string,
     node: FileNode,
-  ): Promise<{ deletedWikiPaths: string[] }> {
+  ): Promise<{ deletedWikiPaths: string[]; deletedSourcePaths: string[] }> {
     const fileName = node.name
+    const sourceRefs = sourceDeleteRefs(pp, node)
+    const productContext = parseProductSourceContext(pp, node.path)
+    const deletedSourcePaths = [node.path]
+
+    if (productContext) {
+      const productRefs = uniqueSourceRefs([
+        ...sourceRefs,
+        productSourceRefForContext(productContext, fileName),
+        fileName,
+      ])
+
+      await deleteFile(node.path)
+      await cleanupSourceFileCaches(pp, [node])
+
+      if (!(await productSourceFolderHasFiles(productContext))) {
+        const productDeleted = await cleanupProductCatalogArtifactsForDeletedSource(pp, productContext, { refreshConcepts: false })
+        if (await cleanupEmptyProductSourceFolder(productContext)) {
+          deletedSourcePaths.push(productContext.sourceFolder)
+        }
+        try {
+          await runConceptAggregator(pp)
+        } catch (err) {
+          console.warn("[SourcesView] Failed to refresh concepts after product source delete:", err)
+        }
+        return { deletedWikiPaths: productDeleted, deletedSourcePaths }
+      }
+
+      const [fieldTouched, sourceTextTouched] = await Promise.all([
+        cleanupProductFieldPagesForDeletedSource(pp, productContext, productRefs),
+        cleanupProductSourceTextForDeletedSource(pp, productContext, fileName),
+      ])
+
+      if (fieldTouched.length > 0) {
+        try {
+          await runConceptAggregator(pp)
+        } catch (err) {
+          console.warn("[SourcesView] Failed to refresh concepts after product field cleanup:", err)
+        }
+      }
+
+      try {
+        const logPath = `${pp}/wiki/log.md`
+        const logContent = await readFile(logPath).catch(() => "# Wiki Log\n")
+        const date = new Date().toISOString().slice(0, 10)
+        const logEntry = `\n## [${date}] delete | ${fileName}\n\nDeleted product source file. Cleared ${fieldTouched.length} product field page(s) and updated ${sourceTextTouched.length} source text page(s).\n`
+        await writeFile(logPath, logContent.trimEnd() + logEntry)
+      } catch {
+        // non-critical
+      }
+
+      return {
+        deletedWikiPaths: Array.from(new Set([...fieldTouched, ...sourceTextTouched])),
+        deletedSourcePaths,
+      }
+    }
+
     // Step 1: Find related wiki pages before deleting
-    const relatedPages = await findRelatedWikiPages(pp, fileName)
+    const relatedPageSet = new Set<string>()
+    for (const sourceRef of uniqueSourceRefs([...sourceRefs, fileName])) {
+      try {
+        const pages = await findRelatedWikiPages(pp, sourceRef)
+        for (const page of pages) relatedPageSet.add(page)
+      } catch (err) {
+        logDel.warn("related page lookup failed", {
+          file: node.path,
+          sourceRef,
+          error: err instanceof Error ? err.message : String(err),
+        })
+      }
+    }
+    const relatedPages = Array.from(relatedPageSet)
 
     // Step 2: Delete the source file
     await deleteFile(node.path)
@@ -751,9 +1257,14 @@ export function SourcesView() {
       const deletedInfos: DeletedPageInfo[] = []
       for (const pagePath of relatedPages) {
         try {
+          const fieldDeleteResult = await clearProductFieldValueForDeletedSource(pp, pagePath, sourceRefs)
+          if (fieldDeleteResult.isProductFieldPage) {
+            continue
+          }
+
           const content = await readFile(pagePath)
           const sourcesList = parseSources(content)
-          const decision = decidePageFate(sourcesList, fileName)
+          const decision = decidePageFateForSourceRefs(sourcesList, sourceRefs)
 
           if (decision.action === "skip") {
             // Nothing to do — page isn't really derived from this source.
@@ -786,47 +1297,7 @@ export function SourcesView() {
         }
       }
 
-      // Steps 5 & 6: clean stale references from every wiki file.
-      //
-      // index.md  → drop list-item lines whose primary `[[target]]` is
-      //             a deleted page (title OR slug form matches).
-      // overview.md + everything else → strip `[[deleted]]` occurrences
-      //             in prose, replacing them with plain text (or with
-      //             the pipe display when present).
-      //
-      // Using normalized-key matching rather than the old substring
-      // `includes` check avoids two classes of real bugs: stale
-      // title-form refs surviving (`[[KV Cache]]` vs slug `kv-cache`),
-      // and innocent siblings getting wiped collaterally (deleting
-      // `ai.md` must not take `[[OpenAI]]` / `[[AI Safety]]` down).
-      const deletedKeys = buildDeletedKeys(deletedInfos)
-      if (deletedKeys.size > 0) {
-        try {
-          const wikiTree = await listDirectory(`${pp}/wiki`)
-          const allMdFiles = flattenMdFiles(wikiTree)
-          for (const file of allMdFiles) {
-            try {
-              const content = await readFile(file.path)
-              const isIndex = file.path === `${pp}/wiki/index.md` ||
-                file.name === "index.md"
-              // For index: first drop whole entry lines for deleted
-              // pages, then still strip any secondary `[[...]]` refs
-              // to deleted pages that may appear in surviving rows.
-              const afterListing = isIndex
-                ? cleanIndexListing(content, deletedKeys)
-                : content
-              const updated = stripDeletedWikilinks(afterListing, deletedKeys)
-              if (updated !== content) {
-                await writeFile(file.path, updated)
-              }
-            } catch {
-              // skip individual file failures — best-effort cleanup
-            }
-          }
-        } catch {
-          // non-critical
-        }
-      }
+      await cleanupDeletedWikiRefs(pp, deletedInfos)
 
     // Step 7: Append deletion record to log.md
     try {
@@ -854,7 +1325,7 @@ export function SourcesView() {
       // non-critical
     }
 
-    return { deletedWikiPaths: actuallyDeleted }
+    return { deletedWikiPaths: actuallyDeleted, deletedSourcePaths }
   }
 
   async function handleIngest(node: FileNode) {
@@ -1056,6 +1527,7 @@ export function SourcesView() {
               pendingDeletePath={pendingDeletePath}
               setPendingDeletePath={setPendingDeletePath}
               ingestingPath={ingestingPath}
+              deletingPath={deletingPath}
               depth={0}
             />
           </div>
@@ -1067,49 +1539,6 @@ export function SourcesView() {
       </div>
     </div>
   )
-}
-
-/**
- * Generate a unique destination path. If file already exists, adds date/counter suffix.
- * "file.pdf" → "file.pdf" (first time)
- * "file.pdf" → "file-20260406.pdf" (conflict)
- * "file.pdf" → "file-20260406-2.pdf" (second conflict same day)
- */
-async function getUniqueDestPath(dir: string, fileName: string): Promise<string> {
-  const basePath = `${dir}/${fileName}`
-
-  // Check if file exists by trying to read it
-  try {
-    await readFile(basePath)
-  } catch {
-    // File doesn't exist — use original name
-    return basePath
-  }
-
-  // File exists — add date suffix
-  const ext = fileName.includes(".") ? fileName.slice(fileName.lastIndexOf(".")) : ""
-  const nameWithoutExt = ext ? fileName.slice(0, -ext.length) : fileName
-  const date = new Date().toISOString().slice(0, 10).replace(/-/g, "")
-
-  const withDate = `${dir}/${nameWithoutExt}-${date}${ext}`
-  try {
-    await readFile(withDate)
-  } catch {
-    return withDate
-  }
-
-  // Date suffix also exists — add counter
-  for (let i = 2; i <= 99; i++) {
-    const withCounter = `${dir}/${nameWithoutExt}-${date}-${i}${ext}`
-    try {
-      await readFile(withCounter)
-    } catch {
-      return withCounter
-    }
-  }
-
-  // Shouldn't happen, but fallback
-  return `${dir}/${nameWithoutExt}-${date}-${Date.now()}${ext}`
 }
 
 function filterTree(nodes: FileNode[]): FileNode[] {
@@ -1158,6 +1587,7 @@ function SourceTree({
   pendingDeletePath,
   setPendingDeletePath,
   ingestingPath,
+  deletingPath,
   depth,
 }: {
   nodes: FileNode[]
@@ -1172,6 +1602,7 @@ function SourceTree({
   pendingDeletePath: string | null
   setPendingDeletePath: (path: string | null) => void
   ingestingPath: string | null
+  deletingPath: string | null
   depth: number
 }) {
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({})
@@ -1187,6 +1618,7 @@ function SourceTree({
    * the resulting action onto the React state + handler props.
    */
   const handleDeleteClick = (node: FileNode) => {
+    if (deletingPath) return
     const action = decideDeleteClick(pendingDeletePath, node)
     switch (action.kind) {
       case "arm":
@@ -1214,6 +1646,7 @@ function SourceTree({
     <>
       {sorted.map((node) => {
         const isPendingDelete = pendingDeletePath === node.path
+        const isDeleting = isWithinDeletedPaths(node.path, deletingPath ? [deletingPath] : [])
         if (node.is_dir && node.children) {
           const isCollapsed = collapsed[node.path] ?? false
           return (
@@ -1239,6 +1672,8 @@ function SourceTree({
                 </button>
                 <DeleteButton
                   isPending={isPendingDelete}
+                  isDeleting={isDeleting}
+                  disabled={deletingPath !== null}
                   onClick={() => handleDeleteClick(node)}
                   hint={
                     isPendingDelete
@@ -1257,6 +1692,7 @@ function SourceTree({
                   pendingDeletePath={pendingDeletePath}
                   setPendingDeletePath={setPendingDeletePath}
                   ingestingPath={ingestingPath}
+                  deletingPath={deletingPath}
                   depth={depth + 1}
                 />
               )}
@@ -1282,13 +1718,15 @@ function SourceTree({
               size="icon"
               className="h-7 w-7 shrink-0"
               title="Ingest"
-              disabled={ingestingPath === node.path}
+              disabled={ingestingPath === node.path || deletingPath !== null}
               onClick={() => onIngest(node)}
             >
               <BookOpen className="h-4 w-4" />
             </Button>
             <DeleteButton
               isPending={isPendingDelete}
+              isDeleting={isDeleting}
+              disabled={deletingPath !== null}
               onClick={() => handleDeleteClick(node)}
               hint={
                 isPendingDelete
@@ -1315,13 +1753,32 @@ function SourceTree({
  */
 function DeleteButton({
   isPending,
+  isDeleting,
+  disabled,
   onClick,
   hint,
 }: {
   isPending: boolean
+  isDeleting: boolean
+  disabled: boolean
   onClick: () => void
   hint: string
 }) {
+  if (isDeleting) {
+    return (
+      <Button
+        variant="destructive"
+        size="sm"
+        className="h-7 shrink-0 px-2 text-[11px] font-semibold"
+        title="删除中..."
+        disabled
+      >
+        <RefreshCw className="mr-1 h-3.5 w-3.5 animate-spin" />
+        删除中...
+      </Button>
+    )
+  }
+
   if (isPending) {
     return (
       <Button
@@ -1329,10 +1786,11 @@ function DeleteButton({
         size="sm"
         className="h-7 shrink-0 px-2 text-[11px] font-semibold animate-pulse"
         title={hint}
+        disabled={disabled}
         onClick={onClick}
       >
         <Trash2 className="mr-1 h-3.5 w-3.5" />
-        Confirm
+        确认删除
       </Button>
     )
   }
@@ -1342,6 +1800,7 @@ function DeleteButton({
       size="icon"
       className="h-7 w-7 shrink-0 text-muted-foreground hover:text-destructive"
       title={hint}
+      disabled={disabled}
       onClick={onClick}
     >
       <Trash2 className="h-3.5 w-3.5" />
@@ -1384,24 +1843,6 @@ function ServiceHierarchyPanel({
 
   const toggle = (key: string) =>
     setCollapsed((prev) => ({ ...prev, [key]: !prev[key] }))
-
-  // Count files under a specific path in the sources tree
-  function countInPath(pathSuffix: string): number {
-    function walk(nodes: FileNode[], depth = 0): number {
-      let n = 0
-      for (const node of nodes) {
-        if (node.is_dir && node.children) {
-          if (node.path.endsWith(pathSuffix) || node.path.includes(`/${pathSuffix}/`)) {
-            n += countFiles(node.children)
-          } else {
-            n += walk(node.children, depth + 1)
-          }
-        }
-      }
-      return n
-    }
-    return walk(sources)
-  }
 
   // Find files under a version directory
   function findVersionFiles(lineName: string, versionName: string): FileNode[] {

@@ -22,7 +22,7 @@ export function AppLayout({ onSwitchProject }: AppLayoutProps) {
   const activeView = useWikiStore((s) => s.activeView)
   const researchPanelOpen = useResearchStore((s) => s.panelOpen)
   const setFileTree = useWikiStore((s) => s.setFileTree)
-  const [leftWidth, setLeftWidth] = useState(220)
+  const [leftWidth, setLeftWidth] = useState(300)
   const [rightWidth, setRightWidth] = useState(400)
   const isDraggingLeft = useRef(false)
   const isDraggingRight = useRef(false)
@@ -57,8 +57,9 @@ export function AppLayout({ onSwitchProject }: AppLayoutProps) {
 
         if (isDraggingLeft.current) {
           const newWidth = e.clientX - rect.left
-          // Hard cap: 150 to 400px
-          setLeftWidth(Math.max(150, Math.min(400, newWidth)))
+          // Keep the center workspace usable while allowing long titles room to breathe.
+          const maxLeftWidth = Math.max(280, Math.min(720, rect.width - 320))
+          setLeftWidth(Math.max(180, Math.min(maxLeftWidth, newWidth)))
         }
         if (isDraggingRight.current) {
           const newWidth = rect.right - e.clientX

@@ -11,6 +11,8 @@ import { cascadeDeleteWikiPage } from "@/lib/wiki-page-delete"
 import { ConfirmDialog } from "@/components/ui/confirm-dialog"
 import { useAuthStore } from "@/stores/auth-store"
 import { syncProductFieldPageAfterEdit } from "@/lib/product-catalog-sync"
+import { isFileMissingError, isFileMissingErrorContent } from "@/lib/fs-errors"
+import type { FileNode } from "@/types/wiki"
 
 const LARGE_PREVIEW_CHAR_LIMIT = 160000
 
@@ -28,22 +30,90 @@ export function PreviewPanel() {
   const bumpDataVersion = useWikiStore((s) => s.bumpDataVersion)
   const dataVersion = useWikiStore((s) => s.dataVersion)
   const project = useWikiStore((s) => s.project)
+  const projectPath = project?.path
   const username = useAuthStore((s) => s.user?.username ?? "unknown")
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const pendingSaveRef = useRef<{ path: string; markdown: string } | null>(null)
   const lastLoadedRef = useRef<string>("")
   const [editMode, setEditMode] = useState(false)
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
   const [showCreateMenu, setShowCreateMenu] = useState(false)
   const [previewTruncated, setPreviewTruncated] = useState(false)
 
-  useEffect(() => { setEditMode(false) }, [selectedFile])
+  const refreshProjectTree = useCallback(async () => {
+    if (!projectPath) return
+    try {
+      const tree = await listDirectory(projectPath) as FileNode[]
+      setFileTree(tree)
+    } catch (err) {
+      console.warn("[PreviewPanel] Failed to refresh file tree:", err)
+    }
+    bumpDataVersion()
+  }, [projectPath, setFileTree, bumpDataVersion])
+
+  const clearMissingSelectedFile = useCallback((path: string, reason?: unknown) => {
+    if (useWikiStore.getState().selectedFile !== path) return
+    console.info("[PreviewPanel] Selected file no longer exists, clearing preview:", path, reason ?? "")
+    lastLoadedRef.current = ""
+    setPreviewTruncated(false)
+    setEditMode(false)
+    setFileContent("")
+    setSelectedFile(null)
+    void refreshProjectTree()
+  }, [setFileContent, setSelectedFile, refreshProjectTree])
+
+  const flushPendingSave = useCallback(async () => {
+    const pending = pendingSaveRef.current
+    if (!pending) return
+
+    pendingSaveRef.current = null
+    if (saveTimerRef.current) {
+      clearTimeout(saveTimerRef.current)
+      saveTimerRef.current = null
+    }
+
+    const { path, markdown } = pending
+    try {
+      await writeFile(path, markdown)
+      let savedContent = markdown
+      if (projectPath) {
+        const syncResult = await syncProductFieldPageAfterEdit(projectPath, path, markdown)
+        savedContent = syncResult.content
+      }
+
+      if (useWikiStore.getState().selectedFile === path) {
+        lastLoadedRef.current = savedContent
+        setFileContent(savedContent)
+        setPreviewTruncated(savedContent.length > LARGE_PREVIEW_CHAR_LIMIT)
+      }
+      bumpDataVersion()
+    } catch (err) {
+      console.error("Failed to save:", err)
+    }
+  }, [projectPath, setFileContent, bumpDataVersion])
+
+  useEffect(() => {
+    void flushPendingSave()
+    setEditMode(false)
+  }, [selectedFile, flushPendingSave])
+
+  useEffect(() => {
+    if (!selectedFile || !isFileMissingErrorContent(fileContent)) return
+    clearMissingSelectedFile(selectedFile, "stale-error-content")
+  }, [selectedFile, fileContent, clearMissingSelectedFile])
 
   useEffect(() => {
     if (!selectedFile) { setFileContent(""); lastLoadedRef.current = ""; setPreviewTruncated(false); return }
     const category = getFileCategory(selectedFile)
     if (isBinary(category)) { setFileContent(""); lastLoadedRef.current = ""; setPreviewTruncated(false); return }
-    readFile(selectedFile)
+    const pathAtLoadStart = selectedFile
+    readFile(pathAtLoadStart)
       .then((c) => {
+        if (useWikiStore.getState().selectedFile !== pathAtLoadStart) return
+        if (isFileMissingErrorContent(c)) {
+          clearMissingSelectedFile(pathAtLoadStart, "error-content")
+          return
+        }
         const truncated = c.length > LARGE_PREVIEW_CHAR_LIMIT
         const content = c.length > LARGE_PREVIEW_CHAR_LIMIT
           ? `${c.slice(0, LARGE_PREVIEW_CHAR_LIMIT)}\n\n> 文件内容较大，预览已截断以保持界面响应。完整内容仍保存在文件中，截断预览不会覆盖原文。`
@@ -52,32 +122,34 @@ export function PreviewPanel() {
         setPreviewTruncated(truncated)
         setFileContent(content)
       })
-      .catch((err) => { lastLoadedRef.current = ""; setPreviewTruncated(false); setFileContent(`Error: ${err}`) })
-  }, [selectedFile, dataVersion, setFileContent])
+      .catch((err) => {
+        if (useWikiStore.getState().selectedFile !== pathAtLoadStart) return
+
+        if (isFileMissingError(err)) {
+          clearMissingSelectedFile(pathAtLoadStart, err)
+          return
+        }
+
+        lastLoadedRef.current = ""
+        setPreviewTruncated(false)
+        setFileContent("")
+        console.error("[PreviewPanel] Failed to load file:", err)
+      })
+  }, [selectedFile, dataVersion, setFileContent, clearMissingSelectedFile])
 
   const handleSave = useCallback((markdown: string) => {
     if (!selectedFile) return
     if (markdown === lastLoadedRef.current) return
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current)
+    pendingSaveRef.current = { path: selectedFile, markdown }
     saveTimerRef.current = setTimeout(() => {
-      writeFile(selectedFile, markdown)
-        .then(async () => {
-          let savedContent = markdown
-          if (project?.path) {
-            const syncResult = await syncProductFieldPageAfterEdit(project.path, selectedFile, markdown)
-            savedContent = syncResult.content
-            if (syncResult.isProductFieldPage) {
-              setFileContent(savedContent)
-              bumpDataVersion()
-            }
-          }
-          lastLoadedRef.current = savedContent
-        })
-        .catch((err) => console.error("Failed to save:", err))
+      void flushPendingSave()
     }, 1000)
-  }, [selectedFile, project, setFileContent, bumpDataVersion])
+  }, [selectedFile, flushPendingSave])
 
-  useEffect(() => () => { if (saveTimerRef.current) clearTimeout(saveTimerRef.current) }, [])
+  useEffect(() => () => {
+    void flushPendingSave()
+  }, [flushPendingSave])
 
   // ── Delete handler ──
   const handleDeleteConfirm = useCallback(async () => {
@@ -86,7 +158,7 @@ export function PreviewPanel() {
     try {
       const pp = normalizePath(project.path)
       await cascadeDeleteWikiPage(pp, selectedFile)
-      const tree = await listDirectory(pp)
+      const tree = await listDirectory(pp) as FileNode[]
       setFileTree(tree)
       bumpDataVersion()
       setSelectedFile(null)
@@ -128,7 +200,7 @@ export function PreviewPanel() {
     ].join("\n")
     try {
       await writeFile(pagePath, template)
-      const tree = await listDirectory(pp)
+      const tree = await listDirectory(pp) as FileNode[]
       setFileTree(tree)
       bumpDataVersion()
       setSelectedFile(pagePath)
@@ -180,7 +252,14 @@ export function PreviewPanel() {
           {/* Edit toggle */}
           {isWiki && (
             <button
-              onClick={() => !previewTruncated && setEditMode((m) => !m)}
+              onClick={() => {
+                if (previewTruncated) return
+                if (editMode) {
+                  void flushPendingSave().then(() => setEditMode(false))
+                } else {
+                  setEditMode(true)
+                }
+              }}
               disabled={previewTruncated}
               className="rounded px-2 py-0.5 text-xs text-muted-foreground hover:bg-accent transition-colors disabled:cursor-not-allowed disabled:opacity-50"
               title={previewTruncated ? "大文件预览已截断，暂不允许直接编辑以避免覆盖完整内容" : undefined}

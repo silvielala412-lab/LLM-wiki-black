@@ -8,11 +8,13 @@
  */
 
 import { useState, useEffect, useCallback } from "react"
-import { GitCommitHorizontal, ChevronDown, ChevronRight, Clock, ArrowRight, FileSearch, RefreshCw } from "lucide-react"
+import { GitCommitHorizontal, ChevronDown, ChevronRight, Clock, ArrowRight, FileSearch, RefreshCw, AlertTriangle, CheckCircle2 } from "lucide-react"
 import { useWikiStore } from "@/stores/wiki-store"
 import { normalizePath } from "@/lib/path-utils"
 import type { KnowledgeTransition } from "@/lib/knowledge-governance/lineage-tracker"
-import { loadLineage, buildVersionChain } from "@/lib/knowledge-governance/lineage-tracker"
+import { loadLineage } from "@/lib/knowledge-governance/lineage-tracker"
+import { loadReviewItems } from "@/lib/persist"
+import type { ReviewItem } from "@/stores/review-store"
 
 // ── Sub-components ────────────────────────────────────────────────────────────
 
@@ -186,6 +188,86 @@ function TransitionCard({
   )
 }
 
+function extractReviewLine(description: string, label: string): string {
+  const match = description.match(new RegExp(`^${label}[:：]\\s*(.+)$`, "m"))
+  return match?.[1]?.trim() ?? ""
+}
+
+function resolvedKnowledgeReview(item: ReviewItem): boolean {
+  return item.resolved && (item.type === "contradiction" || item.type === "confirm")
+}
+
+function reviewFieldName(item: ReviewItem): string {
+  return item.conflict?.fieldName || extractReviewLine(item.description, "字段") || item.title
+}
+
+function reviewExistingValue(item: ReviewItem): string {
+  return item.conflict?.existingValue || extractReviewLine(item.description, "现有值")
+}
+
+function reviewIncomingValue(item: ReviewItem): string {
+  return item.conflict?.incomingValue || extractReviewLine(item.description, "新增值")
+}
+
+function ReviewResolutionCard({
+  item,
+  onOpenPage,
+}: {
+  item: ReviewItem
+  onOpenPage: (path: string) => void
+}) {
+  const fieldName = reviewFieldName(item)
+  const existingValue = reviewExistingValue(item)
+  const incomingValue = reviewIncomingValue(item)
+  const page = item.conflict?.affectedPath || item.affectedPages?.[0] || ""
+  const time = new Date(item.createdAt)
+  const timeLabel = Number.isFinite(time.getTime())
+    ? `${time.toLocaleDateString("zh-CN")} ${time.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}`
+    : ""
+
+  return (
+    <div className="rounded-lg border bg-card p-3 text-sm shadow-sm">
+      <div className="mb-2 flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" />
+            <span className="font-medium">已完成：{fieldName}</span>
+            <span className="rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-medium text-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-300">
+              {item.resolvedAction || "已处理"}
+            </span>
+          </div>
+          <p className="mt-1 text-[11px] text-muted-foreground">{timeLabel}</p>
+        </div>
+        {page && (
+          <button
+            className="shrink-0 rounded border px-2 py-1 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground"
+            onClick={() => onOpenPage(page)}
+          >
+            打开页面
+          </button>
+        )}
+      </div>
+
+      <div className="grid gap-2 md:grid-cols-2">
+        <div className="rounded-md border bg-muted/30 p-2">
+          <div className="mb-1 text-[11px] font-medium text-muted-foreground">原知识</div>
+          <div className="line-clamp-4 text-xs leading-relaxed">{existingValue || "空"}</div>
+        </div>
+        <div className="rounded-md border border-emerald-200 bg-emerald-50/60 p-2 dark:border-emerald-900 dark:bg-emerald-950/20">
+          <div className="mb-1 text-[11px] font-medium text-emerald-700 dark:text-emerald-300">新增知识</div>
+          <div className="line-clamp-4 text-xs leading-relaxed">{incomingValue || "空"}</div>
+        </div>
+      </div>
+
+      {page && (
+        <div className="mt-2 truncate text-[11px] text-muted-foreground" title={page}>
+          页面：{page}
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ── Empty state ───────────────────────────────────────────────────────────────
 
 function EmptyState({ hasProject }: { hasProject: boolean }) {
@@ -198,7 +280,7 @@ function EmptyState({ hasProject }: { hasProject: boolean }) {
         <p className="font-medium">暂无知识演化记录</p>
         <p className="text-xs mt-1 text-muted-foreground/70">
           {hasProject
-            ? "当用户在「知识审核」中确认「替代旧版本」时，变更记录将出现在这里"
+            ? "当用户在「知识审核」中处理知识冲突或确认知识更新后，记录将出现在这里"
             : "请先打开一个项目"
           }
         </p>
@@ -216,6 +298,7 @@ export function EvolutionPanel() {
   const setActiveView = useWikiStore((s) => s.setActiveView)
 
   const [allTransitions, setAllTransitions] = useState<KnowledgeTransition[]>([])
+  const [resolvedReviewItems, setResolvedReviewItems] = useState<ReviewItem[]>([])
   const [loading, setLoading] = useState(false)
   const [searchQuery, setSearchQuery] = useState("")
 
@@ -225,10 +308,18 @@ export function EvolutionPanel() {
     if (!pp) return
     setLoading(true)
     try {
-      const records = await loadLineage(pp)
+      const [records, reviewItems] = await Promise.all([
+        loadLineage(pp),
+        loadReviewItems(pp),
+      ])
       // Sort newest first
       records.sort((a, b) => new Date(b.effectiveDate).getTime() - new Date(a.effectiveDate).getTime())
       setAllTransitions(records)
+      setResolvedReviewItems(
+        reviewItems
+          .filter(resolvedKnowledgeReview)
+          .sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0)),
+      )
     } catch (err) {
       console.warn("[EvolutionPanel] Failed to load lineage:", err)
     } finally {
@@ -241,14 +332,16 @@ export function EvolutionPanel() {
   const openPage = useCallback(async (pagePath: string) => {
     try {
       const { readFile } = await import("@/commands/fs")
-      const content = await readFile(pagePath)
-      setSelectedFile(pagePath)
+      const normalized = normalizePath(pagePath)
+      const fullPath = pp && !normalized.startsWith(pp) ? `${pp}/${normalized}` : normalized
+      const content = await readFile(fullPath)
+      setSelectedFile(fullPath)
       setFileContent(content)
       setActiveView("wiki")
     } catch {
       // File may no longer exist
     }
-  }, [setSelectedFile, setFileContent, setActiveView])
+  }, [pp, setSelectedFile, setFileContent, setActiveView])
 
   // Filter by search query
   const filtered = searchQuery.trim()
@@ -258,6 +351,13 @@ export function EvolutionPanel() {
         t.summary.toLowerCase().includes(searchQuery.toLowerCase())
       )
     : allTransitions
+  const filteredResolvedReviews = searchQuery.trim()
+    ? resolvedReviewItems.filter((item) =>
+        item.title.toLowerCase().includes(searchQuery.toLowerCase()) ||
+        item.description.toLowerCase().includes(searchQuery.toLowerCase()) ||
+        (item.resolvedAction ?? "").toLowerCase().includes(searchQuery.toLowerCase())
+      )
+    : resolvedReviewItems
 
   // Group into chains for rendering
   // For the list view we just render sorted by date
@@ -266,6 +366,7 @@ export function EvolutionPanel() {
     removed: allTransitions.reduce((s, t) => s + t.removedPoints.length, 0),
     changed: allTransitions.reduce((s, t) => s + t.changedPoints.length, 0),
   }
+  const totalRecords = allTransitions.length + resolvedReviewItems.length
 
   return (
     <div className="flex h-full flex-col">
@@ -275,9 +376,9 @@ export function EvolutionPanel() {
           <h2 className="text-sm font-semibold flex items-center gap-2">
             <GitCommitHorizontal className="h-4 w-4 text-primary" />
             知识演化
-            {allTransitions.length > 0 && (
+            {totalRecords > 0 && (
               <span className="rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground">
-                {allTransitions.length} 条记录
+                {totalRecords} 条记录
               </span>
             )}
           </h2>
@@ -292,8 +393,12 @@ export function EvolutionPanel() {
         </div>
 
         {/* Stats row */}
-        {allTransitions.length > 0 && (
+        {totalRecords > 0 && (
           <div className="mt-2 flex gap-3">
+            <span className="flex items-center gap-1 text-[11px] text-emerald-600 dark:text-emerald-400">
+              <div className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
+              {resolvedReviewItems.length} 已完成审核
+            </span>
             <span className="flex items-center gap-1 text-[11px] text-emerald-600 dark:text-emerald-400">
               <div className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
               +{stats.added} 新增
@@ -311,7 +416,7 @@ export function EvolutionPanel() {
       </div>
 
       {/* Search */}
-      {allTransitions.length > 0 && (
+      {totalRecords > 0 && (
         <div className="shrink-0 border-b px-3 py-2">
           <div className="flex items-center gap-2 rounded-md border bg-muted/40 px-3 py-1.5">
             <FileSearch className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
@@ -333,10 +438,24 @@ export function EvolutionPanel() {
             <RefreshCw className="h-4 w-4 animate-spin" />
             加载中...
           </div>
-        ) : filtered.length === 0 ? (
+        ) : filtered.length === 0 && filteredResolvedReviews.length === 0 ? (
           <EmptyState hasProject={!!project} />
         ) : (
           <div className="p-4">
+            {filteredResolvedReviews.length > 0 && (
+              <div className="mb-5">
+                <div className="mb-2 flex items-center gap-2 text-xs font-semibold text-muted-foreground">
+                  <AlertTriangle className="h-3.5 w-3.5 text-amber-500" />
+                  已完成的知识冲突与更新
+                </div>
+                <div className="flex flex-col gap-3">
+                  {filteredResolvedReviews.map((item) => (
+                    <ReviewResolutionCard key={item.id} item={item} onOpenPage={openPage} />
+                  ))}
+                </div>
+              </div>
+            )}
+
             {/* Sorted timeline */}
             {filtered.map((t, idx) => (
               <TransitionCard

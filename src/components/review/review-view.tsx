@@ -21,6 +21,7 @@ import { Button } from "@/components/ui/button"
 import { useReviewStore, type ReviewItem } from "@/stores/review-store"
 import { useWikiStore } from "@/stores/wiki-store"
 import { writeFile, readFile, listDirectory, deleteFile } from "@/commands/fs"
+import type { FileNode } from "@/types/wiki"
 import { normalizePath } from "@/lib/path-utils"
 import { ReviewPanel as GovernanceReviewPanel } from "./review-panel"
 import { EvolutionPanel } from "./evolution-panel"
@@ -105,6 +106,7 @@ async function applyProductConflictIncomingValue(projectPath: string, conflict: 
     productName: conflict.productName,
     fieldName: conflict.fieldName,
     value: conflict.incomingValue,
+    deferDerivedRefresh: true,
   })
 }
 
@@ -117,6 +119,7 @@ export function ReviewView() {
   const setFileTree = useWikiStore((s) => s.setFileTree)
   const governancePendingCount = useGovernanceStore((s) => s.pendingCount)
   const [tab, setTab] = useState<"governance" | "evolution" | "ai-suggestions">("governance")
+  const [processingReviewId, setProcessingReviewId] = useState<string | null>(null)
 
   const handleResolve = useCallback(async (id: string, action: string) => {
     const pp = project ? normalizePath(project.path) : ""
@@ -134,15 +137,22 @@ export function ReviewView() {
       }
 
       if (action === "accept-incoming") {
+        setProcessingReviewId(id)
         try {
           await applyProductConflictIncomingValue(pp, productConflict)
-          const tree = await listDirectory(pp)
-          setFileTree(tree)
-          useWikiStore.getState().bumpDataVersion()
           resolveItem(id, "已采用新值")
+          useWikiStore.getState().bumpDataVersion()
+          try {
+            const tree = await listDirectory(pp) as FileNode[]
+            setFileTree(tree)
+          } catch (refreshErr) {
+            console.warn("Applied incoming product field value, but failed to refresh file tree:", refreshErr)
+          }
         } catch (err) {
           console.error("Failed to apply incoming product field value:", err)
           window.alert(`采用新值失败：${err instanceof Error ? err.message : String(err)}`)
+        } finally {
+          setProcessingReviewId(null)
         }
         return
       }
@@ -220,7 +230,7 @@ export function ReviewView() {
         await writeFile(logPath, logContent.trimEnd() + `\n- ${date}: Saved query page \`${fileName}\`\n`)
 
         // Refresh tree
-        const tree = await listDirectory(pp)
+        const tree = await listDirectory(pp) as FileNode[]
         setFileTree(tree)
 
         resolveItem(id, "Saved to Wiki")
@@ -252,7 +262,7 @@ export function ReviewView() {
       const filePath = action.slice(7)
       try {
         await deleteFile(filePath)
-        const tree = await listDirectory(pp)
+        const tree = await listDirectory(pp) as FileNode[]
         setFileTree(tree)
         resolveItem(id, "Deleted")
       } catch (err) {
@@ -327,7 +337,7 @@ export function ReviewView() {
           await writeFile(logPath, logContent.trimEnd() + `\n- ${date}: Created ${pageType} page \`${fileName}\` from review\n`)
 
           // Refresh
-          const tree = await listDirectory(pp)
+          const tree = await listDirectory(pp) as FileNode[]
           setFileTree(tree)
           useWikiStore.getState().bumpDataVersion()
 
@@ -380,6 +390,11 @@ export function ReviewView() {
           }`}
         >
           📈 知识演化
+          {knowledgeResolved.length > 0 && (
+            <span className="ml-1 rounded-full bg-emerald-600 px-1.5 py-0.5 text-[10px] text-white">
+              {knowledgeResolved.length}
+            </span>
+          )}
         </button>
         <button
           onClick={() => setTab("ai-suggestions")}
@@ -403,9 +418,9 @@ export function ReviewView() {
         <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
           <KnowledgeReviewSection
             pending={knowledgePending}
-            resolved={knowledgeResolved}
             onResolve={handleResolve}
             onDismiss={dismissItem}
+            processingReviewId={processingReviewId}
           />
           <GovernanceReviewPanel />
         </div>
@@ -413,8 +428,10 @@ export function ReviewView() {
 
       {/* Evolution tab */}
       {tab === "evolution" && (
-        <div className="min-h-0 flex-1 overflow-hidden">
-          <EvolutionPanel />
+        <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+          <div className="min-h-0 flex-1 overflow-hidden">
+            <EvolutionPanel />
+          </div>
         </div>
       )}
 
@@ -438,13 +455,13 @@ export function ReviewView() {
             ) : (
               <div className="flex flex-col gap-2 p-3">
                 {aiPending.map((item) => (
-                  <ReviewCard key={item.id} item={item} onResolve={handleResolve} onDismiss={dismissItem} />
+                  <ReviewCard key={item.id} item={item} onResolve={handleResolve} onDismiss={dismissItem} processingReviewId={processingReviewId} />
                 ))}
                 {aiResolved.length > 0 && aiPending.length > 0 && (
                   <div className="my-2 text-center text-xs text-muted-foreground">已处理</div>
                 )}
                 {aiResolved.map((item) => (
-                  <ReviewCard key={item.id} item={item} onResolve={handleResolve} onDismiss={dismissItem} />
+                  <ReviewCard key={item.id} item={item} onResolve={handleResolve} onDismiss={dismissItem} processingReviewId={processingReviewId} />
                 ))}
               </div>
             )}
@@ -458,16 +475,16 @@ export function ReviewView() {
 
 function KnowledgeReviewSection({
   pending,
-  resolved,
   onResolve,
   onDismiss,
+  processingReviewId,
 }: {
   pending: ReviewItem[]
-  resolved: ReviewItem[]
   onResolve: (id: string, action: string) => void
   onDismiss: (id: string) => void
+  processingReviewId: string | null
 }) {
-  if (pending.length === 0 && resolved.length === 0) return null
+  if (pending.length === 0) return null
 
   return (
     <div className="flex max-h-[58%] min-h-[240px] flex-col border-b bg-background">
@@ -488,13 +505,13 @@ function KnowledgeReviewSection({
       <div className="min-h-0 flex-1 overflow-y-auto p-3">
         <div className="flex flex-col gap-3">
           {pending.map((item) => (
-            <ReviewCard key={item.id} item={item} onResolve={onResolve} onDismiss={onDismiss} />
-          ))}
-          {resolved.length > 0 && pending.length > 0 && (
-            <div className="text-center text-xs text-muted-foreground">已处理</div>
-          )}
-          {resolved.map((item) => (
-            <ReviewCard key={item.id} item={item} onResolve={onResolve} onDismiss={onDismiss} />
+            <ReviewCard
+              key={item.id}
+              item={item}
+              onResolve={onResolve}
+              onDismiss={onDismiss}
+              processingReviewId={processingReviewId}
+            />
           ))}
         </div>
       </div>
@@ -502,15 +519,16 @@ function KnowledgeReviewSection({
   )
 }
 
-
 function ReviewCard({
   item,
   onResolve,
   onDismiss,
+  processingReviewId,
 }: {
   item: ReviewItem
   onResolve: (id: string, action: string) => void
   onDismiss: (id: string) => void
+  processingReviewId?: string | null
 }) {
   const config = typeConfig[item.type]
   const Icon = config.icon
@@ -518,6 +536,7 @@ function ReviewCard({
   const conflict = getProductConflict(item)
   const project = useWikiStore((s) => s.project)
   const displayTitle = conflict ? `字段冲突：${conflict.fieldName}` : item.title
+  const isProcessing = processingReviewId === item.id
 
   const openAffectedPage = useCallback(async (page: string) => {
     if (!project) return
@@ -564,6 +583,7 @@ function ReviewCard({
         </div>
         <button
           onClick={() => onDismiss(item.id)}
+          disabled={isProcessing}
           className="shrink-0 rounded p-0.5 text-muted-foreground hover:bg-muted"
         >
           <X className="h-3.5 w-3.5" />
@@ -632,6 +652,7 @@ function ReviewCard({
               variant="default"
               size="sm"
               className="h-7 text-xs gap-1"
+              disabled={isProcessing}
               onClick={() => onResolve(item.id, "__deep_research__")}
             >
               🔍 Deep Research
@@ -643,9 +664,10 @@ function ReviewCard({
               variant="outline"
               size="sm"
               className="h-7 text-xs"
+              disabled={isProcessing}
               onClick={() => onResolve(item.id, opt.action)}
             >
-              {opt.label}
+              {isProcessing && opt.action === "accept-incoming" ? "采用中..." : opt.label}
             </Button>
           ))}
         </div>

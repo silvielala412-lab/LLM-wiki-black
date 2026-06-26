@@ -58,14 +58,32 @@ function detectHierarchy(page: WikiPageInfo): { lineName: string; versionName: s
   return null
 }
 
+function normalizeSearch(value: string): string {
+  return value.trim().toLowerCase()
+}
 
-export function KnowledgeTree() {
+function pageMatchesSearch(page: WikiPageInfo, query: string): boolean {
+  if (!query) return true
+  return [
+    page.title,
+    page.path,
+    page.type,
+    page.domain,
+    page.origin ?? "",
+    page.lineName ?? "",
+    page.versionName ?? "",
+    ...page.tags,
+  ].some(value => value.toLowerCase().includes(query))
+}
+
+export function KnowledgeTree({ searchQuery = "" }: { searchQuery?: string }) {
   const project = useWikiStore((s) => s.project)
   const selectedFile = useWikiStore((s) => s.selectedFile)
   const setSelectedFile = useWikiStore((s) => s.setSelectedFile)
   const setFileTree = useWikiStore((s) => s.setFileTree)
   const bumpDataVersion = useWikiStore((s) => s.bumpDataVersion)
   const fileTree = useWikiStore((s) => s.fileTree)
+  const dataVersion = useWikiStore((s) => s.dataVersion)
 
   const [pages, setPages] = useState<WikiPageInfo[]>([])
   const [groupMode, setGroupMode] = useState<"type" | "service" | "product">("type")
@@ -116,7 +134,7 @@ export function KnowledgeTree() {
     } catch { setPages([]) }
   }, [project])
 
-  useEffect(() => { loadPages() }, [loadPages, fileTree])
+  useEffect(() => { loadPages() }, [loadPages, fileTree, dataVersion])
 
   useEffect(() => {
     if (!project) return
@@ -151,15 +169,20 @@ export function KnowledgeTree() {
 
   if (!project) return <div className="flex h-full items-center justify-center p-4 text-sm text-muted-foreground">No project open</div>
 
+  const normalizedSearch = normalizeSearch(searchQuery)
+  const searchActive = normalizedSearch.length > 0
+  const visiblePages = pages.filter(page => pageMatchesSearch(page, normalizedSearch))
+  const visibleProductCatalogPages = productCatalogPages.filter(page => pageMatchesSearch(page, normalizedSearch))
+
   // Type mode grouping
   const typeGrouped = new Map<string, WikiPageInfo[]>()
-  for (const p of pages) { const l = typeGrouped.get(p.type)??[]; l.push(p); typeGrouped.set(p.type, l) }
+  for (const p of visiblePages) { const l = typeGrouped.get(p.type)??[]; l.push(p); typeGrouped.set(p.type, l) }
   const sortedTypes = [...typeGrouped.entries()].sort((a,b)=>(TYPE_CONFIG[a[0]]?.order??99)-(TYPE_CONFIG[b[0]]?.order??99))
 
   // Service mode: entity map keyed by "line:version"
   const entityMap = new Map<string, WikiPageInfo[]>()
   const otherPages: WikiPageInfo[] = []
-  for (const p of pages) {
+  for (const p of visiblePages) {
     const h = detectHierarchy(p)
     if (h) { const k=`${h.lineName}:${h.versionName}`; const l=entityMap.get(k)??[]; l.push(p); entityMap.set(k,l) }
     else otherPages.push(p)
@@ -195,7 +218,7 @@ export function KnowledgeTree() {
           {/* ── TYPE mode ── */}
           {groupMode === "type" && sortedTypes.map(([type, items]) => {
             const cfg = TYPE_CONFIG[type] ?? DEFAULT_CONFIG
-            const expanded = expandedTypes.has(type)
+            const expanded = searchActive || expandedTypes.has(type)
             return (
               <div key={type} className="mb-1">
                 <button onClick={()=>toggle(setExpandedTypes,type)} className="flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-sm hover:bg-accent/50">
@@ -211,8 +234,9 @@ export function KnowledgeTree() {
 
           {/* ── SERVICE LINE mode — tree from SERVICE_HIERARCHY schema ── */}
           {groupMode === "service" && SERVICE_HIERARCHY.map(series => {
-            const serExpanded = expandedSeries.has(series.seriesName)
+            const serExpanded = searchActive || expandedSeries.has(series.seriesName)
             const serCount = series.scenarios.flatMap(sc=>sc.lines.flatMap(ln=>ln.versions.map(vn=>entityMap.get(`${ln.lineName}:${vn.versionName}`)?.length??0))).reduce((a,b)=>a+b,0)
+            if (searchActive && serCount === 0) return null
             return (
               <div key={series.seriesName} className="mb-1">
                 <button onClick={()=>toggle(setExpandedSeries,series.seriesName)} className="flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-sm font-semibold hover:bg-accent/50">
@@ -224,8 +248,9 @@ export function KnowledgeTree() {
 
                 {serExpanded && series.scenarios.map(sc => {
                   const scKey = `${series.seriesName}:${sc.scenarioName}`
-                  const scExpanded = expandedScenarios.has(scKey)
+                  const scExpanded = searchActive || expandedScenarios.has(scKey)
                   const scCount = sc.lines.flatMap(ln=>ln.versions.map(vn=>entityMap.get(`${ln.lineName}:${vn.versionName}`)?.length??0)).reduce((a,b)=>a+b,0)
+                  if (searchActive && scCount === 0) return null
                   return (
                     <div key={scKey} className="ml-3 mb-0.5">
                       <button onClick={()=>toggle(setExpandedScenarios,scKey)} className="flex w-full items-center gap-1.5 rounded-md px-2 py-1 text-sm hover:bg-accent/50">
@@ -237,8 +262,9 @@ export function KnowledgeTree() {
 
                       {scExpanded && sc.lines.map(ln => {
                         const lnKey = `${scKey}:${ln.lineName}`
-                        const lnExpanded = expandedLines.has(lnKey)
+                        const lnExpanded = searchActive || expandedLines.has(lnKey)
                         const lnCount = ln.versions.map(vn=>entityMap.get(`${ln.lineName}:${vn.versionName}`)?.length??0).reduce((a,b)=>a+b,0)
+                        if (searchActive && lnCount === 0) return null
                         return (
                           <div key={lnKey} className="ml-3 mb-0.5">
                             <button onClick={()=>toggle(setExpandedLines,lnKey)} className="flex w-full items-center gap-1.5 rounded-md px-2 py-1 text-sm hover:bg-accent/50">
@@ -250,8 +276,9 @@ export function KnowledgeTree() {
 
                             {lnExpanded && ln.versions.map(vn => {
                               const vnKey = `${ln.lineName}:${vn.versionName}`
-                              const vnExpanded = expandedVersions.has(vnKey)
                               const items = entityMap.get(vnKey) ?? []
+                              const vnExpanded = searchActive || expandedVersions.has(vnKey)
+                              if (searchActive && items.length === 0) return null
                               return (
                                 <div key={vnKey} className="ml-3 mb-0.5">
                                   <button onClick={()=>toggle(setExpandedVersions,vnKey)} className="flex w-full items-center gap-1.5 rounded-md px-2 py-1 text-xs hover:bg-accent/50">
@@ -286,17 +313,24 @@ export function KnowledgeTree() {
           {/* ── PRODUCT CATALOG mode ── */}
           {groupMode === "product" && (
             <ProductCatalogSection
-              pages={productCatalogPages}
+              pages={visibleProductCatalogPages}
               selectedFile={selectedFile}
               checkedPaths={checkedPaths}
               setSelectedFile={setSelectedFile}
               toggleCheck={toggleCheck}
               expandedProducts={expandedProducts}
               toggleProduct={(key) => toggle(setExpandedProducts, key)}
+              forceExpanded={searchActive}
             />
           )}
 
-          <RawSourcesSection/>
+          {searchActive && visiblePages.length === 0 && (
+            <div className="px-2 py-6 text-center text-xs text-muted-foreground">
+              没有匹配的知识文档
+            </div>
+          )}
+
+          <RawSourcesSection searchQuery={searchQuery}/>
         </div>
       </ScrollArea>
 
@@ -328,7 +362,7 @@ function PageRow({ page, selectedFile, checkedPaths, setSelectedFile, toggleChec
       <button onClick={e=>toggleCheck(page.path,e)} className={`flex-shrink-0 w-3.5 h-3.5 rounded border flex items-center justify-center transition-opacity ${isChk?"opacity-100 border-red-400 bg-red-100":"opacity-0 group-hover:opacity-100 border-muted-foreground/40"}`} title="选中删除">
         {isChk&&<span className="text-red-500" style={{fontSize:8,lineHeight:1}}>✓</span>}
       </button>
-      <button onClick={()=>setSelectedFile(page.path)} className="flex-1 flex items-center gap-1 truncate min-w-0" title={page.path}>
+      <button onClick={()=>setSelectedFile(page.path)} className="flex-1 flex items-center gap-1 truncate min-w-0" title={`${page.title}\n${page.path}`}>
         {page.origin==="web-clip"&&<Globe className="h-3 w-3 shrink-0 text-blue-400"/>}
         <span className="truncate">{page.title}</span>
       </button>
@@ -354,7 +388,7 @@ function OtherSection({ pages, selectedFile, checkedPaths, setSelectedFile, togg
   )
 }
 
-function RawSourcesSection() {
+function RawSourcesSection({ searchQuery = "" }: { searchQuery?: string }) {
   const project = useWikiStore(s=>s.project)
   const setSelectedFile = useWikiStore(s=>s.setSelectedFile)
   const selectedFile = useWikiStore(s=>s.selectedFile)
@@ -364,16 +398,21 @@ function RawSourcesSection() {
     if(!project) return
     listDirectory(`${normalizePath(project.path)}/raw/sources`).then(t=>setSources(flattenAllFiles(t))).catch(()=>setSources([]))
   },[project])
-  if(sources.length===0) return null
+  const normalizedSearch = normalizeSearch(searchQuery)
+  const visibleSources = sources.filter(source =>
+    !normalizedSearch || [source.name, source.path].some(value => value.toLowerCase().includes(normalizedSearch))
+  )
+  if(visibleSources.length===0) return null
+  const isExpanded = !!normalizedSearch || exp
   return (
     <div className="mt-2 border-t pt-2">
       <button onClick={()=>setExp(!exp)} className="flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-sm hover:bg-accent/50">
-        {exp?<ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground"/>:<ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground"/>}
+        {isExpanded?<ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground"/>:<ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground"/>}
         <BookOpen className="h-3.5 w-3.5 shrink-0 text-amber-600"/>
         <span className="flex-1 text-left font-medium text-muted-foreground">Raw Sources</span>
-        <span className="text-xs text-muted-foreground">{sources.length}</span>
+        <span className="text-xs text-muted-foreground">{visibleSources.length}</span>
       </button>
-      {exp && <div className="ml-3">{sources.map(f=>(
+      {isExpanded && <div className="ml-3">{visibleSources.map(f=>(
         <button key={f.path} onClick={()=>setSelectedFile(f.path)} className={`flex w-full items-center gap-1.5 rounded-md px-2 py-1 text-left text-sm ${selectedFile===f.path?"bg-accent text-accent-foreground":"text-muted-foreground hover:bg-accent/50"}`}>
           <span className="truncate">{f.name}</span>
         </button>
@@ -455,7 +494,7 @@ function parseProductCatalogTitle(fileName: string): { category: string; product
   return null
 }
 
-function ProductCatalogSection({ pages, selectedFile, checkedPaths, setSelectedFile, toggleCheck, expandedProducts, toggleProduct }: {
+function ProductCatalogSection({ pages, selectedFile, checkedPaths, setSelectedFile, toggleCheck, expandedProducts, toggleProduct, forceExpanded = false }: {
   pages: WikiPageInfo[]
   selectedFile: string | null
   checkedPaths: Set<string>
@@ -463,6 +502,7 @@ function ProductCatalogSection({ pages, selectedFile, checkedPaths, setSelectedF
   toggleCheck: (p: string, e: React.MouseEvent) => void
   expandedProducts: Set<string>
   toggleProduct: (key: string) => void
+  forceExpanded?: boolean
 }) {
   if (pages.length === 0) {
     return (
@@ -491,7 +531,7 @@ function ProductCatalogSection({ pages, selectedFile, checkedPaths, setSelectedF
       {INSURANCE_CATEGORIES.filter(cat => grouped.has(cat)).map(cat => {
         const products = grouped.get(cat)!
         const catKey = `cat-${cat}`
-        const catExpanded = expandedProducts.has(catKey)
+        const catExpanded = forceExpanded || expandedProducts.has(catKey)
         const totalCount = [...products.values()].reduce((s, a) => s + a.length, 0)
         return (
           <div key={cat} className="mb-1">
@@ -510,7 +550,7 @@ function ProductCatalogSection({ pages, selectedFile, checkedPaths, setSelectedF
 
             {catExpanded && [...products.entries()].map(([product, modulePages]) => {
               const productKey = `product-${cat}-${product}`
-              const productExpanded = expandedProducts.has(productKey)
+              const productExpanded = forceExpanded || expandedProducts.has(productKey)
               return (
                 <div key={productKey} className="ml-3 mb-0.5">
                   {/* Product header */}

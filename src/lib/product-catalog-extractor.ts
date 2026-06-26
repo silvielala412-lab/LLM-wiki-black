@@ -16,6 +16,7 @@ import { useActivityStore } from "@/stores/activity-store"
 import { useReviewStore, type ReviewItem } from "@/stores/review-store"
 import type { LlmConfig } from "@/stores/wiki-store"
 import { preprocessOcrText } from "@/lib/ocr-text-repair"
+import { mergeSourcesLists, parseSources, writeSources } from "@/lib/sources-merge"
 import {
   type InsuranceCategoryType,
   type ModuleGroup,
@@ -33,6 +34,7 @@ const EMPTY_FIELD_VALUE = ""
 
 const PLACEHOLDER_REGEX = /^(未明确|未提及|未提到|未说明|未在本|未在证据|未从证据|证据片段未|证据片段中未|证据片段没有|证据中未|该字段未|文中未|原文未|原文中未|材料未|未找到|未见|没有提到|证据不足|无明确|不涉及|暂无|暂未|无此信息|无相关|本章节未|条款未|不适用于本|N\/A|n\/a|无$)/
 const SOURCE_ONLY_PLACEHOLDER_REGEX = /^(?:详见来源文件|详见费率表|详见(?:原文|附件|附表|条款|附录)|参见来源文件|请参见来源文件)(?:[:：\s]|$)/i
+const WEAK_UNACTIONABLE_VALUE_REGEX = /^(?:需|需要|请|应)?(?:核对|查看|参见|参考|结合|确认).{0,24}(?:条款|合同|保险单|资料|约定|实际|具体)|^(?:以|具体以).{0,24}(?:条款|合同|保险单|资料|约定|实际|为准)$|^按(?:合同|条款|保险单)约定$/i
 const REFERENCE_ONLY_PREFIX_REGEX = /^(?:详见|见|参见|参考|请参见|请查看|查看)\s*/i
 const REFERENCE_ONLY_TARGET_REGEX = /^(?:来源文件|费率表|原文|附件|附表|附录|条款|章节|投保范围|责任免除|保险金给付限额|计划表|保险计划表|第?\d+(?:\.\d+)*\s*(?:条|节)?)/i
 
@@ -49,6 +51,7 @@ function isMissingFieldValue(value: string | undefined | null): boolean {
   return normalized === ""
     || PLACEHOLDER_REGEX.test(normalized)
     || SOURCE_ONLY_PLACEHOLDER_REGEX.test(normalized)
+    || WEAK_UNACTIONABLE_VALUE_REGEX.test(normalized)
     || isReferenceOnlyFieldValue(normalized)
 }
 
@@ -56,6 +59,7 @@ function sanitizeFieldValue(value: string): string {
   const trimmed = value.trim()
   return PLACEHOLDER_REGEX.test(trimmed)
     || SOURCE_ONLY_PLACEHOLDER_REGEX.test(trimmed)
+    || WEAK_UNACTIONABLE_VALUE_REGEX.test(trimmed)
     || isReferenceOnlyFieldValue(trimmed)
     ? ""
     : trimmed
@@ -105,6 +109,11 @@ function isFieldValueCompatible(fieldName: string, value: string): boolean {
   const cleaned = value.trim()
   if (!cleaned || isMissingFieldValue(cleaned)) return false
 
+  if (fieldName === "QA") {
+    return /(问[:：]|答[:：]|Q\s*[:：]|A\s*[:：]|客户问|常见问题|产品问答|异议处理|话术)/i.test(cleaned)
+      && !/^【[^】]+】/.test(cleaned)
+  }
+
   if (fieldName === "投保范围") {
     return !/^【?投保职业】?/.test(cleaned)
       && !/职业类别/.test(cleaned)
@@ -120,6 +129,21 @@ function isFieldValueCompatible(fieldName: string, value: string): boolean {
     if (/续保期|保证续保期/.test(cleaned) && !/(是|否|支持|不支持|保证续保|不保证续保)/.test(cleaned)) return false
   }
 
+  return true
+}
+
+function isLessSpecificThanExisting(existing: string | undefined | null, incoming: string): boolean {
+  const oldValue = (existing ?? "").replace(/\s+/g, "").trim()
+  const newValue = incoming.replace(/\s+/g, "").trim()
+  if (!oldValue || !newValue || oldValue === newValue) return false
+  if (newValue.length > oldValue.length) return false
+  return newValue.length <= 12 && oldValue.includes(newValue)
+}
+
+function isUsefulIncrementalFieldValue(fieldName: string, value: string, existing?: string | null): boolean {
+  if (isMissingFieldValue(value)) return false
+  if (!isFieldValueCompatible(fieldName, value)) return false
+  if (isLessSpecificThanExisting(existing, value)) return false
   return true
 }
 
@@ -165,8 +189,10 @@ const FIELD_EVIDENCE_KEYWORDS: Record<string, string[]> = {
   "犹豫期": ["犹豫期", "退保", "解除合同", "扣除", "无息退还"],
   "宽限期": ["宽限期", "60日", "逾期", "保险费"],
   "投保年龄": ["投保年龄", "出生", "周岁", "最低", "最高"],
+  "产品别称": ["简称", "别称", "别名", "俗称", "推广名", "产品简称"],
   "产品简介": ["产品提供", "保障", "保险责任", "阅读指引", "产品"],
   "产品特色": ["领取方式", "领取期间", "保证给付", "保单贷款", "现金价值", "权益"],
+  "QA": ["Q&A", "QA", "问答", "常见问题", "客户问", "问：", "答：", "如何解释", "异议", "话术"],
   "保单权益": ["重要权益", "保单贷款", "自动垫交", "退保", "现金价值", "受益人"],
   "投保范围": ["投保范围", "被保险人", "投保年龄", "周岁"],
   "保障人群": ["投保年龄", "被保险人", "周岁"],
@@ -186,10 +212,11 @@ const FIELD_EVIDENCE_KEYWORDS: Record<string, string[]> = {
 
 const REFINE_EXTRA_FIELDS_BY_MODULE: Record<string, string[]> = {
   "产品基础信息": [
-    "险种代码", "险种简称", "险种名称", "产品类别", "产品类型", "主附加险",
-    "产品简介", "产品特色", "保单权益", "交费期限", "交费方式", "宽限期",
+    "险种代码", "险种简称", "险种名称", "产品别称", "产品类别", "产品类型", "主附加险",
+    "产品简介", "产品特色", "QA", "保单权益", "交费期限", "交费方式", "宽限期",
     "保障期间", "保障期间分类", "投保年龄", "保险期间和续保", "投保范围",
   ],
+  "QA": ["QA", "产品别称", "产品简介", "产品特色"],
   "投保年龄": ["投保年龄", "保障人群", "投保范围"],
   "投保人群": ["适用人群", "保障人群", "投保范围"],
   "犹豫期": ["犹豫期", "犹豫期及合同解除（退保）"],
@@ -226,6 +253,8 @@ const FIELD_DIRECT_EXTRACTION_HINTS: Record<string, string> = {
   "疾病身故": "仅原文把疾病身故或非意外身故作为单独责任、额外赔付或单独给付规则时填写。",
   "满期返还": "仅原文明示满期保险金、满期返还或保险期间届满返还时填写。",
   "适用人群": "优先从投保人群、投保年龄、投被保关系中抽取；不要从营销话术臆测。",
+  "产品别称": "只抽原文明确出现的产品简称、别称、俗称、推广名；不要根据产品名称自行缩写。",
+  "QA": "提取产品资料中的常见问题、客户问答、销售解释或异议处理；保留问答语义，可按 Q/A 或要点归纳。",
   "投保范围": "提取具体被保险人范围、投保年龄、投保限制或投被保关系；不要只写“见条款/见投保范围”。",
   "保障人群": "可根据明确投保年龄映射儿童/成人/老人等人群；不要输出“见投保范围”。",
   "投保职业": "只抽具体可投职业类别、拒保职业类别或职业限制；如果证据只有投保年龄或“见投保范围/见条款”，不要输出。",
@@ -265,6 +294,7 @@ const LONG_FIELD_MODULE_MAP: Record<string, string[]> = {
   ],
   "报销范围": ["一般住院医疗", "住院前后门急诊", "特殊门诊医疗", "门诊手术医疗"],
   "投保范围": ["投保年龄", "投保人群", "投保职业"],
+  "QA": ["QA", "产品基础信息"],
   "保险期间和续保": ["6年保证续保"],
   "犹豫期及合同解除（退保）": ["犹豫期", "退保"],
 }
@@ -982,6 +1012,7 @@ function buildModuleFile(
   moduleDef: ProductModule,
   category: InsuranceCategoryType,
   productName: string,
+  sourceRefs?: readonly string[],
 ): string {
   const hasValues = moduleHasExtractedValues(m)
   const lines: string[] = []
@@ -997,6 +1028,7 @@ function buildModuleFile(
   lines.push(`extraction_state: ${hasValues ? "has_values" : "needs_refinement"}`)
   lines.push(`created_by: auto-extract`)
   lines.push(`source_sections: ${m.sectionIndices.length}`)
+  appendSourceFrontmatter(lines, sourceRefs)
   lines.push("---")
   lines.push("")
   lines.push(`# ${m.moduleName}`)
@@ -1010,6 +1042,138 @@ function buildModuleFile(
 
 function yamlString(value: string): string {
   return JSON.stringify(value)
+}
+
+function yamlInlineStringList(values: string[]): string {
+  return `[${values.map(value => yamlString(value)).join(", ")}]`
+}
+
+function normalizeSourceRefs(sourceRefs?: readonly string[]): string[] {
+  const seen = new Set<string>()
+  const result: string[] = []
+  for (const ref of sourceRefs ?? []) {
+    const normalized = ref.trim()
+    const key = normalized.toLowerCase()
+    if (!normalized || seen.has(key)) continue
+    seen.add(key)
+    result.push(normalized)
+  }
+  return result
+}
+
+function appendSourceFrontmatter(lines: string[], sourceRefs?: readonly string[]): void {
+  const normalized = normalizeSourceRefs(sourceRefs)
+  if (normalized.length === 0) return
+  lines.push(`sources: ${yamlInlineStringList(normalized)}`)
+}
+
+function ensureSourceInFrontmatter(content: string, sourceRefs?: readonly string[]): string {
+  const normalized = normalizeSourceRefs(sourceRefs)
+  if (normalized.length === 0) return content
+  const merged = mergeSourcesLists(parseSources(content), normalized)
+  return writeSources(content, merged)
+}
+
+function ensureValueSourceInFrontmatter(content: string, sourceRefs?: readonly string[]): string {
+  const normalized = normalizeSourceRefs(sourceRefs)
+  if (normalized.length === 0) return content
+  const existing = frontmatterArrayValue(content, "value_sources")
+  return writeFrontmatterArrayValue(content, "value_sources", mergeSourcesLists(existing, normalized))
+}
+
+function frontmatterArrayValue(content: string, key: string): string[] {
+  const fmMatch = content.match(/^---\r?\n([\s\S]*?)\r?\n---/)
+  if (!fmMatch) return []
+  const inline = fmMatch[1].match(new RegExp(`^${escapeRegExp(key)}:\\s*\\[([^\\]]*)\\]`, "m"))
+  if (!inline) return []
+  const body = inline[1].trim()
+  if (!body) return []
+  return body
+    .split(",")
+    .map(item => item.trim().replace(/^["']|["']$/g, ""))
+    .filter(Boolean)
+}
+
+function writeFrontmatterArrayValue(content: string, key: string, values: readonly string[]): string {
+  const fmMatch = content.match(/^(---\r?\n)([\s\S]*?)(\r?\n---)/)
+  if (!fmMatch) return content
+  const normalized = normalizeSourceRefs(values)
+  const line = `${key}: ${yamlInlineStringList(normalized)}`
+  const [, open, body, close] = fmMatch
+  if (new RegExp(`^${escapeRegExp(key)}:\\s*\\[[^\\]]*\\]`, "m").test(body)) {
+    return `${open}${body.replace(new RegExp(`^${escapeRegExp(key)}:\\s*\\[[^\\]]*\\]`, "m"), line)}${close}${content.slice(fmMatch[0].length)}`
+  }
+  return `${open}${body}\n${line}${close}${content.slice(fmMatch[0].length)}`
+}
+
+function preserveExistingSources(newContent: string, existingContent: string | null): string {
+  if (!existingContent) return newContent
+  const existingSources = parseSources(existingContent)
+  return existingSources.length > 0 ? writeSources(newContent, existingSources) : newContent
+}
+
+function preserveExistingFieldLineage(newContent: string, existingContent: string | null): string {
+  if (!existingContent) return newContent
+  const existingValueSources = frontmatterArrayValue(existingContent, "value_sources")
+  return existingValueSources.length > 0
+    ? writeFrontmatterArrayValue(newContent, "value_sources", existingValueSources)
+    : newContent
+}
+
+interface ProductSourceSegment {
+  name: string
+  ref: string
+  text: string
+}
+
+function normalizeEvidenceText(value: string): string {
+  return value.replace(/\s+/g, "").replace(/[，,。；;、]/g, "")
+}
+
+function productSourceSegments(sourceContent: string): ProductSourceSegment[] {
+  const segments: ProductSourceSegment[] = []
+  const blockRegex = /<!-- PRODUCT_SOURCE_BEGIN:\s*([\s\S]*?)-->([\s\S]*?)<!-- PRODUCT_SOURCE_END:\s*\1\s*-->/g
+  let match: RegExpExecArray | null
+  while ((match = blockRegex.exec(sourceContent)) !== null) {
+    const name = match[1].trim()
+    const text = match[2]
+    const pathMatch = text.match(/路径[:：]\s*([^\r\n]+)/)
+    segments.push({
+      name,
+      ref: (pathMatch?.[1] ?? name).trim(),
+      text,
+    })
+  }
+  return segments
+}
+
+function inferFieldValueSourceRefs(
+  fieldName: string,
+  value: string,
+  sourceContent: string,
+  fallbackRefs: readonly string[],
+): string[] {
+  if (isMissingFieldValue(value)) return []
+  const normalizedFallback = normalizeSourceRefs(fallbackRefs)
+  const segments = productSourceSegments(sourceContent)
+  if (segments.length === 0) return normalizedFallback
+
+  const normalizedField = normalizeEvidenceText(fieldName)
+  const normalizedValue = normalizeEvidenceText(value)
+  const valueTokens = normalizedValue
+    .split(/[、,，;；]/)
+    .map(token => token.trim())
+    .filter(token => token.length >= 2)
+  const matches = segments
+    .filter((segment) => {
+      const text = normalizeEvidenceText(segment.text)
+      if (!text.includes(normalizedField)) return false
+      if (normalizedValue && text.includes(normalizedValue)) return true
+      return valueTokens.length > 0 && valueTokens.some(token => text.includes(token))
+    })
+    .map(segment => segment.ref)
+
+  return matches.length > 0 ? normalizeSourceRefs(matches) : normalizedFallback
 }
 
 function sanitizeFileNamePart(value: string): string {
@@ -1071,12 +1235,37 @@ function parseDirectProductFieldValueTables(
   return values
 }
 
+function extractDirectQaValue(content: string): string {
+  const lines = content.split(/\r?\n/)
+  let start = -1
+  for (let i = 0; i < lines.length; i++) {
+    if (/^#{1,6}\s*(?:QA|Q&A|产品问答|常见问题)\s*$/i.test(lines[i].trim())) {
+      start = i + 1
+      break
+    }
+  }
+  if (start < 0) return ""
+
+  const collected: string[] = []
+  for (let i = start; i < lines.length; i++) {
+    const line = lines[i]
+    if (/^#{1,6}\s+\S/.test(line.trim())) break
+    collected.push(line)
+  }
+
+  const value = collected.join("\n").trim()
+  if (!value) return ""
+  return isFieldValueCompatible("QA", value) ? value : ""
+}
+
 function buildProductFieldFile(
   field: ProductField,
   value: string,
   category: InsuranceCategoryType,
   productName: string,
   baseFieldNames: Set<string>,
+  sourceRefs?: readonly string[],
+  valueSourceRefs?: readonly string[],
 ): string {
   const hasValue = !isMissingFieldValue(value)
   const fieldScope = fieldScopeLabel(field.fieldName, baseFieldNames, category)
@@ -1106,6 +1295,8 @@ function buildProductFieldFile(
   lines.push(`value_type: ${field.valueType}`)
   lines.push(`source_hint: ${yamlString(field.source)}`)
   lines.push(`created_by: auto-extract`)
+  appendSourceFrontmatter(lines, sourceRefs)
+  lines.push(`value_sources: ${yamlInlineStringList(hasValue ? normalizeSourceRefs(valueSourceRefs ?? sourceRefs) : [])}`)
   lines.push("---")
   lines.push("")
   lines.push(`# ${field.fieldName}`)
@@ -1167,14 +1358,17 @@ function buildProductFieldFiles(
   profileMarkdown: string,
   category: InsuranceCategoryType,
   productName: string,
+  sourceRefs?: readonly string[],
+  sourceContent = "",
 ): Array<{ fileName: string; content: string; hasValue: boolean }> {
   const fieldValues = parseProductProfileFieldValues(profileMarkdown)
   const baseFieldNames = new Set(BASE_FIELDS.map(f => f.fieldName))
   return (PRODUCT_FIELDS[category] ?? []).map(field => {
     const value = fieldValues.get(field.fieldName) ?? EMPTY_FIELD_VALUE
+    const valueSourceRefs = inferFieldValueSourceRefs(field.fieldName, value, sourceContent, sourceRefs ?? [])
     return {
       fileName: `${category}-${productName}-字段-${sanitizeFileNamePart(field.fieldName)}.md`,
-      content: buildProductFieldFile(field, value, category, productName, baseFieldNames),
+      content: buildProductFieldFile(field, value, category, productName, baseFieldNames, sourceRefs, valueSourceRefs),
       hasValue: !isMissingFieldValue(value),
     }
   })
@@ -1184,6 +1378,7 @@ type ProductCatalogExtractionMode = "rebuild" | "incremental"
 
 interface ProductCatalogExtractionOptions {
   mode?: ProductCatalogExtractionMode
+  sourceRefs?: string[]
 }
 
 interface ProductCatalogWriteContext {
@@ -1198,6 +1393,7 @@ interface ProductCatalogWriteContext {
   sourceContent: string
   cleanedContent: string
   fileName: string
+  sourceRefs: string[]
   activityId: string
 }
 
@@ -1425,6 +1621,7 @@ function buildMainFile(
   sectionCount: number,
   allModules: ProductModule[],
   sourceContent = "",
+  sourceRefs?: readonly string[],
 ): string {
   const lines: string[] = []
 
@@ -1438,6 +1635,7 @@ function buildMainFile(
   lines.push(`status: candidate`)
   lines.push(`created_by: auto-extract`)
   lines.push(`source_sections: ${sectionCount}`)
+  appendSourceFrontmatter(lines, sourceRefs)
   lines.push("---")
   lines.push("")
   lines.push(`# ${productName}`)
@@ -1873,6 +2071,7 @@ async function writeFullProductCatalogOutputs(ctx: ProductCatalogWriteContext): 
     ctx.sectionCount,
     ctx.allModules,
     ctx.sourceContent,
+    ctx.sourceRefs,
   )
   const mainFileName = `${ctx.category}-${ctx.productName}.md`
   const mainPath = `${ctx.catalogDir}/${mainFileName}`
@@ -1883,7 +2082,7 @@ async function writeFullProductCatalogOutputs(ctx: ProductCatalogWriteContext): 
     log.error("failed to write main file", { error: String(err) })
   }
 
-  for (const fieldPage of buildProductFieldFiles(mainContent, ctx.category, ctx.productName)) {
+  for (const fieldPage of buildProductFieldFiles(mainContent, ctx.category, ctx.productName, ctx.sourceRefs, ctx.sourceContent)) {
     const fieldPath = `${ctx.catalogDir}/${fieldPage.fileName}`
     const fieldRelative = `wiki/product_catalog/${fieldPage.fileName}`
     try {
@@ -1897,7 +2096,7 @@ async function writeFullProductCatalogOutputs(ctx: ProductCatalogWriteContext): 
   for (const m of ctx.foundModules) {
     const moduleDef = ctx.allModules.find(mod => mod.moduleName === m.moduleName)
     if (!moduleDef) continue
-    const content = buildModuleFile(m, moduleDef, ctx.category, ctx.productName)
+    const content = buildModuleFile(m, moduleDef, ctx.category, ctx.productName, ctx.sourceRefs)
     const moduleFileName = `${ctx.category}-${ctx.productName}-${m.moduleName}.md`
     const modulePath = `${ctx.catalogDir}/${moduleFileName}`
     const moduleRelative = `wiki/product_catalog/${moduleFileName}`
@@ -1945,6 +2144,7 @@ async function writeIncrementalProductCatalogOutputs(ctx: ProductCatalogWriteCon
     ctx.sectionCount,
     ctx.allModules,
     ctx.sourceContent,
+    ctx.sourceRefs,
   )
   const existingValues = parseProductProfileFieldValues(existingMain)
   const incomingValues = parseProductProfileFieldValues(incomingMain)
@@ -1954,6 +2154,10 @@ async function writeIncrementalProductCatalogOutputs(ctx: ProductCatalogWriteCon
   )
   for (const [fieldName, value] of directIncomingValues) {
     incomingValues.set(fieldName, value)
+  }
+  const directQaValue = extractDirectQaValue(`${ctx.sourceContent}\n\n${ctx.cleanedContent}`)
+  if (directQaValue) {
+    incomingValues.set("QA", directQaValue)
   }
   const identityReviews = shouldAbortIncrementalForIdentity(
     existingValues,
@@ -1986,21 +2190,24 @@ async function writeIncrementalProductCatalogOutputs(ctx: ProductCatalogWriteCon
   let fieldFilledCount = 0
   let sameFieldCount = 0
   let conflictCount = 0
-  let updatedMain = existingMain
+  let updatedMain = ensureSourceInFrontmatter(existingMain, ctx.sourceRefs)
 
   for (const m of ctx.foundModules) {
     if (!moduleHasExtractedValues(m)) continue
     const moduleDef = ctx.allModules.find(mod => mod.moduleName === m.moduleName)
     if (!moduleDef) continue
-    const incomingContent = buildModuleFile(m, moduleDef, ctx.category, ctx.productName)
+    const incomingContent = buildModuleFile(m, moduleDef, ctx.category, ctx.productName, ctx.sourceRefs)
     const incomingFields = parseKeyFieldsTable(incomingContent)
-    const usefulIncomingFields = [...incomingFields.entries()].filter(([, value]) => !isMissingFieldValue(value))
-    if (usefulIncomingFields.length === 0) continue
 
     const moduleFileName = `${ctx.category}-${ctx.productName}-${m.moduleName}.md`
     const moduleRelative = `wiki/product_catalog/${moduleFileName}`
     const modulePath = `${ctx.catalogDir}/${moduleFileName}`
     const existingContent = await readFile(modulePath).catch(() => null)
+    const existingFields = existingContent ? parseKeyFieldsTable(existingContent) : new Map<string, string>()
+    const usefulIncomingFields = [...incomingFields.entries()].filter(([fieldName, value]) =>
+      isUsefulIncrementalFieldValue(fieldName, value, existingFields.get(fieldName)),
+    )
+    if (usefulIncomingFields.length === 0) continue
 
     if (!existingContent) {
       await writeFile(modulePath, incomingContent)
@@ -2009,12 +2216,12 @@ async function writeIncrementalProductCatalogOutputs(ctx: ProductCatalogWriteCon
       continue
     }
 
-    const existingFields = parseKeyFieldsTable(existingContent)
     let updatedModule = existingContent
     let changed = false
 
     for (const [fieldName, incomingValue] of usefulIncomingFields) {
       const existingValue = existingFields.get(fieldName)
+      if (!isUsefulIncrementalFieldValue(fieldName, incomingValue, existingValue)) continue
       if (isMissingFieldValue(existingValue)) {
         const replaced = setFirstFieldRow(updatedModule, fieldName, incomingValue)
         const next = replaced === updatedModule
@@ -2043,7 +2250,10 @@ async function writeIncrementalProductCatalogOutputs(ctx: ProductCatalogWriteCon
     }
 
     if (changed) {
-      updatedModule = markModuleHasValues(appendIncrementalSourceText(updatedModule, incomingContent, ctx.fileName))
+      updatedModule = ensureSourceInFrontmatter(
+        markModuleHasValues(appendIncrementalSourceText(updatedModule, incomingContent, ctx.fileName)),
+        ctx.sourceRefs,
+      )
       await writeFile(modulePath, updatedModule)
       writtenPaths.push(moduleRelative)
       moduleUpdatedCount++
@@ -2053,16 +2263,6 @@ async function writeIncrementalProductCatalogOutputs(ctx: ProductCatalogWriteCon
   const baseFieldNames = new Set(BASE_FIELDS.map(f => f.fieldName))
   for (const field of PRODUCT_FIELDS[ctx.category] ?? []) {
     const incomingValue = incomingValues.get(field.fieldName)
-    if (isMissingFieldValue(incomingValue)) continue
-    if (!isFieldValueCompatible(field.fieldName, incomingValue!)) {
-      log.info("incremental field value ignored: incompatible with field", {
-        field: field.fieldName,
-        value: incomingValue,
-        productName: ctx.productName,
-      })
-      continue
-    }
-
     const fieldFileName = `${ctx.category}-${ctx.productName}-字段-${sanitizeFileNamePart(field.fieldName)}.md`
     const fieldRelative = `wiki/product_catalog/${fieldFileName}`
     const fieldPath = `${ctx.catalogDir}/${fieldFileName}`
@@ -2071,7 +2271,25 @@ async function writeIncrementalProductCatalogOutputs(ctx: ProductCatalogWriteCon
     const existingValue = !isMissingFieldValue(existingFromField)
       ? existingFromField
       : existingValues.get(field.fieldName) ?? ""
-    const incomingFieldContent = buildProductFieldFile(field, incomingValue!, ctx.category, ctx.productName, baseFieldNames)
+
+    if (!incomingValue || !isUsefulIncrementalFieldValue(field.fieldName, incomingValue, existingValue)) {
+      log.info("incremental field value ignored: incompatible with field", {
+        field: field.fieldName,
+        value: incomingValue,
+        productName: ctx.productName,
+      })
+      continue
+    }
+    const incomingValueSourceRefs = inferFieldValueSourceRefs(field.fieldName, incomingValue!, ctx.sourceContent, ctx.sourceRefs)
+    const incomingFieldContent = buildProductFieldFile(
+      field,
+      incomingValue!,
+      ctx.category,
+      ctx.productName,
+      baseFieldNames,
+      ctx.sourceRefs,
+      incomingValueSourceRefs,
+    )
 
     if (isMissingFieldValue(existingValue)) {
       await writeFile(fieldPath, incomingFieldContent)
@@ -2086,6 +2304,15 @@ async function writeIncrementalProductCatalogOutputs(ctx: ProductCatalogWriteCon
       if (!existingFieldContent) {
         await writeFile(fieldPath, incomingFieldContent)
         writtenPaths.push(fieldRelative)
+      } else {
+        const fieldWithSource = ensureValueSourceInFrontmatter(
+          ensureSourceInFrontmatter(existingFieldContent, ctx.sourceRefs),
+          incomingValueSourceRefs,
+        )
+        if (fieldWithSource !== existingFieldContent) {
+          await writeFile(fieldPath, fieldWithSource)
+          writtenPaths.push(fieldRelative)
+        }
       }
       sameFieldCount++
       continue
@@ -2143,6 +2370,7 @@ export async function runProductCatalogExtraction(
   options: ProductCatalogExtractionOptions = {},
 ): Promise<string[]> {
   const productName = cleanProductName(rawProductName)
+  const sourceRefs = normalizeSourceRefs(options.sourceRefs?.length ? options.sourceRefs : [fileName])
   log.info("product name cleaned", { raw: rawProductName, clean: productName })
 
   const activity = useActivityStore.getState()
@@ -2339,6 +2567,7 @@ export async function runProductCatalogExtraction(
     sourceContent,
     cleanedContent,
     fileName,
+    sourceRefs,
     activityId,
   }
   const writtenPaths = mode === "incremental"
@@ -2973,9 +3202,13 @@ async function rebuildMainFilesFromModules(
       Math.max(group.sectionCount, 1),
       allModules,
     )
-    await writeFile(`${catalogDir}/${group.category}-${group.productName}.md`, mainContent)
+    const mainPath = `${catalogDir}/${group.category}-${group.productName}.md`
+    const existingMain = await readFile(mainPath).catch(() => null)
+    await writeFile(mainPath, preserveExistingSources(mainContent, existingMain))
     for (const fieldPage of buildProductFieldFiles(mainContent, group.category, group.productName)) {
-      await writeFile(`${catalogDir}/${fieldPage.fileName}`, fieldPage.content)
+      const fieldPath = `${catalogDir}/${fieldPage.fileName}`
+      const existingField = await readFile(fieldPath).catch(() => null)
+      await writeFile(fieldPath, preserveExistingFieldLineage(preserveExistingSources(fieldPage.content, existingField), existingField))
     }
     rebuilt++
   }

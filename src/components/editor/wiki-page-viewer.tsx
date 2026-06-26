@@ -27,6 +27,7 @@ import { setPageStatus, parseStatusFromContent } from "@/lib/knowledge-governanc
 import type { KnowledgeStatus } from "@/lib/knowledge-governance"
 import { DOMAIN_LABELS } from "@/lib/knowledge-schema"
 import { buildKnowledgeRelationIndex, relationsForPage, type KnowledgeRelationView } from "@/lib/knowledge-relation-index"
+import { isFileMissingErrorContent } from "@/lib/fs-errors"
 
 // ── Type icons & colours ─────────────────────────────────────────────────────
 
@@ -713,12 +714,17 @@ export function WikiPageViewer({ filePath, content, onEditRequest, onDeleteCompl
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
   const [showCreateMenu, setShowCreateMenu] = useState(false)
   const [indexedRelations, setIndexedRelations] = useState<KnowledgeRelationView[]>([])
+  const contentMissingError = isFileMissingErrorContent(content)
 
   const { fm, sections } = useMemo(() => {
+    if (contentMissingError) {
+      const { fm } = parseFrontmatter("---\ntitle: \"\"\ntype: default\n---\n")
+      return { fm, sections: [] }
+    }
     const { fm, body } = parseFrontmatter(content)
     const sections = splitSections(body).filter(s => s.heading !== fm.title)
     return { fm, sections }
-  }, [content])
+  }, [content, contentMissingError])
   const knowledgeGaps = useMemo(() => extractKnowledgeGaps(fm.attributes), [fm.attributes])
   const bodyAlreadyShowsGaps = useMemo(
     () => sections.some((sec) => /知识缺口|缺失知识|待补全|待补充/.test(`${sec.heading}\n${sec.content}`)),
@@ -834,7 +840,7 @@ export function WikiPageViewer({ filePath, content, onEditRequest, onDeleteCompl
     try {
       await cascadeDeleteWikiPage(projectPath, filePath)
       // Refresh file tree
-      const tree = await listDirectory(normalizePath(projectPath))
+      const tree = await listDirectory(normalizePath(projectPath)) as FileNode[]
       setFileTree(tree)
       bumpDataVersion()
       setSelectedFile(null)
@@ -898,7 +904,7 @@ export function WikiPageViewer({ filePath, content, onEditRequest, onDeleteCompl
     ].join("\n")
     try {
       await writeFile(pagePath, template)
-      const tree = await listDirectory(pp)
+      const tree = await listDirectory(pp) as FileNode[]
       setFileTree(tree)
       bumpDataVersion()
       setSelectedFile(pagePath)
@@ -906,6 +912,14 @@ export function WikiPageViewer({ filePath, content, onEditRequest, onDeleteCompl
       console.error("[WikiPageViewer] Create failed:", err)
     }
   }, [projectPath, setFileTree, bumpDataVersion, setSelectedFile])
+
+  if (contentMissingError) {
+    return (
+      <div className="flex h-full items-center justify-center px-6 text-center text-sm text-muted-foreground">
+        该页面已被删除，正在刷新列表。
+      </div>
+    )
+  }
 
   return (
     <div
@@ -1089,7 +1103,7 @@ export function WikiPageViewer({ filePath, content, onEditRequest, onDeleteCompl
                 </button>
               )}
               {fm.tags.slice(0, 3).map(tag => (
-                <TagBadge key={tag}>{tag}</TagBadge>
+                <TagBadge key={tag} tag={tag} />
               ))}
             </div>
             {(fm.created || fm.updated || filePath) && (
@@ -1266,7 +1280,7 @@ export function WikiPageViewer({ filePath, content, onEditRequest, onDeleteCompl
         {fm.tags.length > 0 && (
           <div style={{ display: "flex", gap: 6, flexWrap: "wrap", paddingTop: 16, borderTop: "1px solid #E2E5EA" }}>
             <span style={{ fontSize: 11, color: "#8B92A0", marginRight: 4 }}>标签:</span>
-            {fm.tags.map(tag => <TagBadge key={tag}>{tag}</TagBadge>)}
+            {fm.tags.map(tag => <TagBadge key={tag} tag={tag} />)}
           </div>
         )}
 

@@ -793,19 +793,25 @@ async function resolveProductCatalogExtractionSource(input: {
   productName: string
   activityId: string
   signal?: AbortSignal
-}): Promise<{ sourceContent: string; sourceFileName: string; cacheContent: string }> {
+}): Promise<{ sourceContent: string; sourceFileName: string; sourceRefs: string[]; cacheContent: string }> {
   const { projectPath, sourcePath, fileName, sourceContent, effectiveCacheContent, category, productName, activityId, signal } = input
   const manifest = isProductCatalogBundleSourcePath(sourcePath)
     ? parseProductCatalogBundleManifest(sourceContent)
     : null
 
   if (!manifest?.files?.length) {
-    return { sourceContent, sourceFileName: fileName, cacheContent: effectiveCacheContent }
+    return {
+      sourceContent,
+      sourceFileName: fileName,
+      sourceRefs: [toProjectRelativePath(projectPath, sourcePath)],
+      cacheContent: effectiveCacheContent,
+    }
   }
 
   const activity = useActivityStore.getState()
   const parts: string[] = []
   const cacheParts: string[] = [`manifest:${effectiveCacheContent}`]
+  const sourceRefs: string[] = []
   const files = manifest.files.filter((file) => file.path && isSupportedProductCatalogBundlePath(file.path))
 
   for (let i = 0; i < files.length; i++) {
@@ -839,6 +845,7 @@ async function resolveProductCatalogExtractionSource(input: {
     const rawFingerprint = /\.pdf$/i.test(name) && isImagePdf(raw)
       ? `image-pdf:${raw.length}`
       : sourceFingerprint(raw)
+    sourceRefs.push(relPath)
     cacheParts.push([
       `\n---SOURCE_CACHE:${relPath}---`,
       `name:${name}`,
@@ -896,7 +903,12 @@ async function resolveProductCatalogExtractionSource(input: {
 
 
   if (parts.length === 0) {
-    return { sourceContent, sourceFileName: fileName, cacheContent: effectiveCacheContent }
+    return {
+      sourceContent,
+      sourceFileName: fileName,
+      sourceRefs: [toProjectRelativePath(projectPath, sourcePath)],
+      cacheContent: effectiveCacheContent,
+    }
   }
 
   const assembledSourceContent = parts.join("\n\n")
@@ -917,6 +929,7 @@ async function resolveProductCatalogExtractionSource(input: {
   return {
     sourceContent: assembledSourceContent,
     sourceFileName: `${category}-${productName}-product-bundle-${files.length}files`,
+    sourceRefs,
     cacheContent: assembledCacheContent,
   }
 }
@@ -3727,6 +3740,7 @@ async function autoIngestImpl(
 
   const productCtxEarly = parseProductCatalogCtxFromFolderContext(folderContext)
   let productExtractionFileName = fileName
+  let productExtractionSourceRefs = [relativeSourcePath]
   if (productCtxEarly) {
     const productSource = await resolveProductCatalogExtractionSource({
       projectPath: pp,
@@ -3741,6 +3755,7 @@ async function autoIngestImpl(
     })
     sourceContent = productSource.sourceContent
     productExtractionFileName = productSource.sourceFileName
+    productExtractionSourceRefs = productSource.sourceRefs
     effectiveCacheContent = productSource.cacheContent
   }
 
@@ -3884,7 +3899,7 @@ async function autoIngestImpl(
         llmConfig,
         activityId,
         signal,
-        { mode: productCatalogMode },
+        { mode: productCatalogMode, sourceRefs: productExtractionSourceRefs },
       )
       // Save cache so re-imports are skipped
       if (writtenPaths.length > 0) {

@@ -84,6 +84,7 @@ export const BASE_FIELDS: ProductField[] = [
   { fieldName: "险种代码", source: "官网同步", valueType: "short", extractable: false },
   { fieldName: "险种简称", source: "产品条款", valueType: "short", extractable: true },
   { fieldName: "险种名称", source: "产品条款", valueType: "short", extractable: true },
+  { fieldName: "产品别称", source: "产品条款/产品说明书/产品问答", valueType: "short", extractable: true, description: "产品在资料、问答或销售话术中出现的简称、俗称、推广名或别名" },
   { fieldName: "开始使用时间", source: "官网同步", valueType: "short", extractable: false },
   { fieldName: "结束使用时间", source: "官网同步", valueType: "short", extractable: false },
   { fieldName: "产品类别", source: "产品条款", valueType: "short", extractable: true },
@@ -94,6 +95,7 @@ export const BASE_FIELDS: ProductField[] = [
   { fieldName: "主附加险", source: "产品条款", valueType: "short", extractable: true },
   { fieldName: "产品简介", source: "产品说明书", valueType: "long", extractable: true },
   { fieldName: "产品特色", source: "产品说明书", valueType: "long", extractable: true },
+  { fieldName: "QA", source: "产品问答/销售问答/产品说明书", valueType: "long", extractable: true, description: "产品相关常见问答、客户异议答复、销售解释口径，按问答对或要点归纳" },
   { fieldName: "适用人群", source: "人工填写", valueType: "short", extractable: false, description: "与客户收入相关" },
   { fieldName: "保单权益", source: "产品条款", valueType: "long", extractable: true },
   { fieldName: "可享服务", source: "三大服务清单", valueType: "short", extractable: false, valueHint: "臻享RUN健康管理服务、居家养老、高端康养" },
@@ -257,6 +259,7 @@ export function getExtractableFields(category: InsuranceCategoryType): ProductFi
 const BASE_MODULES: ProductModule[] = [
   // 一、产品基础信息
   { moduleName: "产品基础信息",    entityType: "product_overview",                      sourceDocHints: ["产品说明书","产品简介","投保须知"],  required: true,  isBaseModule: true,  group: "basic_info" },
+  { moduleName: "QA",              entityType: "product_qa",                            sourceDocHints: ["产品问答","销售问答","常见问题","产品说明书"], required: false, isBaseModule: true, group: "basic_info" },
 
   // 二、投保基础约束
   { moduleName: "投保年龄",        entityType: "underwriting_age_rule",                 sourceDocHints: ["产品条款","投保须知","产品说明书"],  required: true,  isBaseModule: true,  group: "basic_info" },
@@ -385,6 +388,7 @@ const ANNUITY_MODULES: ProductModule[] = [
 /** 每个险种的完整模块列表（基础模块 + 专属模块） */
 const COMMON_BASE_MODULE_NAMES = [
   "产品基础信息",
+  "QA",
   "投保年龄",
   "投保人群",
   "犹豫期",
