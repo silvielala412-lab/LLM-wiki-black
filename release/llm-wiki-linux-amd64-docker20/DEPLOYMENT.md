@@ -20,6 +20,7 @@
 | `deploy.sh` | 校验、加载镜像并启动服务 |
 | `README.txt` | 快速部署说明 |
 | `DEPLOYMENT.md` | 本详细部署手册 |
+| `API_REFERENCE.md` | 前后端与外部模型 API 接口说明 |
 
 镜像标签：`llm-wiki:0.4.3-linux-amd64`
 

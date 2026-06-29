@@ -8,6 +8,7 @@ Files:
   .env.example            Model/API configuration template
   deploy.sh               Load and start script
   DEPLOYMENT.md           Detailed Chinese deployment guide
+  API_REFERENCE.md        Frontend/backend and external API reference
 
 Deployment:
   1. Copy this whole directory to the Linux server.
@@ -20,6 +21,7 @@ Deployment:
 Notes:
   - The real .env is created beside docker-compose.yml during deployment.
   - See DEPLOYMENT.md for model, OCR, networking, backup and troubleshooting.
+  - See API_REFERENCE.md for all /api routes and external model contracts.
   - deploy.sh makes ./data writable by the container user (UID 1001).
   - API keys are not included in the image.
   - The model endpoint must be reachable from inside the container.
