@@ -128,15 +128,16 @@ SERVER_CONFIG_LOCKED=true
 
 ## 6. 配置 OCR、视觉和向量模型
 
-### 6.1 OCR
+### 6.1 内网多模态 OCR
 
-镜像已经包含 OCR 接口调用代码、`pdf-extract`、`pdftotext` 和 `pdftoppm`，但不包含 OCR 模型服务，也不包含真实 OCR Key。
+内网 OCR 实际是一个多模态识别模型，由独立的 multipart 接口对外提供服务。当前接口不需要 API Key，应用不会发送认证头。
+
+镜像已经包含该接口的调用代码、`pdf-extract`、`pdftotext` 和 `pdftoppm`，但不包含多模态 OCR 模型服务本身。
 
 如果需要识别扫描件 PDF，可配置：
 
 ```env
 OCR_ENDPOINT=http://10.10.10.30:8088/api/ocr
-OCR_API_KEY=替换为真实OCR_KEY
 OCR_USER_TEXT=识别文件中的所有文字
 OCR_ACTION_SCENARIO=111
 PDF_DPI=150
@@ -150,7 +151,6 @@ POST multipart/form-data
 file: PDF 或图片二进制
 user_text: 识别指令
 action_scenario: 场景编号
-Authorization: Bearer <OCR_API_KEY>
 ```
 
 OCR 响应契约：
@@ -165,7 +165,9 @@ OCR 响应契约：
 }
 ```
 
-配置 `OCR_ENDPOINT` 后，PDF 会优先发送给该 OCR 服务；调用失败才会降级到本地文字层抽取。只有文字型 PDF 时可暂不配置 OCR。
+配置 `OCR_ENDPOINT` 后，PDF 会优先发送给该多模态 OCR 模型；调用失败才会降级到本地文字层抽取。只有文字型 PDF 时可暂不配置 OCR。
+
+虽然底层是多模态模型，但它使用 `file + user_text + action_scenario` 专用协议，因此应配置在 `OCR_ENDPOINT`，而不是 `VISION_ENDPOINT`。
 
 ### 6.2 视觉模型
 
@@ -177,7 +179,7 @@ VISION_MODEL=替换为视觉模型名称
 VISION_API_KEY=替换为视觉模型KEY
 ```
 
-已经配置专用 OCR 且不处理其他图片时，视觉模型可以暂时留空。
+`VISION_ENDPOINT` 仅用于 OpenAI 兼容的多模态接口。已经配置上述内网 OCR，且不处理其他图片时，`VISION_*` 可以留空。
 
 ### 6.3 Embedding 模型
 
@@ -381,4 +383,4 @@ docker compose up -d --force-recreate
 - 能访问 Docker daemon 的用户通常也能读取容器环境变量，应严格限制 `root` 和 `docker` 组成员。
 - 对外提供服务时建议在前面增加 Nginx/网关，启用 HTTPS、访问控制和审计日志。
 - 仅向业务网段开放 `8231`，不要直接暴露到互联网。
-- 定期轮换 LLM、OCR、Vision 和 Embedding API Key。
+- 定期轮换 LLM、Vision 和 Embedding API Key；当前内网多模态 OCR 接口无 Key。

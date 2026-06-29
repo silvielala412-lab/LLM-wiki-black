@@ -516,6 +516,7 @@ Tier 4: pdftoppm → 图片页面 marker → 前端 VLM OCR
 - 生成 Docker 20.10+ 部署包：Compose、环境模板、部署脚本、镜像归档与 SHA-256。
 - 部署模板对齐当前内网 OCR 契约：请求字段为 `user_text + action_scenario + file`，不再使用旧的 `OCR_MODEL` 参数。
 - 新增 `release/llm-wiki-linux-amd64-docker20/DEPLOYMENT.md`，覆盖 `.env`、模型/OCR 配置、网络、验证、备份与排障流程。
+- 对齐内网 OCR 实际形态：它是无需 Key 的多模态识别接口，部署模板移除 `OCR_API_KEY`，继续使用专用 multipart 协议接入。
 - 容器 smoke test 通过：首页 200、`/api/health` 正常、运行时 LLM/Vision/Embedding 配置可读取。
 
 **交付目录**：`release/llm-wiki-linux-amd64-docker20/`

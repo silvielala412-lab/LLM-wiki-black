@@ -98,8 +98,6 @@ ENV OCR_ENDPOINT=
 # OCR 服务的业务参数，可按内网接口约定覆盖
 ENV OCR_USER_TEXT=识别文件中的所有文字
 ENV OCR_ACTION_SCENARIO=111
-# OCR 服务的 API Key（如果需要，以 Bearer token 方式发送）
-ENV OCR_API_KEY=
 # 用户是否可覆盖服务端配置：true=可以覆盖 false=锁定
 ENV SERVER_CONFIG_LOCKED=false
 

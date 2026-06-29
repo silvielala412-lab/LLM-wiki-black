@@ -31,7 +31,6 @@ services:
       OCR_ENDPOINT: "${OCR_ENDPOINT:-}"
       OCR_USER_TEXT: "${OCR_USER_TEXT:-识别文件中的所有文字}"
       OCR_ACTION_SCENARIO: "${OCR_ACTION_SCENARIO:-111}"
-      OCR_API_KEY: "${OCR_API_KEY:-}"
       PDF_DPI: "${PDF_DPI:-150}"
       PDF_OCR_MODE: "${PDF_OCR_MODE:-auto}"
 
