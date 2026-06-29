@@ -26,6 +26,15 @@ function isSkippedPath(filePath: string): boolean {
   return SKIP_PATH_SEGMENTS.some(seg => normalized.includes(seg))
 }
 
+function pathKey(path: string): string {
+  const normalized = path.replace(/\\/g, "/").replace(/\/+$/, "")
+  return /^[a-z]:\//i.test(normalized) ? normalized.toLowerCase() : normalized
+}
+
+function isSamePagePath(left: string, right: string): boolean {
+  return pathKey(left) === pathKey(right)
+}
+
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 export interface ConflictCandidate {
@@ -118,8 +127,9 @@ export async function findSimilarByVector(
     const { searchByEmbedding } = await import("@/lib/embedding")
     const { normalizePath } = await import("@/lib/path-utils")
     const pp = normalizePath(projectPath)
+    const expectedNewPagePath = `${pp}/wiki/${newPageId}.md`
     const newIsSource = isSourcePagePath(newPageId) || isSourceTypedContent(newContent)
-    if (newIsSource) return []
+    if (newIsSource || isSkippedPath(expectedNewPagePath)) return []
 
     // Use the page's title + first 500 chars as the search query
     const { title, excerpt } = extractTitleAndExcerpt(newContent)
@@ -138,6 +148,10 @@ export async function findSimilarByVector(
       let pagePath = ""
       for (const dir of dirs) {
         const candidate = `${pp}/wiki/${dir}/${r.id}.md`
+        if (isSamePagePath(candidate, expectedNewPagePath)) {
+          pagePath = candidate
+          break
+        }
         try {
           const content = await readFile(candidate)
           // Skip audit/source/redirect pages even if vector-similar
@@ -161,6 +175,7 @@ export async function findSimilarByVector(
       // If we still haven't resolved it, try a flat wiki/ path
       if (!pagePath) {
         const candidate = `${pp}/wiki/${r.id}.md`
+        if (isSamePagePath(candidate, expectedNewPagePath)) continue
         try {
           const content = await readFile(candidate)
           // Skip audit/source/redirect pages even if vector-similar
@@ -259,7 +274,7 @@ export async function findSimilarByTitle(
     const { listDirectory } = await import("@/commands/fs")
     const { normalizePath } = await import("@/lib/path-utils")
     const pp = normalizePath(projectPath)
-    if (isSourcePagePath(newPagePath)) return []
+    if (isSourcePagePath(newPagePath) || isSkippedPath(newPagePath)) return []
 
     // Flatten all .md files under wiki/
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -284,7 +299,7 @@ export async function findSimilarByTitle(
     for (const filePath of allPaths) {
       const base = filePath.split(/[/\\]/).pop() ?? ""
       if (SKIP.has(base)) continue
-      if (filePath === newPagePath) continue
+      if (isSamePagePath(filePath, newPagePath)) continue
       if (isSourcePagePath(filePath)) continue
       if (isSkippedPath(filePath)) continue  // path-based audit/source/query filter
 
@@ -350,7 +365,7 @@ export async function detectConflicts(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   embCfg: any,
 ): Promise<ConflictCandidate[]> {
-  if (isSourcePagePath(newPagePath) || isSourceTypedContent(newContent)) return []
+  if (isSourcePagePath(newPagePath) || isSkippedPath(newPagePath) || isSourceTypedContent(newContent)) return []
 
   const embEnabled = embCfg?.enabled && embCfg?.model
 

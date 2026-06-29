@@ -35,21 +35,24 @@ pub struct LlmServerConfig {
     /// - "always": render every PDF page for OCR.
     pub pdf_ocr_mode: String,
 
-    // ── Internal PDF OCR API (custom format) ──────────────────────────
-    /// POST endpoint for the intranet PDF OCR service.
-    /// e.g. http://192.168.1.50:8088/api/pdf/ocr
+    // ── Internal OCR API (custom intranet format) ─────────────────────
+    /// POST endpoint for the intranet OCR service.
+    /// e.g. http://laip-ivap-python-llm-retriever.example.cn:80/local_file_parser
     /// If set, this takes priority over pdftoppm + vision-model approach.
     #[serde(rename = "ocr_endpoint_configured")]
     pub has_ocr_endpoint: bool,
     #[serde(skip)]
     pub ocr_endpoint: Option<String>,
-    /// Model parameter sent to the OCR API. Choices depend on the service.
-    /// e.g. "qwen2.5-v1-72b" or "glm-ocr"
-    pub ocr_model: String,
     /// Optional Bearer token / API key for the OCR service.
     #[serde(skip)]
     pub ocr_api_key: Option<String>,
     pub has_ocr_api_key: bool,
+    /// Prompt sent as `user_text` field to the intranet OCR API.
+    /// Defaults to "识别文件中的所有文字".
+    pub ocr_user_text: Option<String>,
+    /// Scene tag sent as `action_scenario` field to the intranet OCR API.
+    /// Defaults to "111".
+    pub ocr_action_scenario: Option<String>,
 
     // ── Frontend behaviour ────────────────────────────────────────────
     pub allow_user_override: bool,
@@ -105,10 +108,10 @@ impl LlmServerConfig {
             pdf_ocr_mode,
             has_ocr_endpoint: ocr_endpoint.is_some(),
             ocr_endpoint,
-            ocr_model: Self::opt_env("OCR_MODEL")
-                .unwrap_or_else(|| "qwen2.5-v1-72b".to_string()),
             has_ocr_api_key: ocr_api_key.is_some(),
             ocr_api_key,
+            ocr_user_text: Self::opt_env("OCR_USER_TEXT"),
+            ocr_action_scenario: Self::opt_env("OCR_ACTION_SCENARIO"),
             allow_user_override: Self::opt_env("SERVER_CONFIG_LOCKED")
                 .map(|v| v.to_lowercase() != "true")
                 .unwrap_or(true),

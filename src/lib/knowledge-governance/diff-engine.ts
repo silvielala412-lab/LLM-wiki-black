@@ -81,7 +81,7 @@ function parseDiffResponse(raw: string): {
   }
 }
 
-import { callLLM } from "./llm-helper"
+import { callLLM, hasUsableLlmConfig } from "./llm-helper"
 
 export interface SemanticDiff {
   addedPoints: string[]
@@ -107,7 +107,7 @@ export async function generateSemanticDiff(
   newTitle: string,
   newContent: string,
 ): Promise<SemanticDiff | null> {
-  if (!llmConfig?.endpoint || !llmConfig?.model) {
+  if (!hasUsableLlmConfig(llmConfig)) {
     console.warn("[diff-engine] LLM not configured")
     return null
   }
@@ -125,4 +125,3 @@ export async function generateSemanticDiff(
   }
   return parseDiffResponse(responseText)
 }
-

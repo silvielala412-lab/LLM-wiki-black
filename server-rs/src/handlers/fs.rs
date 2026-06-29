@@ -651,14 +651,15 @@ async fn extract_pdf_content_async(path: &str, state: &AppState) -> anyhow::Resu
     Ok(marker)
 }
 
-/// Call the intranet PDF OCR API.
+/// Call the intranet OCR API.
 ///
 /// API contract (POST multipart/form-data):
-///   - model: string  ("qwen2.5-v1-72b" | "glm-ocr")
-///   - file:  binary  (PDF file bytes)
+///   - file:            binary  (PDF or image bytes)
+///   - user_text:       string  识别指令（由 OCR_USER_TEXT 配置，默认"识别文件中的所有文字"）
+///   - action_scenario: string  场景标识（由 OCR_ACTION_SCENARIO 配置，默认"111"）
 ///
 /// Response JSON:
-///   { "code": 0, "message": "成功处理", "data": { "trace_id": "...", "robot_text": "全文..." } }
+///   { "code": 0, "message": "操作成功", "data": { "trace_id": "...", "robot_text": "全文..." } }
 async fn call_intranet_ocr_api(
     path: &str,
     endpoint: &str,
@@ -666,23 +667,42 @@ async fn call_intranet_ocr_api(
 ) -> anyhow::Result<String> {
     let cfg = &state.llm_config;
 
-    // Read PDF bytes
+    // Read file bytes (PDF or image)
     let bytes = tokio::fs::read(path).await
-        .map_err(|e| anyhow::anyhow!("Cannot read PDF for OCR: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("Cannot read file for OCR: {e}"))?;
 
     let filename = Path::new(path)
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "document.pdf".to_string());
 
-    // Build multipart form
+    // Determine MIME type from extension
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let mime = match ext.as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png"          => "image/png",
+        "webp"         => "image/webp",
+        _              => "application/pdf",
+    };
+
+    // Build multipart form — matches intranet OCR API contract
     let file_part = reqwest::multipart::Part::bytes(bytes)
         .file_name(filename)
-        .mime_str("application/pdf")
+        .mime_str(mime)
         .map_err(|e| anyhow::anyhow!("MIME error: {e}"))?;
 
+    let user_text = cfg.ocr_user_text.clone()
+        .unwrap_or_else(|| "识别文件中的所有文字".to_string());
+    let action_scenario = cfg.ocr_action_scenario.clone()
+        .unwrap_or_else(|| "111".to_string());
+
     let form = reqwest::multipart::Form::new()
-        .text("model", cfg.ocr_model.clone())
+        .text("user_text", user_text)
+        .text("action_scenario", action_scenario)
         .part("file", file_part);
 
     // Build request

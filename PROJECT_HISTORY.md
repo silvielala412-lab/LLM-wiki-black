@@ -494,6 +494,38 @@ Tier 4: pdftoppm → 图片页面 marker → 前端 VLM OCR
 
 ---
 
+### [2026-06-29] v2.7 本地模型联调、治理自冲突修复与 Linux Docker 20 交付
+
+**本地联调结果**：
+- 修复本地 Web 服务启动后 `/api/config` 模型配置为空的问题：Rust 服务会依次检查当前目录、`server-rs/.env` 与可执行文件祖先目录，只补充尚未由系统环境变量提供的配置。
+- 使用隔离项目 `local-extraction-smoke-20260628` 上传 0626 mock，完成真实 DeepSeek 抽取、Schema 回填、Embedding 入库和 RAG 问答。
+- 共生成 12 个 Markdown；销售状态、开始使用时间、产品别称和 QA 话术均被识别。
+- `投保年龄=见条款 1.3`、`等待期=未明确` 未进入结构化有效值，问答能够说明两者没有明确有效值。
+- RAG 问答正确返回“已停售、2026-06-26”，并展示知识来源。
+
+**治理修复**：
+- `judge-module.ts`、`diff-engine.ts` 不再检查不存在的 `llmConfig.endpoint`，统一使用 provider-aware 模型配置判断，服务端托管模型可正常执行治理判断。
+- `conflict-detector.ts` 统一 Windows/Linux 路径比较，向量检索与标题扫描均排除当前页面自身。
+- 审计页、来源页不再进入知识冲突检测，避免抽取质量审计与产品页产生伪冲突。
+- 新增 4 个回归测试，覆盖 Windows 路径分隔符、自冲突、审计页过滤和服务端托管模型判断。
+
+**Linux Docker 20 交付**：
+- 构建目标：`linux/amd64`，镜像标签 `llm-wiki:0.4.3-linux-amd64`。
+- 镜像内前端、Rust 服务、Poppler PDF 工具完整打包；API Key 不进入镜像。
+- `.dockerignore` 排除 `wiki-data`、mock、日志、本地 `.env` 与 release 产物，避免测试数据进入构建上下文。
+- 生成 Docker 20.10+ 部署包：Compose、环境模板、部署脚本、镜像归档与 SHA-256。
+- 部署模板对齐当前内网 OCR 契约：请求字段为 `user_text + action_scenario + file`，不再使用旧的 `OCR_MODEL` 参数。
+- 容器 smoke test 通过：首页 200、`/api/health` 正常、运行时 LLM/Vision/Embedding 配置可读取。
+
+**交付目录**：`release/llm-wiki-linux-amd64-docker20/`
+
+**已知待办**：
+- 全项目 `npm run build` 仍被历史 TypeScript 类型错误阻挡；当前镜像使用 `vite build` 成功产出前端。
+- 通用抽取生成的正文仍会显示“占位值（未抽取）”说明，虽然结构化值为 null；产品字段展示可继续收敛。
+- 内网生产部署前仍需补服务端业务 API 鉴权、HTTPS 反向代理、结构化日志和多用户写入并发控制。
+
+---
+
 ## 分支约定
 
 | 分支 | 用途 |
@@ -504,4 +536,4 @@ Tier 4: pdftoppm → 图片页面 marker → 前端 VLM OCR
 
 ---
 
-*最后更新：2026-06-26*
+*最后更新：2026-06-29*

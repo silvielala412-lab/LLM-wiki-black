@@ -10,7 +10,7 @@
  */
 
 import type { JudgementResult, JudgeRelation, JudgeConfidence } from "./types"
-import { callLLM } from "./llm-helper"
+import { callLLM, hasUsableLlmConfig } from "./llm-helper"
 
 // ── Prompt construction ───────────────────────────────────────────────────────
 
@@ -97,7 +97,7 @@ export async function judgeRelationship(
   existingTitle: string,
   existingExcerpt: string,
 ): Promise<JudgementResult | null> {
-  if (!llmConfig?.endpoint || !llmConfig?.model) {
+  if (!hasUsableLlmConfig(llmConfig)) {
     console.warn("[judge-module] LLM not configured — skipping judgement")
     return null
   }

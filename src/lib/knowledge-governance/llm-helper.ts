@@ -17,6 +17,13 @@
 import { streamChat } from "@/lib/llm-client"
 import type { LlmConfig } from "@/stores/wiki-store"
 
+export function hasUsableLlmConfig(config: Partial<LlmConfig> | null | undefined): boolean {
+  if (!config?.model) return false
+  if (config.apiKey) return true
+  if (config.provider === "ollama" || config.provider === "claude-code") return true
+  return config.provider === "custom" && Boolean(config.customEndpoint)
+}
+
 /**
  * Call the LLM and return the full accumulated response text.
  * Returns null if the call fails or produces empty output.
@@ -31,7 +38,7 @@ export async function callLLM(
   messages: { role: string; content: string }[],
   maxTokens = 512,
 ): Promise<string | null> {
-  if (!llmConfig) {
+  if (!hasUsableLlmConfig(llmConfig)) {
     console.warn("[llm-helper] No LLM config provided")
     return null
   }

@@ -1,0 +1,54 @@
+version: "3.8"
+
+services:
+  llm-wiki:
+    image: llm-wiki:0.4.3-linux-amd64
+    container_name: llm-wiki
+    restart: unless-stopped
+    ports:
+      - "${HOST_PORT:-8231}:8231"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./data:/data
+    environment:
+      APP_HOST: "0.0.0.0"
+      APP_PORT: "8231"
+      WIKI_DATA_PATH: "/data"
+      STATIC_DIR: "/app/dist"
+      RUST_LOG: "${RUST_LOG:-llm_wiki_server=info,tower_http=warn}"
+
+      LLM_PROVIDER: "${LLM_PROVIDER:-custom}"
+      LLM_ENDPOINT: "${LLM_ENDPOINT}"
+      LLM_API_KEY: "${LLM_API_KEY}"
+      LLM_MODEL: "${LLM_MODEL}"
+      LLM_API_MODE: "${LLM_API_MODE:-chat_completions}"
+      LLM_MAX_CONTEXT: "${LLM_MAX_CONTEXT:-128000}"
+
+      VISION_ENDPOINT: "${VISION_ENDPOINT:-}"
+      VISION_MODEL: "${VISION_MODEL:-}"
+      VISION_API_KEY: "${VISION_API_KEY:-}"
+      OCR_ENDPOINT: "${OCR_ENDPOINT:-}"
+      OCR_USER_TEXT: "${OCR_USER_TEXT:-识别文件中的所有文字}"
+      OCR_ACTION_SCENARIO: "${OCR_ACTION_SCENARIO:-111}"
+      OCR_API_KEY: "${OCR_API_KEY:-}"
+      PDF_DPI: "${PDF_DPI:-150}"
+      PDF_OCR_MODE: "${PDF_OCR_MODE:-auto}"
+
+      EMBEDDING_ENDPOINT: "${EMBEDDING_ENDPOINT:-}"
+      EMBEDDING_MODEL: "${EMBEDDING_MODEL:-}"
+      EMBEDDING_API_KEY: "${EMBEDDING_API_KEY:-}"
+      SERVER_CONFIG_LOCKED: "${SERVER_CONFIG_LOCKED:-true}"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8231/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    security_opt:
+      - no-new-privileges:true

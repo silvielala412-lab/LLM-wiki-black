@@ -25,8 +25,7 @@ use state::AppState;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Load .env if present
-    let _ = dotenvy::dotenv();
+    let loaded_env = load_dotenv();
 
     // Tracing
     tracing_subscriber::fmt()
@@ -35,6 +34,10 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| "llm_wiki_server=info,tower_http=warn".into()),
         )
         .init();
+
+    if let Some(path) = loaded_env {
+        info!("Loaded environment file: {}", path.display());
+    }
 
     let port: u16 = std::env::var("APP_PORT")
         .unwrap_or_else(|_| "8000".into())
@@ -135,6 +138,41 @@ async fn main() -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+fn load_dotenv() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join(".env"));
+        candidates.push(cwd.join("server-rs").join(".env"));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        for ancestor in exe.ancestors().take(4) {
+            candidates.push(ancestor.join(".env"));
+        }
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    for path in candidates {
+        if !path.is_file() || !seen.insert(path.clone()) {
+            continue;
+        }
+        match dotenvy::from_path_iter(&path) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let (key, value) = entry;
+                    if std::env::var_os(&key).is_none() {
+                        std::env::set_var(key, value);
+                    }
+                }
+                return Some(path);
+            }
+            Err(error) => {
+                eprintln!("Failed to load {}: {error}", path.display());
+            }
+        }
+    }
+    None
 }
 
 async fn no_cache_headers(request: Request, next: Next) -> Response {

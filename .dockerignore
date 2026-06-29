@@ -16,6 +16,12 @@ dist/
 server-rs/target/
 __pycache__/
 *.pyc
+wiki-data/
+mock_uploads/
+release/
+server-rs/*.log
+*.tar
+*.tar.gz
 
 # Dev configs
 .env

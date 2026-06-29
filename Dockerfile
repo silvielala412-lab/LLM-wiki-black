@@ -91,12 +91,13 @@ ENV VISION_MODEL=
 # PDF 转图 DPI：150（默认）或 200（表格密集场景）
 ENV PDF_DPI=150
 # ── 内网 PDF OCR 专用 API（整文档一次性识别，优先级最高）──────
-# 接口格式：POST multipart/form-data，字段：model + file（PDF字节）
+# 接口格式：POST multipart/form-data，字段：user_text + action_scenario + file
 # 响应格式：{ "code": 0, "data": { "robot_text": "全文..." } }
 # 不填则降级到 pdf-extract → pdftoppm 方案
 ENV OCR_ENDPOINT=
-# 模型选项：qwen2.5-v1-72b（默认）或 glm-ocr
-ENV OCR_MODEL=qwen2.5-v1-72b
+# OCR 服务的业务参数，可按内网接口约定覆盖
+ENV OCR_USER_TEXT=识别文件中的所有文字
+ENV OCR_ACTION_SCENARIO=111
 # OCR 服务的 API Key（如果需要，以 Bearer token 方式发送）
 ENV OCR_API_KEY=
 # 用户是否可覆盖服务端配置：true=可以覆盖 false=锁定
