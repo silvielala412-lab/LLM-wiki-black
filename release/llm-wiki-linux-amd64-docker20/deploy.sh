@@ -5,7 +5,8 @@ cd "$(dirname "$0")"
 
 if [[ ! -f .env ]]; then
   cp .env.example .env
-  echo "Created .env. Fill in LLM_ENDPOINT, LLM_API_KEY and LLM_MODEL, then run this script again."
+  chmod 600 .env
+  echo "Created $(pwd)/.env. Fill in LLM_ENDPOINT, LLM_API_KEY and LLM_MODEL, then run this script again."
   exit 1
 fi
 

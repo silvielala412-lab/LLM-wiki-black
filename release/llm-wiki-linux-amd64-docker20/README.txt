@@ -7,6 +7,7 @@ Files:
   docker-compose.yml      Runtime definition
   .env.example            Model/API configuration template
   deploy.sh               Load and start script
+  DEPLOYMENT.md           Detailed Chinese deployment guide
 
 Deployment:
   1. Copy this whole directory to the Linux server.
@@ -17,6 +18,8 @@ Deployment:
   6. Check: curl http://127.0.0.1:8231/api/health
 
 Notes:
+  - The real .env is created beside docker-compose.yml during deployment.
+  - See DEPLOYMENT.md for model, OCR, networking, backup and troubleshooting.
   - API keys are not included in the image.
   - The model endpoint must be reachable from inside the container.
   - localhost inside the container means the container itself. Use an intranet IP,
