@@ -232,7 +232,8 @@ chmod +x deploy.sh
 2. 使用 `sha256sum` 校验离线镜像包。
 3. 解压并执行 `docker load`。
 4. 创建持久化目录 `./data`。
-5. 自动选择 `docker compose` 或 `docker-compose` 启动服务。
+5. 将 `data` 修正为容器用户 UID `1001` 可写，并处理 SELinux 挂载标签。
+6. 自动选择 `docker compose` 或 `docker-compose` 启动服务。
 
 脚本不会访问公网拉取镜像。
 
@@ -317,6 +318,32 @@ docker logs -f --tail 200 llm-wiki
 | 文字 PDF 可用但扫描件失败 | `OCR_ENDPOINT` 或 `VISION_*` 是否配置 |
 | OCR 返回解析错误 | 响应是否满足 `code=0` 且包含 `data.robot_text` |
 | 语义搜索效果弱 | Embedding 服务是否配置并可访问 |
+
+### 注册接口返回 500
+
+`POST /api/auth/register` 会写入 `/data/.auth/users.json`。容器以 UID `1001` 运行，如果宿主机 `data` 由 root 创建且不可写，注册会返回 `500`，日志中通常会出现 `Failed to save users: Permission denied`。
+
+在已部署服务器上执行：
+
+```bash
+cd /opt/llm-wiki
+docker compose stop
+docker run --rm --user 0 \
+  -v "$(pwd)/data:/data:Z" \
+  --entrypoint /bin/sh \
+  llm-wiki:0.4.3-linux-amd64 \
+  -c 'chown -R 1001:0 /data && chmod -R u+rwX,g+rwX /data'
+docker compose start
+```
+
+旧版 Compose 将 `docker compose` 替换为 `docker-compose`。验证权限：
+
+```bash
+docker exec llm-wiki sh -c 'id; test -w /data && echo writable || echo not-writable; ls -ldn /data /data/.auth 2>/dev/null || true'
+docker logs --tail 100 llm-wiki
+```
+
+输出应包含 `writable`。如果仍提示 `Permission denied`，执行 `getenforce`；输出为 `Enforcing` 时，确认 Compose 挂载保留 `./data:/data:Z`，然后执行 `docker compose up -d --force-recreate`。
 
 ## 12. 修改配置后重启
 

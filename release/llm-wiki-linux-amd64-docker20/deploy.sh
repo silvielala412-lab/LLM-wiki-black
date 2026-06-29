@@ -19,6 +19,14 @@ sha256sum -c llm-wiki-image.sha256
 gzip -dc llm-wiki-image.tar.gz | docker load
 mkdir -p data
 
+# The application runs as UID 1001. Bind-mounted directories created by root
+# are otherwise not writable, which makes /api/auth/register return HTTP 500.
+docker run --rm --user 0 \
+  -v "$(pwd)/data:/data:Z" \
+  --entrypoint /bin/sh \
+  llm-wiki:0.4.3-linux-amd64 \
+  -c 'chown -R 1001:0 /data && chmod -R u+rwX,g+rwX /data'
+
 if docker compose version >/dev/null 2>&1; then
   docker compose up -d
 elif command -v docker-compose >/dev/null 2>&1; then

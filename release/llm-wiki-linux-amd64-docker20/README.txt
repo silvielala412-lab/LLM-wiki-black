@@ -20,6 +20,7 @@ Deployment:
 Notes:
   - The real .env is created beside docker-compose.yml during deployment.
   - See DEPLOYMENT.md for model, OCR, networking, backup and troubleshooting.
+  - deploy.sh makes ./data writable by the container user (UID 1001).
   - API keys are not included in the image.
   - The model endpoint must be reachable from inside the container.
   - localhost inside the container means the container itself. Use an intranet IP,

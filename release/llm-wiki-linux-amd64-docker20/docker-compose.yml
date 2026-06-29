@@ -10,7 +10,7 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
-      - ./data:/data
+      - ./data:/data:Z
     environment:
       APP_HOST: "0.0.0.0"
       APP_PORT: "8231"

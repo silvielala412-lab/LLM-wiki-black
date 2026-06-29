@@ -11,7 +11,7 @@ services:
       - "host.docker.internal:host-gateway"
     volumes:
       # Wiki 数据持久化目录 — 请定期备份此目录
-      - ./wiki-data:/data
+      - ./wiki-data:/data:Z
     environment:
       APP_HOST: "0.0.0.0"
       APP_PORT: "8231"
