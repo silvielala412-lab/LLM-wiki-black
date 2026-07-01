@@ -10,6 +10,7 @@
  */
 
 import { isFileMissingErrorContent, extractFileMissingErrorMessage } from "@/lib/fs-errors"
+import type { FileNode } from "@/types/wiki"
 
 const API_BASE = "/api"
 
@@ -97,8 +98,8 @@ export async function writeFile(path: string, contents: string): Promise<void> {
   return post<void>("/fs/write", { path, contents })
 }
 
-export async function listDirectory(path: string): Promise<unknown[]> {
-  return post<unknown[]>("/fs/list", { path })
+export async function listDirectory(path: string): Promise<FileNode[]> {
+  return post<FileNode[]>("/fs/list", { path })
 }
 
 export async function fileExists(path: string): Promise<boolean> {
@@ -294,6 +295,116 @@ export async function uploadFiles(
   } finally {
     clearTimeout(timer)
   }
+}
+
+// ── Product Catalog Batch Ingestion ──────────────────────────────────────────
+
+export type ProductIngestBatchStatus =
+  | "uploading"
+  | "ready"
+  | "queued"
+  | "processing"
+  | "completed"
+  | "failed"
+
+export interface ProductIngestBatchFile {
+  file_id: string
+  name: string
+  relative_path: string
+  stored_path: string
+  size: number
+  sha256: string
+  document_type?: string
+}
+
+export interface ProductIngestBatch {
+  batch_id: string
+  client_batch_id?: string
+  project_id: string
+  project_name: string
+  project_path: string
+  product_name: string
+  product_code?: string
+  insurance_category: string
+  duplicate_policy: "reject" | "merge"
+  status: ProductIngestBatchStatus
+  files: ProductIngestBatchFile[]
+  written_files: string[]
+  warnings: string[]
+  manifest_path?: string
+  error?: string
+  created_at: string
+  updated_at: string
+  started_at?: string
+  completed_at?: string
+}
+
+export interface CreateProductIngestBatchInput {
+  project_name: string
+  product_name: string
+  insurance_category: string
+  product_code?: string
+  client_batch_id?: string
+  duplicate_policy?: "reject" | "merge"
+}
+
+export async function createProductIngestBatch(
+  input: CreateProductIngestBatchInput,
+): Promise<ProductIngestBatch> {
+  return post<ProductIngestBatch>("/ingest/product-batches", input)
+}
+
+export async function uploadProductIngestFile(
+  batchId: string,
+  file: File,
+  relativePath?: string,
+  documentType?: string,
+  timeoutMs = UPLOAD_TIMEOUT_MS,
+): Promise<{ batch: ProductIngestBatch; file: ProductIngestBatchFile }> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const query = new URLSearchParams()
+    if (relativePath) query.set("relative_path", relativePath)
+    if (documentType) query.set("document_type", documentType)
+    const fd = new FormData()
+    fd.append("file", file)
+    const suffix = query.size > 0 ? `?${query.toString()}` : ""
+    const res = await fetch(`${API_BASE}/ingest/product-batches/${encodeURIComponent(batchId)}/files${suffix}`, {
+      method: "POST",
+      body: fd,
+      signal: controller.signal,
+    })
+    if (!res.ok) throw new Error(await readApiError(res))
+    return res.json()
+  } catch (err) {
+    if (err instanceof DOMException && err.name === "AbortError") {
+      throw new Error(`上传超时（>${Math.round(timeoutMs / 60000)} 分钟）：${file.name}`)
+    }
+    throw err
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+export async function startProductIngestBatch(batchId: string): Promise<ProductIngestBatch> {
+  return post<ProductIngestBatch>(`/ingest/product-batches/${encodeURIComponent(batchId)}/start`, {})
+}
+
+export async function retryProductIngestBatch(batchId: string): Promise<ProductIngestBatch> {
+  return post<ProductIngestBatch>(`/ingest/product-batches/${encodeURIComponent(batchId)}/retry`, {})
+}
+
+export async function getProductIngestBatch(batchId: string): Promise<ProductIngestBatch> {
+  return get<ProductIngestBatch>(`/ingest/product-batches/${encodeURIComponent(batchId)}`)
+}
+
+export async function listProductIngestBatches(
+  projectName: string,
+  limit = 50,
+): Promise<ProductIngestBatch[]> {
+  const query = new URLSearchParams({ project_name: projectName, limit: String(limit) })
+  return get<ProductIngestBatch[]>(`/ingest/product-batches?${query.toString()}`)
 }
 
 // ── Media URL helper (replaces Tauri convertFileSrc) ─────────────────────────

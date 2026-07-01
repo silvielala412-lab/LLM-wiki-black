@@ -41,15 +41,15 @@ COPY package.json package-lock.json* ./
 RUN npm ci --prefer-offline || npm install
 
 # Copy frontend source (exclude server-rs, src-tauri, etc. via .dockerignore)
-COPY index.html tsconfig*.json vite.config.ts ./
+COPY index.html tsconfig*.json vite.config.ts vite.worker.config.ts ./
 COPY src ./src
 # public/ is optional in this project
 RUN if [ -d public ]; then cp -r public ./public; fi
 
-RUN npx vite build
+RUN npx vite build && npx vite build --config vite.worker.config.ts
 
 # ── Stage 3: Minimal runtime image ───────────────────────────────────────────
-FROM ubuntu:22.04
+FROM node:20-bookworm-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -63,6 +63,7 @@ WORKDIR /app
 
 COPY --from=rust-builder  /build/target/release/llm-wiki-server .
 COPY --from=frontend-builder /build/dist ./dist
+COPY --from=frontend-builder /build/worker-dist ./worker
 
 RUN mkdir -p /data /app && chown -R 1001:0 /app /data
 
@@ -72,6 +73,8 @@ ENV APP_HOST=0.0.0.0
 ENV APP_PORT=8000
 ENV WIKI_DATA_PATH=/data
 ENV STATIC_DIR=/app/dist
+ENV INGEST_WORKER_PATH=/app/worker/ingest-worker.js
+ENV INGEST_WORKER_CONCURRENCY=2
 ENV RUST_LOG=info
 
 # ── LLM 服务端配置（管理员设置，不需要用户配置）──────────────

@@ -24,7 +24,7 @@ mkdir -p data
 docker run --rm --user 0 \
   -v "$(pwd)/data:/data:Z" \
   --entrypoint /bin/sh \
-  llm-wiki:0.4.3-linux-amd64 \
+  llm-wiki:0.5.0-linux-amd64 \
   -c 'chown -R 1001:0 /data && chmod -R u+rwX,g+rwX /data'
 
 if docker compose version >/dev/null 2>&1; then

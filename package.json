@@ -1,12 +1,13 @@
 {
   "name": "llm-wiki",
   "private": true,
-  "version": "0.4.3",
+  "version": "0.5.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "typecheck": "tsc --build --pretty",
     "build": "npm run typecheck && vite build",
+    "build:worker": "vite build --config vite.worker.config.ts",
     "preview": "vite preview",
     "test": "npm run test:mocks && npm run test:llm",
     "test:mocks": "vitest run --exclude='**/*.real-llm.test.ts'",

@@ -1,12 +1,12 @@
 import React, { useState, useEffect, useCallback, useRef } from "react"
-import { FileText, Users, Lightbulb, BookOpen, HelpCircle, GitMerge, BarChart3, ChevronRight, ChevronDown, Layout, Globe, ShieldCheck, CalendarClock, BriefcaseBusiness, Network, FolderOpen, Package } from "lucide-react"
+import { FileText, Users, Lightbulb, BookOpen, HelpCircle, GitMerge, BarChart3, ChevronRight, ChevronDown, Layout, Globe, ShieldCheck, BriefcaseBusiness, Network, FolderOpen, Package } from "lucide-react"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { useWikiStore } from "@/stores/wiki-store"
 import { readFile, listDirectory } from "@/commands/fs"
 import type { FileNode } from "@/types/wiki"
 import { normalizePath } from "@/lib/path-utils"
 import { SERVICE_HIERARCHY } from "@/lib/insurance-schema-registry"
-import { INSURANCE_CATEGORIES, type InsuranceCategoryType } from "@/lib/product-catalog-modules"
+import { INSURANCE_CATEGORIES, parseProductModuleTitle } from "@/lib/product-catalog-modules"
 import { getQueueSummary } from "@/lib/ingest-queue"
 
 interface WikiPageInfo {
@@ -150,6 +150,27 @@ export function KnowledgeTree({ searchQuery = "" }: { searchQuery?: string }) {
     const timer = window.setInterval(tick, 2500)
     return () => window.clearInterval(timer)
   }, [project, loadProductCatalogPages])
+
+  useEffect(() => {
+    if (!project) return
+    const events = new EventSource(`/api/ingest/product-batches/events?project_name=${encodeURIComponent(project.name)}`)
+    const refresh = (event: Event) => {
+      const message = event as MessageEvent<string>
+      void (async () => {
+        try {
+          const batch = JSON.parse(message.data) as { status?: string }
+          if (batch.status !== "completed") return
+          await loadProductCatalogPages()
+          setFileTree(await listDirectory(normalizePath(project.path)))
+          bumpDataVersion()
+        } catch {
+          // A later event or normal page refresh will recover the view.
+        }
+      })()
+    }
+    events.addEventListener("batch", refresh)
+    return () => events.close()
+  }, [project, loadProductCatalogPages, setFileTree, bumpDataVersion])
 
   const toggleCheck = useCallback((path: string, e: React.MouseEvent) => {
     e.stopPropagation()
@@ -481,17 +502,10 @@ function flattenAllFiles(nodes:FileNode[]):FileNode[]{
 
 function parseProductCatalogTitle(fileName: string): { category: string; product: string; module: string } | null {
   const base = fileName.replace(/\.md$/i, "")
-  // Find the insurance category prefix
-  const categories = INSURANCE_CATEGORIES as readonly string[]
-  for (const cat of categories) {
-    if (base.startsWith(cat + "-")) {
-      const rest = base.slice(cat.length + 1)
-      const dashIdx = rest.indexOf("-")
-      if (dashIdx === -1) return { category: cat, product: rest, module: "" }
-      return { category: cat, product: rest.slice(0, dashIdx), module: rest.slice(dashIdx + 1) }
-    }
-  }
-  return null
+  const parsed = parseProductModuleTitle(base)
+  return parsed
+    ? { category: parsed.category, product: parsed.productName, module: parsed.moduleName }
+    : null
 }
 
 function ProductCatalogSection({ pages, selectedFile, checkedPaths, setSelectedFile, toggleCheck, expandedProducts, toggleProduct, forceExpanded = false }: {

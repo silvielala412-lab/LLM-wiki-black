@@ -2,7 +2,7 @@ version: "3.8"
 
 services:
   llm-wiki:
-    image: llm-wiki:0.4.3-linux-amd64
+    image: llm-wiki:0.5.0-linux-amd64
     container_name: llm-wiki
     restart: unless-stopped
     ports:
@@ -16,6 +16,8 @@ services:
       APP_PORT: "8231"
       WIKI_DATA_PATH: "/data"
       STATIC_DIR: "/app/dist"
+      INGEST_WORKER_PATH: "/app/worker/ingest-worker.js"
+      INGEST_WORKER_CONCURRENCY: "${INGEST_WORKER_CONCURRENCY:-2}"
       RUST_LOG: "${RUST_LOG:-llm_wiki_server=info,tower_http=warn}"
 
       LLM_PROVIDER: "${LLM_PROVIDER:-custom}"

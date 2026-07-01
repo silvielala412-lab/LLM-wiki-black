@@ -95,7 +95,7 @@ export const BASE_FIELDS: ProductField[] = [
   { fieldName: "主附加险", source: "产品条款", valueType: "short", extractable: true },
   { fieldName: "产品简介", source: "产品说明书", valueType: "long", extractable: true },
   { fieldName: "产品特色", source: "产品说明书", valueType: "long", extractable: true },
-  { fieldName: "QA", source: "产品问答/销售问答/产品说明书", valueType: "long", extractable: true, description: "产品相关常见问答、客户异议答复、销售解释口径，按问答对或要点归纳" },
+  { fieldName: "QA", source: "产品问答/销售问答/常见问答", valueType: "long", extractable: true, description: "仅从明确的问答类文件抽取产品常见问答，保留多个问题与答案的配对结构" },
   { fieldName: "适用人群", source: "人工填写", valueType: "short", extractable: false, description: "与客户收入相关" },
   { fieldName: "保单权益", source: "产品条款", valueType: "long", extractable: true },
   { fieldName: "可享服务", source: "三大服务清单", valueType: "short", extractable: false, valueHint: "臻享RUN健康管理服务、居家养老、高端康养" },
@@ -259,7 +259,7 @@ export function getExtractableFields(category: InsuranceCategoryType): ProductFi
 const BASE_MODULES: ProductModule[] = [
   // 一、产品基础信息
   { moduleName: "产品基础信息",    entityType: "product_overview",                      sourceDocHints: ["产品说明书","产品简介","投保须知"],  required: true,  isBaseModule: true,  group: "basic_info" },
-  { moduleName: "QA",              entityType: "product_qa",                            sourceDocHints: ["产品问答","销售问答","常见问题","产品说明书"], required: false, isBaseModule: true, group: "basic_info" },
+  { moduleName: "QA",              entityType: "product_qa",                            sourceDocHints: ["产品问答","销售问答","常见问题","常见问答","Q&A","QA"], required: false, isBaseModule: true, group: "basic_info" },
 
   // 二、投保基础约束
   { moduleName: "投保年龄",        entityType: "underwriting_age_rule",                 sourceDocHints: ["产品条款","投保须知","产品说明书"],  required: true,  isBaseModule: true,  group: "basic_info" },
@@ -480,12 +480,24 @@ export function buildProductModuleTitle(
 export function parseProductModuleTitle(
   title: string,
 ): { category: InsuranceCategoryType; productName: string; moduleName: string } | null {
-  const parts = title.split("-")
-  if (parts.length < 3) return null
-  const category = parts[0] as InsuranceCategoryType
-  if (!INSURANCE_CATEGORIES.includes(category)) return null
+  const category = INSURANCE_CATEGORIES.find(item => title.startsWith(`${item}-`))
+  if (!category) return null
+  const rest = title.slice(category.length + 1)
+  const fieldMarker = "-字段-"
+  const fieldMarkerIndex = rest.indexOf(fieldMarker)
+  if (fieldMarkerIndex > 0) {
+    return {
+      category,
+      productName: rest.slice(0, fieldMarkerIndex),
+      moduleName: `字段-${rest.slice(fieldMarkerIndex + fieldMarker.length)}`,
+    }
+  }
+  const parts = rest.split("-")
+  if (parts.length === 1) {
+    return parts[0] ? { category, productName: parts[0], moduleName: "" } : null
+  }
   const moduleName = parts[parts.length - 1]
-  const productName = parts.slice(1, -1).join("-")
+  const productName = parts.slice(0, -1).join("-")
   if (!productName || !moduleName) return null
   return { category, productName, moduleName }
 }

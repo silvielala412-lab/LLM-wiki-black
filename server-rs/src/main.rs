@@ -1,27 +1,26 @@
 use axum::{
-    Router,
-    routing::{get, post},
+    extract::DefaultBodyLimit,
+    extract::Request,
     http::{header, HeaderValue, Method},
     middleware::{self, Next},
-    extract::Request,
     response::Response,
-    extract::DefaultBodyLimit,
-};
-use tower_http::{
-    cors::{CorsLayer, Any},
-    services::ServeDir,
-    trace::TraceLayer,
+    routing::{get, post},
+    Router,
 };
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use tokio::net::TcpListener;
+use tower_http::{
+    cors::{Any, CorsLayer},
+    services::ServeDir,
+    trace::TraceLayer,
+};
 use tracing::info;
 
+mod error;
 mod handlers;
 mod state;
-mod error;
 
 use state::AppState;
-
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -49,14 +48,16 @@ async fn main() -> anyhow::Result<()> {
     let static_dir = std::env::var("STATIC_DIR").unwrap_or_else(|_| "./dist".into());
 
     let llm_config = state::LlmServerConfig::from_env();
-    info!("Server LLM config: provider={:?} model={:?} has_key={} vision={:?} ocr_endpoint={}",
-        llm_config.provider, llm_config.model, llm_config.has_api_key,
-        llm_config.vision_endpoint, llm_config.has_ocr_endpoint);
+    info!(
+        "Server LLM config: provider={:?} model={:?} has_key={} vision={:?} ocr_endpoint={}",
+        llm_config.provider,
+        llm_config.model,
+        llm_config.has_api_key,
+        llm_config.vision_endpoint,
+        llm_config.has_ocr_endpoint
+    );
 
-    let state = Arc::new(AppState::new(
-        PathBuf::from(&data_root),
-        llm_config,
-    ));
+    let state = Arc::new(AppState::new(PathBuf::from(&data_root), llm_config));
 
     info!("Wiki data root: {data_root}");
     info!("Allowed wiki data roots: {:?}", state.allowed_data_roots);
@@ -73,50 +74,93 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(handlers::health::health))
         .route("/config", get(handlers::config::get_config))
         // File system
-        .route("/fs/read",     post(handlers::fs::read_file))
-        .route("/fs/write",    post(handlers::fs::write_file))
-        .route("/fs/list",     post(handlers::fs::list_directory))
-        .route("/fs/exists",   post(handlers::fs::file_exists))
-        .route("/fs/delete",   post(handlers::fs::delete_file))
-        .route("/fs/mkdir",    post(handlers::fs::create_directory))
-        .route("/fs/copy",     post(handlers::fs::copy_file))
+        .route("/fs/read", post(handlers::fs::read_file))
+        .route("/fs/write", post(handlers::fs::write_file))
+        .route("/fs/list", post(handlers::fs::list_directory))
+        .route("/fs/exists", post(handlers::fs::file_exists))
+        .route("/fs/delete", post(handlers::fs::delete_file))
+        .route("/fs/mkdir", post(handlers::fs::create_directory))
+        .route("/fs/copy", post(handlers::fs::copy_file))
         .route("/fs/copy-dir", post(handlers::fs::copy_directory))
         .route("/fs/preprocess", post(handlers::fs::preprocess_file))
         .route("/fs/read-base64", post(handlers::fs::read_file_base64))
-        .route("/fs/related-wiki-pages", post(handlers::fs::related_wiki_pages))
-        .route("/fs/media",    get(handlers::fs::serve_media))
-        .route("/fs/clip-server-status", get(handlers::fs::clip_server_status))
+        .route(
+            "/fs/related-wiki-pages",
+            post(handlers::fs::related_wiki_pages),
+        )
+        .route("/fs/media", get(handlers::fs::serve_media))
+        .route(
+            "/fs/clip-server-status",
+            get(handlers::fs::clip_server_status),
+        )
         // Project
-        .route("/project/list",        get(handlers::project::list_projects))
-        .route("/project/open",        post(handlers::project::open_project))
-        .route("/project/create",      post(handlers::project::create_project))
-        .route("/project/create-auto", post(handlers::project::create_project_auto))
+        .route("/project/list", get(handlers::project::list_projects))
+        .route("/project/open", post(handlers::project::open_project))
+        .route("/project/create", post(handlers::project::create_project))
+        .route(
+            "/project/create-auto",
+            post(handlers::project::create_project_auto),
+        )
         // Vector store
-        .route("/vector/upsert-chunks",  post(handlers::vector::upsert_chunks))
-        .route("/vector/search-chunks",  post(handlers::vector::search_chunks))
-        .route("/vector/delete-page",    post(handlers::vector::delete_page))
-        .route("/vector/count-chunks",   post(handlers::vector::count_chunks))
-        .route("/vector/drop-legacy",    post(handlers::vector::drop_legacy))
-        .route("/vector/meta",           get(handlers::vector::get_meta))
-        .route("/vector/update-meta",    post(handlers::vector::update_meta))
+        .route(
+            "/vector/upsert-chunks",
+            post(handlers::vector::upsert_chunks),
+        )
+        .route(
+            "/vector/search-chunks",
+            post(handlers::vector::search_chunks),
+        )
+        .route("/vector/delete-page", post(handlers::vector::delete_page))
+        .route("/vector/count-chunks", post(handlers::vector::count_chunks))
+        .route("/vector/drop-legacy", post(handlers::vector::drop_legacy))
+        .route("/vector/meta", get(handlers::vector::get_meta))
+        .route("/vector/update-meta", post(handlers::vector::update_meta))
         // RAG retrieval — backend search pipeline (Phase 1: vector; Phase 2+: BM25+graph)
-        .route("/rag/retrieve",          post(handlers::rag::retrieve))
-        .route("/rag/status",            get(handlers::rag::status))
-        .route("/chat/stream",           post(handlers::chat::stream_chat))
+        .route("/rag/retrieve", post(handlers::rag::retrieve))
+        .route("/rag/status", get(handlers::rag::status))
+        .route("/chat/stream", post(handlers::chat::stream_chat))
         // Upload — allow up to 200 MB per request (axum default is 2 MB)
-        .route("/upload/file",  post(handlers::upload::upload_file))
+        .route("/upload/file", post(handlers::upload::upload_file))
         .route("/upload/files", post(handlers::upload::upload_files))
+        // Product-catalog batch ingestion (manual UI and external systems share this API)
+        .route(
+            "/ingest/product-batches",
+            post(handlers::ingest::create_batch).get(handlers::ingest::list_batches),
+        )
+        .route(
+            "/ingest/product-batches/{batch_id}",
+            get(handlers::ingest::get_batch),
+        )
+        .route(
+            "/ingest/product-batches/{batch_id}/files",
+            post(handlers::ingest::upload_batch_file),
+        )
+        .route(
+            "/ingest/product-batches/{batch_id}/start",
+            post(handlers::ingest::start_batch),
+        )
+        .route(
+            "/ingest/product-batches/{batch_id}/retry",
+            post(handlers::ingest::retry_batch),
+        )
+        .route(
+            "/ingest/product-batches/events",
+            get(handlers::ingest::batch_events),
+        )
         // LLM / Embedding proxy (solves Mixed Content + CORS for HTTPS deployments)
         .route("/llm/stream", post(handlers::llm::stream_chat))
-        .route("/llm/vision-stream", post(handlers::llm::stream_vision_chat))
-        .route("/llm/embed",  post(handlers::llm::embed))
+        .route(
+            "/llm/vision-stream",
+            post(handlers::llm::stream_vision_chat),
+        )
+        .route("/llm/embed", post(handlers::llm::embed))
         // Web search proxy (routes Tavily/Perplexity calls through the server)
         .route("/search/web", post(handlers::search::web_search))
         // Auth (public — no JWT required)
         .route("/auth/register", post(handlers::auth::register))
-        .route("/auth/login",    post(handlers::auth::login))
-        .route("/auth/logout",   post(handlers::auth::logout))
-        .route("/auth/me",       get(handlers::auth::me))
+        .route("/auth/login", post(handlers::auth::login))
+        .route("/auth/logout", post(handlers::auth::logout))
+        .route("/auth/me", get(handlers::auth::me))
         .with_state(state);
 
     // SPA fallback — serve React app for all non-API routes

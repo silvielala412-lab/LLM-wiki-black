@@ -1,8 +1,8 @@
 # LLM Wiki 前后端 API 接口说明
 
-> 适用版本：`llm-wiki:0.4.3-linux-amd64`
+> 适用版本：`llm-wiki:0.5.0-linux-amd64`
 >
-> 文档日期：2026-06-29
+> 文档日期：2026-06-30
 >
 > 后端：Rust + Axum
 >
@@ -93,7 +93,7 @@ Cache-Control: no-store, no-cache, must-revalidate, max-age=0
 
 ## 4. API 总览
 
-当前后端共注册 39 条 `/api` 路由。
+当前后端共注册 46 条 `/api` 路由。
 
 | 分组 | 数量 | 前缀 |
 |---|---:|---|
@@ -101,6 +101,7 @@ Cache-Control: no-store, no-cache, must-revalidate, max-age=0
 | 文件系统 | 13 | `/api/fs/*` |
 | 项目 | 4 | `/api/project/*` |
 | 上传 | 2 | `/api/upload/*` |
+| 产品批量导入 | 7 | `/api/ingest/product-batches*` |
 | 向量索引 | 7 | `/api/vector/*` |
 | RAG 与问答 | 3 | `/api/rag/*`、`/api/chat/*` |
 | 模型代理 | 3 | `/api/llm/*` |
@@ -626,7 +627,7 @@ Content-Type: multipart/form-data
   -> POST /api/vector/upsert-chunks 写入 LanceDB
 ```
 
-注意：当前知识抽取编排主要运行在浏览器前端，上传接口本身不会在后端自动启动抽取。
+注意：通用 `/api/upload/*` 仍由浏览器前端编排抽取；产品库批量导入应使用第 18 节的 `/api/ingest/product-batches*`，由后端自动执行抽取。
 
 ### 15.2 项目知识问答
 
@@ -678,3 +679,76 @@ curl -s "http://127.0.0.1:8231/api/rag/status?project_path=/data/black"
 # 最近服务日志
 docker logs --tail 200 llm-wiki
 ```
+
+## 18. 产品批量导入 API
+
+该组接口同时服务于前端手动上传和外部批处理系统。一个批次对应一个保险产品；批量处理 1000 个产品时，由调用方为每个产品创建独立批次。不同项目可以并行处理，同一项目内串行抽取，避免同时改写相同 Markdown 和索引。
+
+### 18.1 参数职责
+
+| 参数 | 必填 | 说明 |
+|---|---:|---|
+| `project_name` | 是 | 前端创建项目时的名称，全局共享，不按用户隔离；名称必须能唯一定位项目 |
+| `product_name` | 是 | 保险产品名称，同时作为产品源文件目录名 |
+| `insurance_category` | 是 | 保险分类，当前支持医疗险、重疾险、意外医疗险、意外险、寿险、年金险 |
+| `product_code` | 否 | 外部系统的产品编码 |
+| `client_batch_id` | 否 | 调用方幂等键，重复提交返回已有批次 |
+| `duplicate_policy` | 否 | `reject` 或 `merge`，默认 `merge`；版本化导入作为后续能力单独设计 |
+| `relative_path` | 否 | 文件在产品文件夹内的相对路径，用于保留子目录结构 |
+| `document_type` | 否 | 调用方已知时可传的文档类型提示，不传不影响处理 |
+
+调用方不传字段级抽取规则。后端根据 `insurance_category`、文件扩展名/MIME、文件名、目录上下文以及可选的 `document_type` 选择 OCR、预处理和产品字段抽取规则，保证前端上传与接口导入使用同一套规则。
+
+QA 与产品特色使用更严格的文档级路由：QA 只从文件名明确属于 QA/Q&A/FAQ/产品问答/常见问答的文件抽取；产品特色只从产品说明书、产品介绍书、产品简介或产品手册抽取。其它文件不会为这两个字段补值。产品别称抽取成功后会同步为所有该产品 Markdown 的 `aliases` frontmatter，供检索直接使用。
+
+### 18.2 创建批次
+
+```http
+POST /api/ingest/product-batches
+Content-Type: application/json
+```
+
+```json
+{
+  "project_name": "dww",
+  "product_name": "平安福2026",
+  "insurance_category": "重疾险",
+  "product_code": "PAF-2026",
+  "client_batch_id": "erp-20260630-0001",
+  "duplicate_policy": "merge"
+}
+```
+
+响应包含后续接口使用的 `batch_id`，初始状态为 `uploading`。
+
+### 18.3 逐文件流式上传
+
+```http
+POST /api/ingest/product-batches/{batch_id}/files?relative_path=条款/主条款.pdf&document_type=保险条款
+Content-Type: multipart/form-data
+
+file: <binary>
+```
+
+每次请求上传一个文件，单文件上限 200 MB。服务端边接收边落盘并计算 SHA-256，不把整个文件读入内存。调用方可并发上传同一批次的多个文件；前端默认并发数为 4。
+
+### 18.4 启动、查询和重试
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `POST` | `/api/ingest/product-batches/{batch_id}/start` | 生成产品 manifest 并提交后台抽取，返回 `202` |
+| `GET` | `/api/ingest/product-batches/{batch_id}` | 查询批次状态、错误、告警和已写入 Markdown |
+| `GET` | `/api/ingest/product-batches?project_name=dww&limit=50` | 查询项目最近批次 |
+| `POST` | `/api/ingest/product-batches/{batch_id}/retry` | 重试失败批次，复用已上传文件 |
+| `GET` | `/api/ingest/product-batches/events?project_name=dww` | SSE 状态事件；前端在完成后自动刷新知识树 |
+
+状态流转：`uploading -> ready -> queued -> processing -> completed`；任何后台错误进入 `failed`，并在 `error` 字段返回可诊断信息。
+
+### 18.5 推荐的外部批处理流程
+
+1. 创建或确认目标项目，并保证 `project_name` 唯一。
+2. 每个产品调用一次创建批次接口，传产品名称和保险分类。
+3. 对该产品目录下的文件逐个调用上传接口，保留 `relative_path`。
+4. 所有文件成功上传后调用 `start`；不要在文件仍上传时提前启动。
+5. 轮询批次详情或监听 SSE，失败时记录 `error` 并调用 `retry`。
+6. `completed` 后，生成的 Markdown 会出现在现有 `wiki/product_catalog` 页面中，前端无需另做数据同步。

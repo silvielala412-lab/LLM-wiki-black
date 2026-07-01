@@ -3,6 +3,7 @@ pub mod chat;
 pub mod config;
 pub mod fs;
 pub mod health;
+pub mod ingest;
 pub mod llm;
 pub mod project;
 pub mod rag;

@@ -22,7 +22,7 @@
 | `DEPLOYMENT.md` | 本详细部署手册 |
 | `API_REFERENCE.md` | 前后端与外部模型 API 接口说明 |
 
-镜像标签：`llm-wiki:0.4.3-linux-amd64`
+镜像标签：`llm-wiki:0.5.0-linux-amd64`
 
 ## 2. `.env` 文件在哪里
 
@@ -126,6 +126,16 @@ SERVER_CONFIG_LOCKED=true
 主 LLM 接口需要兼容 OpenAI Chat Completions 请求格式。一般填写 `/v1` 根地址，应用会调用对应的聊天补全接口。
 
 `SERVER_CONFIG_LOCKED=true` 表示地址、模型和 Key 由服务器统一管理，前端用户不能覆盖。当前部署版本还没有将“抽取模型”和“问答模型”拆成两套独立配置。
+
+### 5.1 后台产品抽取 Worker
+
+`0.5.0` 镜像已内置 Node.js 20 和产品抽取 worker。外部系统或前端通过 `/api/ingest/product-batches*` 提交产品后，Rust 服务会在容器内启动 worker，复用现有 OCR、LLM、知识冲突和 Markdown 写入逻辑，不需要在浏览器保持页面打开。
+
+```env
+INGEST_WORKER_CONCURRENCY=2
+```
+
+该值限制整个实例同时运行的高成本抽取任务数，默认 `2`。同一项目始终串行执行，避免并发改写同一知识库；不同项目可在此上限内并行。内存或模型吞吐较小时建议设置为 `1`。
 
 ## 6. 配置 OCR、视觉和向量模型
 
@@ -332,7 +342,7 @@ docker compose stop
 docker run --rm --user 0 \
   -v "$(pwd)/data:/data:Z" \
   --entrypoint /bin/sh \
-  llm-wiki:0.4.3-linux-amd64 \
+  llm-wiki:0.5.0-linux-amd64 \
   -c 'chown -R 1001:0 /data && chmod -R u+rwX,g+rwX /data'
 docker compose start
 ```

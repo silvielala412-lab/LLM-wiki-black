@@ -577,7 +577,6 @@ export function SourcesView() {
 
   const PRODUCT_UPLOAD_ACCEPT = ".pdf,.md,.mdx,.txt,.docx,.xlsx,.xls,.csv,.json,.png,.jpg,.jpeg"
   const PRODUCT_UPLOAD_EXTS = new Set(PRODUCT_UPLOAD_ACCEPT.split(",").map((ext) => ext.slice(1)))
-  const PRODUCT_BUNDLE_MANIFEST_NAME = "__product_bundle__.json"
 
   function isSupportedProductUploadFile(file: File): boolean {
     if (file.name.startsWith("~$")) return false
@@ -615,78 +614,55 @@ export function SourcesView() {
       )
       try {
         log.info("product upload start", { dest: `产品/${category}/${productName}`, files: files.length, mode })
-        const { writeFile } = await import("@/commands/fs")
-        const results = await uploadFilesOneByOne(
-          files,
-          destDir,
-          (file, index, total) =>
-            mode === "folder"
-              ? `正在逐个上传产品文件夹 ${index}/${total}: ${file.name}`
-              : `正在逐个上传 ${index}/${total}: ${file.name}`,
-        )
-        const importedPaths: string[] = results
-          .filter((r): r is { path: string; name: string; size: number } => "path" in r)
-          .map((r) => r.path)
-        const errorCount = results.filter((r) => "error" in r).length
-        log.info("product upload done", { dest: destDir, success: importedPaths.length, errors: errorCount })
-        setImportStatus(
-          errorCount > 0
-            ? `上传完成：${importedPaths.length} 成功，${errorCount} 失败`
-            : `✓ ${category} > ${productName}：${importedPaths.length} 个文件已上传`
-        )
-        await loadSources()
-        const canIngest = !!(llmConfig.apiKey || llmConfig.provider === "ollama" || llmConfig.provider === "custom")
-        if (canIngest && importedPaths.length > 0) {
-          const tasks_pc: Array<{ sourcePath: string; folderContext: string }> = []
-          const folderContext = encodeProductCatalogFolderContext(category, productName.trim(), [], 0)
-          if (mode === "folder" || importedPaths.length > 1) {
-            const uploadedByPath = new Map(
-              results
-                .filter((r): r is { path: string; name: string; size: number } => "path" in r)
-                .map((r) => [normalizePath(r.path), r])
-            )
-            const manifestPath = `${destDir}/${PRODUCT_BUNDLE_MANIFEST_NAME}`
-            const manifest = {
-              kind: "product_catalog_bundle",
-              version: 1,
-              insurance_category: category,
-              product_name: productName.trim(),
-              created_at: new Date().toISOString(),
-              upload_mode: mode,
-              files: importedPaths.map((absPath, index) => {
-                const normalized = normalizePath(absPath)
-                const uploaded = uploadedByPath.get(normalized)
-                const selected = files[index]
-                return {
-                  name: uploaded?.name ?? selected?.name ?? getFileName(normalized),
-                  path: normalized.startsWith(pp + "/") ? normalized.slice(pp.length + 1) : normalized,
-                  size: uploaded?.size ?? selected?.size ?? 0,
-                  original_relative_path: (selected as File & { webkitRelativePath?: string } | undefined)?.webkitRelativePath ?? "",
-                }
-              }),
-            }
-            await writeFile(manifestPath, JSON.stringify(manifest, null, 2))
-            const manifestSourcePath = manifestPath.startsWith(pp + "/") ? manifestPath.slice(pp.length + 1) : manifestPath
-            tasks_pc.push({
-              sourcePath: manifestSourcePath,
-              folderContext,
-            })
-          } else {
-            for (const absPath of importedPaths) {
-              const sourcePath = absPath.startsWith(pp + "/") ? absPath.slice(pp.length + 1) : absPath
-              tasks_pc.push({ sourcePath, folderContext })
+        const {
+          createProductIngestBatch,
+          uploadProductIngestFile,
+          startProductIngestBatch,
+        } = await import("@/commands/fs")
+        const batch = await createProductIngestBatch({
+          project_name: project.name,
+          product_name: productName.trim(),
+          insurance_category: category,
+          duplicate_policy: "merge",
+        })
+
+        let cursor = 0
+        let completed = 0
+        const importedPaths: string[] = []
+        const uploadErrors: UploadResult[] = []
+        const uploadWorker = async () => {
+          while (cursor < files.length) {
+            const index = cursor++
+            const file = files[index]
+            const webkitPath = (file as File & { webkitRelativePath?: string }).webkitRelativePath ?? ""
+            const relativePath = mode === "folder" && webkitPath
+              ? webkitPath.split("/").slice(1).join("/") || file.name
+              : file.name
+            setImportStatus(`正在并发上传 ${completed + 1}/${files.length}: ${file.name}`)
+            try {
+              const result = await uploadProductIngestFile(batch.batch_id, file, relativePath)
+              importedPaths.push(result.file.stored_path)
+            } catch (err) {
+              uploadErrors.push({ error: extractErrMsg(err), name: file.name })
+            } finally {
+              completed++
             }
           }
-          log.info("product enqueue batch", { project: project.id, files: importedPaths.length, tasks: tasks_pc.length })
-          enqueueBatch(project.id, tasks_pc).catch((err) => {
-            const msg = err instanceof Error ? err.message : String(err)
-            log.error("product enqueue failed", { error: msg })
-            setImportError(`\u26a0\ufe0f \u6392\u961f\u5931\u8d25: ${msg}`)
-          })
-        } else if (!canIngest) {
-          setImportError("\u26a0\ufe0f LLM \u672a\u914d\u7f6e\uff0c\u6587\u4ef6\u5df2\u4e0a\u4f20\u4f46\u65e0\u6cd5\u81ea\u52a8\u89e3\u6790\u3002")
         }
-        setTimeout(() => setImportStatus(null), 5000)
+        await Promise.all(Array.from({ length: Math.min(4, files.length) }, () => uploadWorker()))
+        const errorCount = uploadErrors.length
+        log.info("product upload done", { dest: destDir, success: importedPaths.length, errors: errorCount })
+        if (importedPaths.length === 0) {
+          throw new Error(`全部 ${files.length} 个文件上传失败`)
+        }
+        await loadSources()
+        await startProductIngestBatch(batch.batch_id)
+        setImportStatus(
+          errorCount > 0
+            ? `已提交后台抽取：${importedPaths.length} 个文件，${errorCount} 个上传失败`
+            : `✓ ${category} > ${productName}：已提交后台抽取`,
+        )
+        setTimeout(() => setImportStatus(null), 8000)
       } catch (err) {
         log.error("product upload failed", { dest: destDir, error: extractErrMsg(err) })
         setImportError(`上传失败: ${extractErrMsg(err)}`)

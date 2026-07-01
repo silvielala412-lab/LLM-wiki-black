@@ -574,6 +574,7 @@ interface ProductCatalogBundleFile {
   path?: string
   size?: number
   original_relative_path?: string
+  document_type?: string
 }
 
 interface ProductCatalogBundleManifest {
@@ -891,6 +892,7 @@ async function resolveProductCatalogExtractionSource(input: {
       `<!-- PRODUCT_SOURCE_BEGIN: ${name} -->`,
       `# 来源文件：${name}`,
       `路径：${relPath}`,
+      file.document_type ? `文档类型：${file.document_type}` : "",
       metaFacts,
       prepared.sourceContent.trim(),
       `<!-- PRODUCT_SOURCE_END: ${name} -->`,

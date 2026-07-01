@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use tokio::sync::{broadcast, Mutex, Semaphore};
 
 /// Server-level LLM / embedding / vision configuration.
 /// Read once at startup from environment variables.
@@ -62,8 +63,8 @@ impl LlmServerConfig {
     pub fn from_env() -> Self {
         let api_key = Self::opt_env("LLM_API_KEY");
         let dashscope_api_key = Self::opt_env("DASHSCOPE_API_KEY");
-        let embedding_api_key = Self::opt_env("EMBEDDING_API_KEY")
-            .or_else(|| dashscope_api_key.clone());
+        let embedding_api_key =
+            Self::opt_env("EMBEDDING_API_KEY").or_else(|| dashscope_api_key.clone());
         let vision_endpoint = Self::opt_env("VISION_ENDPOINT");
         let vision_uses_dashscope = vision_endpoint
             .as_deref()
@@ -92,8 +93,7 @@ impl LlmServerConfig {
             model: Self::opt_env("LLM_MODEL"),
             endpoint: Self::opt_env("LLM_ENDPOINT"),
             api_mode: Self::opt_env("LLM_API_MODE"),
-            max_context_size: Self::opt_env("LLM_MAX_CONTEXT")
-                .and_then(|v| v.parse().ok()),
+            max_context_size: Self::opt_env("LLM_MAX_CONTEXT").and_then(|v| v.parse().ok()),
             embedding_endpoint: Self::opt_env("EMBEDDING_ENDPOINT"),
             embedding_model: Self::opt_env("EMBEDDING_MODEL"),
             has_embedding_api_key: embedding_api_key.is_some(),
@@ -127,7 +127,9 @@ impl LlmServerConfig {
     }
 
     pub fn embedding_api_key(&self) -> Option<&str> {
-        self.embedding_api_key.as_deref().or_else(|| self.api_key.as_deref())
+        self.embedding_api_key
+            .as_deref()
+            .or_else(|| self.api_key.as_deref())
     }
 
     pub fn ocr_api_key(&self) -> Option<&str> {
@@ -146,6 +148,14 @@ pub struct AppState {
     pub llm_config: LlmServerConfig,
     /// Shared HTTP client — reuse connection pools across requests.
     pub http_client: reqwest::Client,
+    /// Limits expensive server-side ingestion workers across all projects.
+    pub ingest_workers: Arc<Semaphore>,
+    /// Serializes ingestion inside one project while allowing different projects to run concurrently.
+    pub ingest_project_locks: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
+    /// Protects read-modify-write updates to persisted batch JSON files.
+    pub ingest_store_lock: Arc<Mutex<()>>,
+    /// Broadcasts persisted ingestion status changes to browser clients.
+    pub ingest_events: broadcast::Sender<String>,
 }
 
 impl AppState {
@@ -155,7 +165,30 @@ impl AppState {
             .timeout(std::time::Duration::from_secs(300)) // 5 min for large PDFs
             .build()
             .expect("Failed to build HTTP client");
-        Self { data_root, allowed_data_roots, llm_config, http_client }
+        let worker_concurrency = std::env::var("INGEST_WORKER_CONCURRENCY")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(2);
+        let (ingest_events, _) = broadcast::channel(512);
+        Self {
+            data_root,
+            allowed_data_roots,
+            llm_config,
+            http_client,
+            ingest_workers: Arc::new(Semaphore::new(worker_concurrency)),
+            ingest_project_locks: Arc::new(Mutex::new(HashMap::new())),
+            ingest_store_lock: Arc::new(Mutex::new(())),
+            ingest_events,
+        }
+    }
+
+    pub async fn project_ingest_semaphore(&self, project_id: &str) -> Arc<Semaphore> {
+        let mut locks = self.ingest_project_locks.lock().await;
+        locks
+            .entry(project_id.to_string())
+            .or_insert_with(|| Arc::new(Semaphore::new(1)))
+            .clone()
     }
 }
 

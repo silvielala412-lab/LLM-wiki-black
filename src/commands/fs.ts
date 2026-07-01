@@ -28,7 +28,19 @@ export {
   vectorDropLegacy,
   uploadFile,
   uploadFiles,
+  createProductIngestBatch,
+  uploadProductIngestFile,
+  startProductIngestBatch,
+  retryProductIngestBatch,
+  getProductIngestBatch,
+  listProductIngestBatches,
   convertFileSrc,
 } from "@/commands/api-client"
 
-export type { FileBase64 } from "@/commands/api-client"
+export type {
+  FileBase64,
+  ProductIngestBatch,
+  ProductIngestBatchFile,
+  ProductIngestBatchStatus,
+  CreateProductIngestBatchInput,
+} from "@/commands/api-client"

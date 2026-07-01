@@ -13,6 +13,7 @@ server/
 # Dev artifacts
 node_modules/
 dist/
+worker-dist/
 server-rs/target/
 __pycache__/
 *.pyc

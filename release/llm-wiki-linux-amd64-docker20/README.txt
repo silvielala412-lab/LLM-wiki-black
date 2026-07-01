@@ -25,6 +25,8 @@ Notes:
   - deploy.sh makes ./data writable by the container user (UID 1001).
   - API keys are not included in the image.
   - The model endpoint must be reachable from inside the container.
+  - The image includes Node.js 20 for server-side product batch ingestion.
+  - INGEST_WORKER_CONCURRENCY controls concurrent extraction jobs (default: 2).
   - localhost inside the container means the container itself. Use an intranet IP,
     a Compose service name, or host.docker.internal on Docker 20.10+.
   - Persistent project data is stored in ./data.

@@ -9,7 +9,7 @@
 
 import { chunkMarkdown, type Chunk } from "@/lib/text-chunker"
 import { streamChat } from "@/lib/llm-client"
-import { createDirectory, writeFile, readFile, listDirectory } from "@/commands/fs"
+import { createDirectory, deleteFile, writeFile, readFile, listDirectory } from "@/commands/fs"
 import { normalizePath } from "@/lib/path-utils"
 import { getLogger } from "@/lib/logger"
 import { useActivityStore } from "@/stores/activity-store"
@@ -191,7 +191,7 @@ const FIELD_EVIDENCE_KEYWORDS: Record<string, string[]> = {
   "投保年龄": ["投保年龄", "出生", "周岁", "最低", "最高"],
   "产品别称": ["简称", "别称", "别名", "俗称", "推广名", "产品简称"],
   "产品简介": ["产品提供", "保障", "保险责任", "阅读指引", "产品"],
-  "产品特色": ["领取方式", "领取期间", "保证给付", "保单贷款", "现金价值", "权益"],
+  "产品特色": ["产品特色", "产品亮点", "核心优势", "保障亮点", "特色保障", "产品优势"],
   "QA": ["Q&A", "QA", "问答", "常见问题", "客户问", "问：", "答：", "如何解释", "异议", "话术"],
   "保单权益": ["重要权益", "保单贷款", "自动垫交", "退保", "现金价值", "受益人"],
   "投保范围": ["投保范围", "被保险人", "投保年龄", "周岁"],
@@ -213,27 +213,27 @@ const FIELD_EVIDENCE_KEYWORDS: Record<string, string[]> = {
 const REFINE_EXTRA_FIELDS_BY_MODULE: Record<string, string[]> = {
   "产品基础信息": [
     "险种代码", "险种简称", "险种名称", "产品别称", "产品类别", "产品类型", "主附加险",
-    "产品简介", "产品特色", "QA", "保单权益", "交费期限", "交费方式", "宽限期",
+    "产品简介", "保单权益", "交费期限", "交费方式", "宽限期",
     "保障期间", "保障期间分类", "投保年龄", "保险期间和续保", "投保范围",
   ],
-  "QA": ["QA", "产品别称", "产品简介", "产品特色"],
+  "QA": ["QA", "产品别称"],
   "投保年龄": ["投保年龄", "保障人群", "投保范围"],
   "投保人群": ["适用人群", "保障人群", "投保范围"],
   "犹豫期": ["犹豫期", "犹豫期及合同解除（退保）"],
   "退保": ["犹豫期及合同解除（退保）", "保单权益"],
   "身故保险金": [
     "保什么", "身故保险金", "全残保障", "意外身故", "疾病身故", "满期返还",
-    "特殊免责", "购买限制", "保单权益", "产品特色",
+    "特殊免责", "购买限制", "保单权益",
   ],
   "通用责任免除": ["特殊免责", "免责少"],
   "未成年人保额限制": ["购买限制"],
   "年金给付规则": [
-    "保什么", "养老金", "保证领取", "领取规则", "领取期间", "产品特色",
+    "保什么", "养老金", "保证领取", "领取规则", "领取期间",
     "保单权益", "领钱时间早", "教育金",
   ],
-  "领取期间": ["领取期间", "领取规则", "保障期间", "保险期间和续保", "产品特色"],
-  "领取明细示例": ["领取期间", "领取规则", "养老金", "产品特色"],
-  "保单贷款": ["保单贷款", "高流动性", "现金价值", "保单权益", "产品特色"],
+  "领取期间": ["领取期间", "领取规则", "保障期间", "保险期间和续保"],
+  "领取明细示例": ["领取期间", "领取规则", "养老金"],
+  "保单贷款": ["保单贷款", "高流动性", "现金价值", "保单权益"],
   "减保": ["部分领取", "高流动性", "现金价值", "保单权益"],
   "万能账户规则": ["万能账户", "产品利率", "保证利率", "初始费用", "领取手续费", "部分领取", "高流动性"],
   "保证利率": ["保证利率", "产品利率"],
@@ -254,7 +254,8 @@ const FIELD_DIRECT_EXTRACTION_HINTS: Record<string, string> = {
   "满期返还": "仅原文明示满期保险金、满期返还或保险期间届满返还时填写。",
   "适用人群": "优先从投保人群、投保年龄、投被保关系中抽取；不要从营销话术臆测。",
   "产品别称": "只抽原文明确出现的产品简称、别称、俗称、推广名；不要根据产品名称自行缩写。",
-  "QA": "提取产品资料中的常见问题、客户问答、销售解释或异议处理；保留问答语义，可按 Q/A 或要点归纳。",
+  "QA": "仅从文件名明确属于 QA、Q&A、产品问答、销售问答或常见问题的文档中抽取；每个问题必须与对应答案配对，非问答文件留空。",
+  "产品特色": "仅从产品说明书中明确的产品特色、亮点、核心优势或特色保障段落提炼；输出 2-6 条简洁亮点，不要把整段保险责任、免责条款或通用投保规则改写成产品特色。",
   "投保范围": "提取具体被保险人范围、投保年龄、投保限制或投被保关系；不要只写“见条款/见投保范围”。",
   "保障人群": "可根据明确投保年龄映射儿童/成人/老人等人群；不要输出“见投保范围”。",
   "投保职业": "只抽具体可投职业类别、拒保职业类别或职业限制；如果证据只有投保年龄或“见投保范围/见条款”，不要输出。",
@@ -294,7 +295,7 @@ const LONG_FIELD_MODULE_MAP: Record<string, string[]> = {
   ],
   "报销范围": ["一般住院医疗", "住院前后门急诊", "特殊门诊医疗", "门诊手术医疗"],
   "投保范围": ["投保年龄", "投保人群", "投保职业"],
-  "QA": ["QA", "产品基础信息"],
+  "QA": ["QA"],
   "保险期间和续保": ["6年保证续保"],
   "犹豫期及合同解除（退保）": ["犹豫期", "退保"],
 }
@@ -304,7 +305,6 @@ const RULE_DERIVED_FIELD_NAMES = new Set([
   "保障期间分类",
   "高流动性",
   "产品简介",
-  "产品特色",
   "保单权益",
   "投保范围",
 ])
@@ -1013,6 +1013,7 @@ function buildModuleFile(
   category: InsuranceCategoryType,
   productName: string,
   sourceRefs?: readonly string[],
+  productAliases?: readonly string[],
 ): string {
   const hasValues = moduleHasExtractedValues(m)
   const lines: string[] = []
@@ -1021,6 +1022,7 @@ function buildModuleFile(
   lines.push(`knowledge_domain: product_catalog`)
   lines.push(`insurance_category: "${category}"`)
   lines.push(`product_name: "${productName}"`)
+  lines.push(`aliases: ${yamlInlineStringList(normalizeProductAliases(productAliases, productName))}`)
   lines.push(`module_name: "${m.moduleName}"`)
   lines.push(`concept_name: "${m.moduleName}"`)
   lines.push(`entity_type: "${moduleDef.entityType}"`)
@@ -1059,6 +1061,31 @@ function normalizeSourceRefs(sourceRefs?: readonly string[]): string[] {
     result.push(normalized)
   }
   return result
+}
+
+function normalizeProductAliases(aliases?: readonly string[], productName = ""): string[] {
+  return normalizeSourceRefs(aliases)
+    .map(alias => alias.replace(/^['"]|['"]$/g, "").trim())
+    .filter(alias => alias && alias !== productName)
+}
+
+function productAliasesFromValue(value: string | undefined, productName: string): string[] {
+  if (isMissingFieldValue(value)) return []
+  return normalizeProductAliases(
+    (value ?? "")
+      .replace(/<br\s*\/?>/gi, "\n")
+      .split(/[\n、，,；;|]+/)
+      .map(alias => alias.trim())
+      .filter(Boolean),
+    productName,
+  )
+}
+
+function productAliasesFromProfile(profileMarkdown: string, productName: string): string[] {
+  return productAliasesFromValue(
+    parseProductProfileFieldValues(profileMarkdown).get("产品别称"),
+    productName,
+  )
 }
 
 function appendSourceFrontmatter(lines: string[], sourceRefs?: readonly string[]): void {
@@ -1106,6 +1133,105 @@ function writeFrontmatterArrayValue(content: string, key: string, values: readon
   return `${open}${body}\n${line}${close}${content.slice(fmMatch[0].length)}`
 }
 
+async function markdownFilesIn(directory: string): Promise<CatalogFileEntry[]> {
+  try {
+    const entries = await listDirectory(directory) as CatalogFileEntry[]
+    return entries.filter(entry => !entry.is_dir && entry.name.endsWith(".md"))
+  } catch {
+    return []
+  }
+}
+
+async function syncProductAliasesForProduct(
+  projectPath: string,
+  category: InsuranceCategoryType,
+  productName: string,
+  aliases: readonly string[],
+): Promise<string[]> {
+  const normalizedAliases = normalizeProductAliases(aliases, productName)
+  const roots = [
+    `${projectPath}/wiki/product_catalog`,
+    `${projectPath}/wiki/source_text`,
+  ]
+  const written: string[] = []
+  for (const root of roots) {
+    const candidates = (await markdownFilesIn(root))
+      .filter(file => file.name.includes(productName))
+    for (const file of candidates) {
+      const content = await readFile(file.path).catch(() => null)
+      if (!content) continue
+      if (frontmatterValue(content, "insurance_category") !== category) continue
+      if (frontmatterValue(content, "product_name") !== productName) continue
+      const updated = writeFrontmatterArrayValue(content, "aliases", normalizedAliases)
+      if (updated === content) continue
+      await writeFile(file.path, updated)
+      written.push(file.path)
+    }
+  }
+  return written
+}
+
+export async function backfillProductCatalogAliases(
+  projectPath: string,
+  scope?: { category?: string; productName?: string },
+): Promise<number> {
+  const pp = normalizePath(projectPath)
+  const catalogDir = `${pp}/wiki/product_catalog`
+  const records: Array<{
+    file: CatalogFileEntry
+    content: string
+    category: InsuranceCategoryType
+    productName: string
+  }> = []
+  const aliasCandidates = new Map<string, { aliases: string[]; priority: number }>()
+
+  for (const file of await markdownFilesIn(catalogDir)) {
+    const content = await readFile(file.path).catch(() => null)
+    if (!content) continue
+    const category = frontmatterValue(content, "insurance_category")
+    const productName = frontmatterValue(content, "product_name")
+    if (!isInsuranceCategory(category) || !productName) continue
+    if (scope?.category && category !== scope.category) continue
+    if (scope?.productName && productName !== scope.productName) continue
+    records.push({ file, content, category, productName })
+
+    const fieldName = frontmatterValue(content, "field_name")
+    const domain = frontmatterValue(content, "knowledge_domain")
+    const priority = fieldName === "产品别称" ? 2 : domain === "product_catalog" ? 1 : 0
+    if (priority === 0) continue
+    const value = fieldName === "产品别称"
+      ? getFieldRowValue(content, "产品别称")
+      : parseProductProfileFieldValues(content).get("产品别称")
+    const aliases = productAliasesFromValue(value, productName)
+    const key = `${category}\0${productName}`
+    const existing = aliasCandidates.get(key)
+    if (!existing || (aliases.length > 0 && (existing.aliases.length === 0 || priority >= existing.priority))) {
+      aliasCandidates.set(key, { aliases, priority })
+    }
+  }
+
+  for (const file of await markdownFilesIn(`${pp}/wiki/source_text`)) {
+    const content = await readFile(file.path).catch(() => null)
+    if (!content) continue
+    const category = frontmatterValue(content, "insurance_category")
+    const productName = frontmatterValue(content, "product_name")
+    if (!isInsuranceCategory(category) || !productName) continue
+    if (scope?.category && category !== scope.category) continue
+    if (scope?.productName && productName !== scope.productName) continue
+    records.push({ file, content, category, productName })
+  }
+
+  let updatedCount = 0
+  for (const record of records) {
+    const aliases = aliasCandidates.get(`${record.category}\0${record.productName}`)?.aliases ?? []
+    const updated = writeFrontmatterArrayValue(record.content, "aliases", aliases)
+    if (updated === record.content) continue
+    await writeFile(record.file.path, updated)
+    updatedCount++
+  }
+  return updatedCount
+}
+
 function preserveExistingSources(newContent: string, existingContent: string | null): string {
   if (!existingContent) return newContent
   const existingSources = parseSources(existingContent)
@@ -1123,7 +1249,13 @@ function preserveExistingFieldLineage(newContent: string, existingContent: strin
 interface ProductSourceSegment {
   name: string
   ref: string
+  documentType?: string
   text: string
+}
+
+interface ScopedProductSource {
+  content: string
+  refs: string[]
 }
 
 function normalizeEvidenceText(value: string): string {
@@ -1138,13 +1270,146 @@ function productSourceSegments(sourceContent: string): ProductSourceSegment[] {
     const name = match[1].trim()
     const text = match[2]
     const pathMatch = text.match(/路径[:：]\s*([^\r\n]+)/)
+    const documentTypeMatch = text.match(/文档类型[:：]\s*([^\r\n]+)/)
     segments.push({
       name,
       ref: (pathMatch?.[1] ?? name).trim(),
+      documentType: documentTypeMatch?.[1]?.trim(),
       text,
     })
   }
   return segments
+}
+
+export function isQaDocumentName(name: string): boolean {
+  const stem = name.replace(/\.[^.]+$/i, "")
+  return /(QA|Q&A|FAQ)/i.test(stem)
+    || /(产品问答|销售问答|常见问答|常见问题|客户问答|问答手册|异议处理)/.test(stem)
+}
+
+export function isProductDescriptionDocumentName(name: string): boolean {
+  return /(产品说明书|产品介绍书|产品简介|产品手册)/.test(name.replace(/\.[^.]+$/i, ""))
+}
+
+export function documentScopedSource(
+  sourceContent: string,
+  fileName: string,
+  predicate: (name: string) => boolean,
+): ScopedProductSource {
+  const segments = productSourceSegments(sourceContent)
+  if (segments.length === 0) {
+    return predicate(fileName)
+      ? { content: sourceContent, refs: [fileName] }
+      : { content: "", refs: [] }
+  }
+  const selected = segments.filter(segment =>
+    predicate(segment.name) || predicate(segment.documentType ?? ""),
+  )
+  return {
+    content: selected.map(segment => segment.text).join("\n\n---\n\n"),
+    refs: normalizeSourceRefs(selected.map(segment => segment.ref)),
+  }
+}
+
+function removeKeyFieldRow(markdown: string, fieldName: string): string {
+  return markdown
+    .split(/\r?\n/)
+    .filter(line => splitMarkdownTableRow(line)?.[0] !== fieldName)
+    .join("\n")
+}
+
+function removeDocumentScopedFields(results: SectionResult[]): void {
+  for (const result of results) {
+    for (const fragment of result.fragments) {
+      fragment.markdown = removeKeyFieldRow(
+        removeKeyFieldRow(fragment.markdown, "QA"),
+        "产品特色",
+      )
+    }
+  }
+}
+
+async function extractDocumentScopedField(
+  fieldName: "QA" | "产品特色",
+  source: ScopedProductSource,
+  category: InsuranceCategoryType,
+  productName: string,
+  llmConfig: LlmConfig,
+  signal?: AbortSignal,
+): Promise<{ value: string; evidence: string } | null> {
+  if (!source.content.trim()) return null
+  const evidence = buildRefineSourceExcerpt(
+    source.content,
+    fieldName,
+    [fieldName],
+    undefined,
+    fieldName === "QA" ? 30000 : 20000,
+  )
+  const task = fieldName === "QA"
+    ? [
+        "只抽取文档中明确存在的保险产品问答对。",
+        "保留所有有实际答案的问题，每组严格写成两行：Q：问题；A：答案。",
+        "不要把普通条款、字段清单、保障责任摘要或销售参数改写成问答。",
+      ].join("\n")
+    : [
+        "只根据产品说明书中明确的产品特色、产品亮点、核心优势或特色保障内容提炼。",
+        "输出 2-6 条简洁、可区分的产品亮点，可使用分号分隔。",
+        "不要把整段保险责任、免责条款、投保规则或理赔计算公式当作产品特色。",
+        "说明书没有明确特色或亮点时不要自行总结。",
+      ].join("\n")
+  const response = await streamText(llmConfig, [
+    {
+      role: "system",
+      content: `你是保险产品知识抽取专家。目标字段：${fieldName}。\n${task}\n没有合格内容时输出 EMPTY。`,
+    },
+    {
+      role: "user",
+      content: [
+        `险种：${category}`,
+        `产品：${productName}`,
+        "只按以下格式输出，不要补充解释：",
+        "---VALUE---",
+        "字段值或 EMPTY",
+        "---END---",
+        "",
+        "文档证据：",
+        evidence,
+      ].join("\n"),
+    },
+  ], signal, { temperature: 0.1, max_tokens: fieldName === "QA" ? 8000 : 2500 })
+  const match = response.match(/---VALUE---\s*([\s\S]*?)\s*---END---/i)
+  const value = sanitizeFieldValue((match?.[1] ?? "").trim())
+  if (!value || /^EMPTY$/i.test(value)) return null
+  if (!isFieldValueCompatible(fieldName, value)) return null
+  return { value, evidence }
+}
+
+function scopedFieldSectionResult(
+  moduleName: "QA" | "产品基础信息",
+  fieldName: "QA" | "产品特色",
+  value: string,
+  evidence: string,
+  sectionIndex: number,
+): SectionResult {
+  const tableValue = value.replace(/\r?\n/g, "<br>").replace(/\|/g, "\\|")
+  return {
+    sectionIndex,
+    fragments: [{
+      moduleName,
+      sectionIndex,
+      markdown: [
+        "## 关键字段",
+        "",
+        "| 字段 | 值 |",
+        "|---|---|",
+        `| ${fieldName} | ${tableValue} |`,
+        "",
+        "## 详细条款原文",
+        "",
+        evidence,
+      ].join("\n"),
+    }],
+  }
 }
 
 function inferFieldValueSourceRefs(
@@ -1266,6 +1531,7 @@ function buildProductFieldFile(
   baseFieldNames: Set<string>,
   sourceRefs?: readonly string[],
   valueSourceRefs?: readonly string[],
+  productAliases?: readonly string[],
 ): string {
   const hasValue = !isMissingFieldValue(value)
   const fieldScope = fieldScopeLabel(field.fieldName, baseFieldNames, category)
@@ -1284,6 +1550,7 @@ function buildProductFieldFile(
   lines.push(`knowledge_domain: product_catalog_field`)
   lines.push(`insurance_category: ${yamlString(category)}`)
   lines.push(`product_name: ${yamlString(productName)}`)
+  lines.push(`aliases: ${yamlInlineStringList(normalizeProductAliases(productAliases, productName))}`)
   lines.push(`field_name: ${yamlString(field.fieldName)}`)
   lines.push(`field_scope: ${yamlString(fieldScope)}`)
   lines.push(`concept_name: ${yamlString(field.fieldName)}`)
@@ -1360,15 +1627,31 @@ function buildProductFieldFiles(
   productName: string,
   sourceRefs?: readonly string[],
   sourceContent = "",
+  scopedFieldSourceRefs: Partial<Record<"QA" | "产品特色", string[]>> = {},
 ): Array<{ fileName: string; content: string; hasValue: boolean }> {
   const fieldValues = parseProductProfileFieldValues(profileMarkdown)
   const baseFieldNames = new Set(BASE_FIELDS.map(f => f.fieldName))
+  const productAliases = productAliasesFromValue(fieldValues.get("产品别称"), productName)
   return (PRODUCT_FIELDS[category] ?? []).map(field => {
     const value = fieldValues.get(field.fieldName) ?? EMPTY_FIELD_VALUE
-    const valueSourceRefs = inferFieldValueSourceRefs(field.fieldName, value, sourceContent, sourceRefs ?? [])
+    const scopedRefs = field.fieldName === "QA" || field.fieldName === "产品特色"
+      ? scopedFieldSourceRefs[field.fieldName]
+      : undefined
+    const valueSourceRefs = scopedRefs
+      ? normalizeSourceRefs(scopedRefs)
+      : inferFieldValueSourceRefs(field.fieldName, value, sourceContent, sourceRefs ?? [])
     return {
       fileName: `${category}-${productName}-字段-${sanitizeFileNamePart(field.fieldName)}.md`,
-      content: buildProductFieldFile(field, value, category, productName, baseFieldNames, sourceRefs, valueSourceRefs),
+      content: buildProductFieldFile(
+        field,
+        value,
+        category,
+        productName,
+        baseFieldNames,
+        sourceRefs,
+        valueSourceRefs,
+        productAliases,
+      ),
       hasValue: !isMissingFieldValue(value),
     }
   })
@@ -1394,6 +1677,8 @@ interface ProductCatalogWriteContext {
   cleanedContent: string
   fileName: string
   sourceRefs: string[]
+  qaSourceContent: string
+  scopedFieldSourceRefs: Partial<Record<"QA" | "产品特色", string[]>>
   activityId: string
 }
 
@@ -1547,6 +1832,7 @@ async function writeProductSourceText(
   cleanedContent: string,
   sectionCount: number,
   mode: ProductCatalogExtractionMode,
+  productAliases?: readonly string[],
 ): Promise<string | null> {
   try {
     const sourceDir = `${projectPath}/wiki/source_text`
@@ -1562,6 +1848,7 @@ async function writeProductSourceText(
       `knowledge_domain: source_text`,
       `insurance_category: "${category}"`,
       `product_name: "${productName}"`,
+      `aliases: ${yamlInlineStringList(normalizeProductAliases(productAliases, productName))}`,
       `source_file: "${fileName}"`,
       `total_chars: ${cleanedContent.length}`,
       `total_sections: ${sectionCount}`,
@@ -1793,7 +2080,6 @@ function buildMainFile(
       if (coverageLabels.length > 0) {
         setMainFieldIfMissing("产品简介", `${productName}提供${coverageLabels.join("、")}保障。`)
       }
-      setMainFieldIfMissing("产品特色", responsibilityParts.join("；"))
     }
 
     setMainFieldIfMissing("全残保障", disabilityValue)
@@ -1848,7 +2134,6 @@ function buildMainFile(
       loanRule ? "支持保单贷款" : undefined,
     ])
     if (featureParts.length > 0) {
-      setMainFieldIfMissing("产品特色", featureParts.join("；"))
       setMainFieldIfMissing("保单权益", featureParts.join("；"))
     }
   }
@@ -2052,7 +2337,11 @@ function buildMainFile(
     lines.push("")
   }
 
-  return lines.join("\n")
+  return writeFrontmatterArrayValue(
+    lines.join("\n"),
+    "aliases",
+    productAliasesFromValue(shortFieldLookup.get("产品别称"), productName),
+  )
 }
 
 // ── Top-level orchestrator ────────────────────────────────────────────────
@@ -2073,6 +2362,7 @@ async function writeFullProductCatalogOutputs(ctx: ProductCatalogWriteContext): 
     ctx.sourceContent,
     ctx.sourceRefs,
   )
+  const productAliases = productAliasesFromProfile(mainContent, ctx.productName)
   const mainFileName = `${ctx.category}-${ctx.productName}.md`
   const mainPath = `${ctx.catalogDir}/${mainFileName}`
   try {
@@ -2082,7 +2372,14 @@ async function writeFullProductCatalogOutputs(ctx: ProductCatalogWriteContext): 
     log.error("failed to write main file", { error: String(err) })
   }
 
-  for (const fieldPage of buildProductFieldFiles(mainContent, ctx.category, ctx.productName, ctx.sourceRefs, ctx.sourceContent)) {
+  for (const fieldPage of buildProductFieldFiles(
+    mainContent,
+    ctx.category,
+    ctx.productName,
+    ctx.sourceRefs,
+    ctx.sourceContent,
+    ctx.scopedFieldSourceRefs,
+  )) {
     const fieldPath = `${ctx.catalogDir}/${fieldPage.fileName}`
     const fieldRelative = `wiki/product_catalog/${fieldPage.fileName}`
     try {
@@ -2096,7 +2393,17 @@ async function writeFullProductCatalogOutputs(ctx: ProductCatalogWriteContext): 
   for (const m of ctx.foundModules) {
     const moduleDef = ctx.allModules.find(mod => mod.moduleName === m.moduleName)
     if (!moduleDef) continue
-    const content = buildModuleFile(m, moduleDef, ctx.category, ctx.productName, ctx.sourceRefs)
+    const moduleSourceRefs = m.moduleName === "QA"
+      ? ctx.scopedFieldSourceRefs.QA
+      : ctx.sourceRefs
+    const content = buildModuleFile(
+      m,
+      moduleDef,
+      ctx.category,
+      ctx.productName,
+      moduleSourceRefs,
+      productAliases,
+    )
     const moduleFileName = `${ctx.category}-${ctx.productName}-${m.moduleName}.md`
     const modulePath = `${ctx.catalogDir}/${moduleFileName}`
     const moduleRelative = `wiki/product_catalog/${moduleFileName}`
@@ -2116,8 +2423,15 @@ async function writeFullProductCatalogOutputs(ctx: ProductCatalogWriteContext): 
     ctx.cleanedContent,
     ctx.sectionCount,
     "rebuild",
+    productAliases,
   )
   if (sourcePath) writtenPaths.push(sourcePath)
+  await syncProductAliasesForProduct(
+    ctx.projectPath,
+    ctx.category,
+    ctx.productName,
+    productAliases,
+  )
   return writtenPaths
 }
 
@@ -2152,13 +2466,17 @@ async function writeIncrementalProductCatalogOutputs(ctx: ProductCatalogWriteCon
     `${ctx.sourceContent}\n\n${ctx.cleanedContent}`,
     ctx.category,
   )
+  directIncomingValues.delete("QA")
+  directIncomingValues.delete("产品特色")
   for (const [fieldName, value] of directIncomingValues) {
     incomingValues.set(fieldName, value)
   }
-  const directQaValue = extractDirectQaValue(`${ctx.sourceContent}\n\n${ctx.cleanedContent}`)
+  const directQaValue = extractDirectQaValue(ctx.qaSourceContent)
   if (directQaValue) {
     incomingValues.set("QA", directQaValue)
   }
+  const existingProductAliases = productAliasesFromValue(existingValues.get("产品别称"), ctx.productName)
+  const incomingProductAliases = productAliasesFromValue(incomingValues.get("产品别称"), ctx.productName)
   const identityReviews = shouldAbortIncrementalForIdentity(
     existingValues,
     incomingValues,
@@ -2177,8 +2495,15 @@ async function writeIncrementalProductCatalogOutputs(ctx: ProductCatalogWriteCon
       ctx.cleanedContent,
       ctx.sectionCount,
       "incremental",
+      existingProductAliases,
     )
     if (sourcePath) writtenPaths.push(sourcePath)
+    await syncProductAliasesForProduct(
+      ctx.projectPath,
+      ctx.category,
+      ctx.productName,
+      existingProductAliases,
+    )
     activity.updateItem(ctx.activityId, {
       detail: `增量更新已暂停：发现 ${identityReviews.length} 个产品身份冲突，未覆盖现有知识。`,
     })
@@ -2190,13 +2515,31 @@ async function writeIncrementalProductCatalogOutputs(ctx: ProductCatalogWriteCon
   let fieldFilledCount = 0
   let sameFieldCount = 0
   let conflictCount = 0
-  let updatedMain = ensureSourceInFrontmatter(existingMain, ctx.sourceRefs)
+  let productAliases = existingProductAliases
+  if (productAliases.length === 0) {
+    productAliases = incomingProductAliases
+  }
+  let updatedMain = writeFrontmatterArrayValue(
+    ensureSourceInFrontmatter(existingMain, ctx.sourceRefs),
+    "aliases",
+    productAliases,
+  )
 
   for (const m of ctx.foundModules) {
     if (!moduleHasExtractedValues(m)) continue
     const moduleDef = ctx.allModules.find(mod => mod.moduleName === m.moduleName)
     if (!moduleDef) continue
-    const incomingContent = buildModuleFile(m, moduleDef, ctx.category, ctx.productName, ctx.sourceRefs)
+    const moduleSourceRefs = m.moduleName === "QA"
+      ? ctx.scopedFieldSourceRefs.QA
+      : ctx.sourceRefs
+    const incomingContent = buildModuleFile(
+      m,
+      moduleDef,
+      ctx.category,
+      ctx.productName,
+      moduleSourceRefs,
+      productAliases,
+    )
     const incomingFields = parseKeyFieldsTable(incomingContent)
 
     const moduleFileName = `${ctx.category}-${ctx.productName}-${m.moduleName}.md`
@@ -2280,7 +2623,12 @@ async function writeIncrementalProductCatalogOutputs(ctx: ProductCatalogWriteCon
       })
       continue
     }
-    const incomingValueSourceRefs = inferFieldValueSourceRefs(field.fieldName, incomingValue!, ctx.sourceContent, ctx.sourceRefs)
+    const scopedRefs = field.fieldName === "QA" || field.fieldName === "产品特色"
+      ? ctx.scopedFieldSourceRefs[field.fieldName]
+      : undefined
+    const incomingValueSourceRefs = scopedRefs
+      ? normalizeSourceRefs(scopedRefs)
+      : inferFieldValueSourceRefs(field.fieldName, incomingValue!, ctx.sourceContent, ctx.sourceRefs)
     const incomingFieldContent = buildProductFieldFile(
       field,
       incomingValue!,
@@ -2289,6 +2637,7 @@ async function writeIncrementalProductCatalogOutputs(ctx: ProductCatalogWriteCon
       baseFieldNames,
       ctx.sourceRefs,
       incomingValueSourceRefs,
+      productAliases,
     )
 
     if (isMissingFieldValue(existingValue)) {
@@ -2332,6 +2681,8 @@ async function writeIncrementalProductCatalogOutputs(ctx: ProductCatalogWriteCon
   }
 
   if (updatedMain !== existingMain) {
+    productAliases = productAliasesFromProfile(updatedMain, ctx.productName)
+    updatedMain = writeFrontmatterArrayValue(updatedMain, "aliases", productAliases)
     await writeFile(mainPath, updatedMain)
     writtenPaths.push(mainRelative)
   }
@@ -2344,8 +2695,15 @@ async function writeIncrementalProductCatalogOutputs(ctx: ProductCatalogWriteCon
     ctx.cleanedContent,
     ctx.sectionCount,
     "incremental",
+    productAliases,
   )
   if (sourcePath) writtenPaths.push(sourcePath)
+  await syncProductAliasesForProduct(
+    ctx.projectPath,
+    ctx.category,
+    ctx.productName,
+    productAliases,
+  )
 
   if (reviewItems.length > 0) {
     useReviewStore.getState().addItems(reviewItems)
@@ -2385,6 +2743,12 @@ export async function runProductCatalogExtraction(
   // 清洗 OCR 文本（去除代码围栏、重复页眉等），然后按标题结构切分成 sections。
   activity.updateItem(activityId, { detail: "正在预处理文本并切分章节..." })
   const cleanedContent = preprocessOcrText(sourceContent, productName)
+  const qaSource = documentScopedSource(sourceContent, fileName, isQaDocumentName)
+  const productDescriptionSource = documentScopedSource(
+    sourceContent,
+    fileName,
+    isProductDescriptionDocumentName,
+  )
   const sections = splitIntoSections(cleanedContent)
   log.info("文本切分完成", {
     file: fileName,
@@ -2435,7 +2799,7 @@ export async function runProductCatalogExtraction(
   // Build group → modules map for this category
   const groupMap = new Map<string, ProductModule[]>()
   for (const g of GROUP_ORDER) {
-    const members = allModules.filter(m => m.group === g)
+    const members = allModules.filter(m => m.group === g && m.moduleName !== "QA")
     if (members.length > 0) groupMap.set(g, members)
   }
 
@@ -2526,6 +2890,33 @@ export async function runProductCatalogExtraction(
     concurrency: MAX_SECTION_PARALLEL,               // 每批并发数
   })
 
+  // QA and 产品特色 have strict document-level provenance rules. Remove any
+  // values guessed by the generic passes, then run only against matching files.
+  removeDocumentScopedFields(sectionResults)
+  activity.updateItem(activityId, { detail: "正在按文件类型抽取 QA 与产品特色..." })
+  const [qaField, productFeatureField] = await Promise.all([
+    extractDocumentScopedField("QA", qaSource, category, productName, llmConfig, signal),
+    extractDocumentScopedField("产品特色", productDescriptionSource, category, productName, llmConfig, signal),
+  ])
+  if (qaField) {
+    sectionResults.push(scopedFieldSectionResult(
+      "QA",
+      "QA",
+      qaField.value,
+      qaField.evidence,
+      sections.length,
+    ))
+  }
+  if (productFeatureField) {
+    sectionResults.push(scopedFieldSectionResult(
+      "产品基础信息",
+      "产品特色",
+      productFeatureField.value,
+      productFeatureField.evidence,
+      sections.length + 1,
+    ))
+  }
+
 
   // ── Phase 3: Merge ─────────────────────────────────────────
   activity.updateItem(activityId, { detail: "正在跨章节合并..." })
@@ -2568,6 +2959,11 @@ export async function runProductCatalogExtraction(
     cleanedContent,
     fileName,
     sourceRefs,
+    qaSourceContent: qaSource.content,
+    scopedFieldSourceRefs: {
+      QA: qaSource.refs,
+      产品特色: productDescriptionSource.refs,
+    },
     activityId,
   }
   const writtenPaths = mode === "incremental"
@@ -2927,6 +3323,180 @@ function parseCatalogFieldMetadata(content: string): CatalogFieldMetadata | null
     evidenceModules: frontmatterArray(content, "evidence_modules")
       .filter(moduleName => isModuleAllowedForCategory(categoryValue, moduleName)),
   }
+}
+
+export interface DocumentScopedFieldRepairResult {
+  productsScanned: number
+  qaExtracted: number
+  qaCleared: number
+  productFeaturesExtracted: number
+  productFeaturesCleared: number
+}
+
+/**
+ * Rebuilds QA and 产品特色 from retained OCR pages without rerunning the full
+ * product extraction pipeline. This is also the migration path for data that
+ * predates document-level routing for these two fields.
+ */
+export async function repairProductCatalogDocumentScopedFields(
+  projectPath: string,
+  llmConfig: LlmConfig,
+  scope?: { category?: string; productName?: string },
+  signal?: AbortSignal,
+): Promise<DocumentScopedFieldRepairResult> {
+  const pp = normalizePath(projectPath)
+  const catalogDir = `${pp}/wiki/product_catalog`
+  const sourceDir = `${pp}/wiki/source_text`
+  const groups = new Map<string, {
+    category: InsuranceCategoryType
+    productName: string
+    contents: string[]
+    refs: string[]
+    sourceNames: string[]
+  }>()
+
+  for (const file of await markdownFilesIn(sourceDir)) {
+    const content = await readFile(file.path).catch(() => null)
+    if (!content || frontmatterValue(content, "knowledge_domain") !== "source_text") continue
+    const category = frontmatterValue(content, "insurance_category")
+    const productName = frontmatterValue(content, "product_name")
+    if (!isInsuranceCategory(category) || !productName) continue
+    if (scope?.category && category !== scope.category) continue
+    if (scope?.productName && productName !== scope.productName) continue
+
+    const key = `${category}\0${productName}`
+    const group = groups.get(key) ?? {
+      category,
+      productName,
+      contents: [],
+      refs: [],
+      sourceNames: [],
+    }
+    group.contents.push(content)
+    const segments = productSourceSegments(content)
+    group.refs.push(...segments.map(segment => segment.ref))
+    const sourceName = frontmatterValue(content, "source_file") ?? file.name
+    group.sourceNames.push(sourceName)
+    if (segments.length === 0) group.refs.push(sourceName)
+    groups.set(key, group)
+  }
+
+  const result: DocumentScopedFieldRepairResult = {
+    productsScanned: 0,
+    qaExtracted: 0,
+    qaCleared: 0,
+    productFeaturesExtracted: 0,
+    productFeaturesCleared: 0,
+  }
+
+  for (const group of groups.values()) {
+    if (signal?.aborted) break
+    result.productsScanned++
+    const sourceContent = group.contents.join("\n\n---\n\n")
+    const sourceFileName = group.sourceNames.join("+")
+    const qaSource = documentScopedSource(sourceContent, sourceFileName, isQaDocumentName)
+    const productDescriptionSource = documentScopedSource(
+      sourceContent,
+      sourceFileName,
+      isProductDescriptionDocumentName,
+    )
+    const [qaField, productFeatureField] = await Promise.all([
+      extractDocumentScopedField("QA", qaSource, group.category, group.productName, llmConfig, signal),
+      extractDocumentScopedField(
+        "产品特色",
+        productDescriptionSource,
+        group.category,
+        group.productName,
+        llmConfig,
+        signal,
+      ),
+    ])
+
+    const mainFileName = `${group.category}-${group.productName}.md`
+    const mainPath = `${catalogDir}/${mainFileName}`
+    let mainContent = await readFile(mainPath).catch(() => null)
+    if (!mainContent) continue
+    const aliases = productAliasesFromProfile(mainContent, group.productName)
+    const allSourceRefs = normalizeSourceRefs(group.refs)
+    const baseFieldNames = new Set(BASE_FIELDS.map(field => field.fieldName))
+
+    const scopedValues: Array<{
+      fieldName: "QA" | "产品特色"
+      value: string
+      refs: string[]
+    }> = [
+      { fieldName: "QA", value: qaField?.value ?? "", refs: qaSource.refs },
+      { fieldName: "产品特色", value: productFeatureField?.value ?? "", refs: productDescriptionSource.refs },
+    ]
+
+    for (const scoped of scopedValues) {
+      const field = (PRODUCT_FIELDS[group.category] ?? [])
+        .find(candidate => candidate.fieldName === scoped.fieldName)
+      if (!field) continue
+      mainContent = setFirstFieldRow(mainContent, scoped.fieldName, scoped.value)
+      const fieldFileName = `${group.category}-${group.productName}-字段-${sanitizeFileNamePart(scoped.fieldName)}.md`
+      const fieldContent = buildProductFieldFile(
+        field,
+        scoped.value,
+        group.category,
+        group.productName,
+        baseFieldNames,
+        allSourceRefs,
+        scoped.value ? scoped.refs : [],
+        aliases,
+      )
+      await writeFile(`${catalogDir}/${fieldFileName}`, fieldContent)
+    }
+
+    await writeFile(mainPath, writeFrontmatterArrayValue(mainContent, "aliases", aliases))
+
+    const qaModulePath = `${catalogDir}/${group.category}-${group.productName}-QA.md`
+    if (qaField) {
+      const qaModuleDef = (PRODUCT_CATALOG_MODULES[group.category] ?? [])
+        .find(module => module.moduleName === "QA")
+      if (qaModuleDef) {
+        const qaSection = scopedFieldSectionResult("QA", "QA", qaField.value, qaField.evidence, 0)
+        const qaModule: MergedModule = {
+          moduleName: "QA",
+          contents: qaSection.fragments.map(fragment => fragment.markdown),
+          sectionIndices: [0],
+          found: true,
+        }
+        await writeFile(qaModulePath, buildModuleFile(
+          qaModule,
+          qaModuleDef,
+          group.category,
+          group.productName,
+          qaSource.refs,
+          aliases,
+        ))
+      }
+      result.qaExtracted++
+    } else {
+      const existingQaModule = await readFile(qaModulePath).catch(() => null)
+      if (existingQaModule) await deleteFile(qaModulePath)
+      result.qaCleared++
+    }
+
+    const basicInfoPath = `${catalogDir}/${group.category}-${group.productName}-产品基础信息.md`
+    const basicInfoContent = await readFile(basicInfoPath).catch(() => null)
+    if (basicInfoContent) {
+      let updatedBasicInfo = removeKeyFieldRow(basicInfoContent, "产品特色")
+      if (productFeatureField) {
+        const tableValue = productFeatureField.value
+          .replace(/\r?\n/g, "<br>")
+          .replace(/\|/g, "\\|")
+        updatedBasicInfo = appendKeyFieldRow(updatedBasicInfo, "产品特色", tableValue)
+      }
+      updatedBasicInfo = writeFrontmatterArrayValue(updatedBasicInfo, "aliases", aliases)
+      if (updatedBasicInfo !== basicInfoContent) await writeFile(basicInfoPath, updatedBasicInfo)
+    }
+
+    if (productFeatureField) result.productFeaturesExtracted++
+    else result.productFeaturesCleared++
+  }
+
+  return result
 }
 
 async function filterModuleFiles(
@@ -3320,7 +3890,7 @@ export async function refineAllProductModules(
       type: typeof tree,
       length: Array.isArray(tree) ? tree.length : "not array",
       firstItem: tree?.[0] ? JSON.stringify(tree[0]).substring(0, 200) : "empty",
-      firstItemKeys: tree?.[0] ? Object.keys(tree[0] as Record<string, unknown>) : [],
+      firstItemKeys: tree?.[0] ? Object.keys(tree[0]) : [],
     })
     const candidates = (tree as CatalogFileEntry[])
       .filter(f => !f.is_dir && f.name?.endsWith(".md") && f.name?.includes("-"))
