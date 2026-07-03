@@ -133,9 +133,11 @@ SERVER_CONFIG_LOCKED=true
 
 ```env
 INGEST_WORKER_CONCURRENCY=2
+INGEST_SECTION_PARALLEL=4
+REFINE_PARALLEL=4
 ```
 
-该值限制整个实例同时运行的高成本抽取任务数，默认 `2`。同一项目始终串行执行，避免并发改写同一知识库；不同项目可在此上限内并行。内存或模型吞吐较小时建议设置为 `1`。
+`INGEST_WORKER_CONCURRENCY` 限制整个实例同时运行的高成本抽取/精炼任务数，默认 `2`。同一项目始终串行执行，避免并发改写同一知识库；不同项目可在此上限内并行。`INGEST_SECTION_PARALLEL` 控制首次抽取章节并发，`REFINE_PARALLEL` 独立控制二次精炼模块并发；内存或模型吞吐较小时建议都设置为 `1`。
 
 ## 6. 配置 OCR、视觉和向量模型
 

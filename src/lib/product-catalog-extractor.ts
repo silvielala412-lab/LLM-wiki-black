@@ -148,6 +148,29 @@ function isUsefulIncrementalFieldValue(fieldName: string, value: string, existin
 }
 
 const FIELD_EXTRACTION_HINTS: Record<string, Record<string, string>> = {
+  "产品基础信息": {
+    "交费方式": "只抽具体交费方式枚举值（如趸交、年交、月交、半年交、季交），不要抽条款描述性文字如'由您与我们约定并在保险单上载明'。",
+    "交费期限": "只抽具体期限枚举值（如趸交/3年/5年/10年/15年/20年），不要抽条款描述性文字。",
+    "犹豫期": "只抽天数（如15日、20日），不要抽'自签收本合同之日起'等前缀描述。",
+    "宽限期": "只抽天数（如60日），不要抽完整的宽限期规则说明。",
+    "保障期间": "只抽简洁期间描述（如终身、1年、至70周岁），不要抽整段续保条款。",
+    "保证续保": "只抽是否保证续保（如保证续保/不保证续保/否），不要抽整段续保说明。",
+    "保证续保期": "只抽具体年限（如6年、10年、每10年为一个保证续保期间），不要抽整段规则。",
+    "免赔额": "抽具体金额（如1万元），若有多档次需全部列出（如一档0万、二档1万、三档3万）。",
+    "报销比例": "抽具体比例及社保/非社保区别（如100%，未使用社保则60%）。",
+    "可覆盖风险": "从保险责任中提取可覆盖的风险类别（如身故风险、重疾风险、医疗风险、意外风险），用顿号分隔。",
+  },
+  "投保年龄": {
+    "最低投保年龄": "从保险条款/产品说明书的'投保范围'条款中提取最低起始年龄（如0周岁、出生满28日）。【警告】不要从费率表的年龄列推算，费率表年龄范围通常小于实际投保年龄范围。",
+    "最高投保年龄": "从保险条款/产品说明书的'投保范围'条款中提取最高投保年龄上限（如75周岁）。取所有交费方式中最大的那个年龄。【警告】不要从费率表的年龄列推算。",
+    "按交费期间投保年龄": "【必填】如果不同交费方式/交费期间对应不同的投保年龄上限，必须逐一列出。数据来源优先从保险条款/产品说明书的'投保范围'或'投保条件'中取，格式示例：趸交0-75岁；3年交0-73岁；5年交0-72岁；10年交0-70岁。如果所有交费方式年龄范围相同则留空。",
+    "特殊情形说明": "提取超龄投保、非首次投保、续保等特殊条件说明。",
+  },
+  "保单贷款": {
+    "贷款比例": "必须提取具体比例（如现金价值的80%），不要只写'您有保单贷款的权利'。",
+    "贷款期限": "必须提取具体期限（如6个月、最长不超过6个月）。",
+    "贷款利率": "提取利率描述或利率确定规则。",
+  },
   "疾病等待期": {
     "意外豁免": "实际指全部“无等待期/等待期豁免情形”，不限于意外伤害；如原文列出多种情形，必须逐条完整列出，不要只取第 1 条。",
     "等待期内发生理赔处理": "分别列出一般疾病、恶性肿瘤等不同情形下的处理结果，不要合并丢项。",
@@ -261,6 +284,15 @@ const FIELD_DIRECT_EXTRACTION_HINTS: Record<string, string> = {
   "投保职业": "只抽具体可投职业类别、拒保职业类别或职业限制；如果证据只有投保年龄或“见投保范围/见条款”，不要输出。",
 }
 
+// Additional direct extraction hints for fields needing specific format guidance
+const FIELD_DIRECT_EXTRACTION_HINTS_EXTRA: Record<string, string> = {
+  "保单贷款": "必须包含贷款比例（如现金价值的80%）、贷款期限（如6个月）和利率描述；不要只写'您有保单贷款的权利'。",
+  "产品简介": "用60-100字概括产品定位、核心保障和适用人群，需包含具体保障内容摘要，不要只用模板句。",
+}
+// Merge extra hints
+for (const [k, v] of Object.entries(FIELD_DIRECT_EXTRACTION_HINTS_EXTRA)) {
+  FIELD_DIRECT_EXTRACTION_HINTS[k] = v
+}
 const FIELD_PREFERRED_EVIDENCE_MODULES: Record<string, string[]> = {
   "现金价值": ["年度现金价值表", "减保", "保单贷款"],
   "部分领取": ["减保"],
@@ -453,6 +485,21 @@ function shouldReplaceFieldValue(
   const current = existing!.trim()
   const next = candidate.trim()
   if (current === next || current.includes(next)) return false
+
+  // ── Special handling for age fields: prefer the HIGHER numeric age ──
+  // Fee rate tables often show a lower max age than the actual insured age limit
+  // from the terms document. We must keep whichever value has the highest number.
+  if (fieldName === "最高投保年龄" || fieldName === "最低投保年龄") {
+    const currentMaxAge = Math.max(0, ...([...current.matchAll(/(\d+)\s*(?:周岁|岁)/g)].map(m => Number.parseInt(m[1], 10))))
+    const nextMaxAge = Math.max(0, ...([...next.matchAll(/(\d+)\s*(?:周岁|岁)/g)].map(m => Number.parseInt(m[1], 10))))
+    if (fieldName === "最高投保年龄") {
+      // For max age: keep the HIGHER value (terms usually has a higher limit than rate table)
+      return nextMaxAge > currentMaxAge
+    }
+    // For min age: keep the LOWER value
+    return nextMaxAge > 0 && nextMaxAge < currentMaxAge
+  }
+
   if (next.includes(current)) return true
 
   const hinted = !!(moduleName && fieldName && FIELD_EXTRACTION_HINTS[moduleName]?.[fieldName])
@@ -602,8 +649,8 @@ export function splitIntoSections(sourceContent: string): Chunk[] {
 
 // Maps module name → list of key fields that should appear in the summary table
 const MODULE_KEY_FIELDS: Record<string, string[]> = {
-  "产品基础信息": ["险种名称", "险种简称", "险种代码", "备案号", "产品类别", "产品类型", "主附加险", "保障期间", "交费方式", "交费期限", "保险期限", "发行公司"],
-  "投保年龄": ["最低投保年龄", "最高投保年龄", "续保年龄上限", "特殊情形说明"],
+  "产品基础信息": ["险种名称", "险种简称", "险种代码", "备案号", "产品类别", "产品类型", "主附加险", "保障期间", "交费方式", "交费期限", "保险期限", "发行公司", "可覆盖风险"],
+  "投保年龄": ["最低投保年龄", "最高投保年龄", "按交费期间投保年龄", "续保年龄上限", "特殊情形说明"],
   "投保职业": ["可投职业类别", "拒保职业类别", "职业分类标准"],
   "投保人群": ["目标人群", "投保人与被保人关系要求", "特殊限制"],
   "未成年人保额限制": ["保额上限", "适用年龄范围", "法规依据"],
@@ -646,6 +693,9 @@ const MODULE_KEY_FIELDS: Record<string, string[]> = {
   "重疾就医绿通": ["服务内容", "适用条件", "申请方式"],
   "异地就医医院限制": ["认可医院级别", "特殊限制", "昂贵医院范围"],
   "分年龄保费费率表": ["保费单位", "费率表数据", "计划说明"],
+  // 保单管理
+  "保单贷款": ["贷款比例", "贷款期限", "贷款利率", "到期未还处理"],
+  "减保": ["减保规则", "最低保额限制", "减保手续费"],
   // 疾病释义
   "重大疾病释义": ["覆盖疾病种数", "主要疾病列表（前5种）", "诊断标准依据"],
   "中症疾病释义": ["覆盖疾病种数", "主要疾病列表（前5种）", "赔付比例"],
@@ -693,6 +743,39 @@ function buildPrompt(
 | 免赔额金额（无社保） | 1万元/年 |
 | 免赔额类型 | 绝对免赔 |
 | 计划选项 | 计划一（1万元）、计划二（0元） |
+---END---
+
+---MODULE: 产品基础信息---
+## 关键字段
+
+| 字段 | 值 |
+|---|---|
+| 险种名称 | 平安e无忧优享版长期医疗保险（费率可调） |
+| 险种简称 | e无忧优享版 |
+| 产品类别 | 医疗保险 |
+| 主附加险 | 主险 |
+| 保障期间 | 1年，每10年为一个保证续保期间 |
+| 交费方式 | 年交 |
+| 交费期限 | 1年 |
+| 宽限期 | 60日 |
+| 犹豫期 | 20日 |
+| 保证续保 | 保证续保 |
+| 保证续保期 | 每10年为一个保证续保期间 |
+| 免赔额 | 1万元 |
+| 报销比例 | 100%（未使用社保则60%） |
+| 可覆盖风险 | 医疗风险、重疾风险 |
+---END---
+
+---MODULE: 投保年龄---
+## 关键字段
+
+| 字段 | 值 |
+|---|---|
+| 最低投保年龄 | 0周岁（出生满28日） |
+| 最高投保年龄 | 60周岁 |
+| 按交费期间投保年龄 | 趸交0-60岁；3年交0-58岁；5年交0-56岁 |
+| 续保年龄上限 |  |
+| 特殊情形说明 | 71-100周岁投保需满足非首次投保且在上一保险期间届满后60日内提出申请 |
 ---END---`
 
   return [
@@ -1870,7 +1953,8 @@ async function writeProductSourceText(
 
 function deriveAudienceFromAge(ageText: string | undefined): string | null {
   if (!ageText || isMissingFieldValue(ageText)) return null
-  const ages = [...ageText.matchAll(/(\d+)\s*周岁/g)].map(m => Number.parseInt(m[1], 10))
+  // Match both "周岁" and plain "岁" patterns (e.g. "0-75岁(趸交)" or "0周岁至75周岁")
+  const ages = [...ageText.matchAll(/(\d+)\s*(?:周岁|岁)/g)].map(m => Number.parseInt(m[1], 10))
   if (ages.length === 0) return null
   const minAge = Math.min(...ages)
   const maxAge = Math.max(...ages)
@@ -1881,7 +1965,7 @@ function deriveAudienceFromAge(ageText: string | undefined): string | null {
   if (minAge <= 17) groups.push("儿童(0-17岁)")
   if (minAge <= 60 && maxAge >= 18) groups.push("成人(18-60岁)")
   if (maxAge >= 60) groups.push("老人(60岁以上)")
-  return groups.length > 0 ? groups.join("；") : null
+  return groups.length > 0 ? groups.join("、") : null
 }
 
 function deriveCoveragePeriodClass(periodText: string | undefined): string | null {
@@ -1988,6 +2072,8 @@ function buildMainFile(
     "投保人群": { "投保人与被保人关系要求": "投保范围" },
     "6年保证续保": { "保证续保": "保证续保", "保证续保期": "保证续保期" },
     "退保": { "犹豫期退保处理": "犹豫期及合同解除（退保）" },
+    "保单贷款": { "贷款比例": "保单贷款" },
+    "减保": { "减保规则": "部分领取" },
   }
   for (const [moduleName, fieldMap] of Object.entries(MODULE_TO_FIELD_BRIDGE)) {
     const mod = mergedModules.get(moduleName)
@@ -2031,8 +2117,36 @@ function buildMainFile(
   const ageFields = collectModuleKeyFields(mergedModules.get("投保年龄"))
   const minAge = ageFields.get("最低投保年龄")
   const maxAge = ageFields.get("最高投保年龄")
+  // Simple: just use the authoritative min-max range from the terms document
   if (minAge && maxAge) {
-    setMainFieldIfWeak("投保年龄", `${minAge}至${maxAge}`)
+    setMainFieldIfMissing("投保年龄", `${minAge}至${maxAge}`)
+  }
+
+  // ── Auto-derive 可覆盖风险 from category + extracted modules ──
+  const CATEGORY_COVERAGE_RISKS: Record<string, string> = {
+    "医疗险": "医疗风险、重疾风险",
+    "重疾险": "重疾风险",
+    "意外医疗险": "意外风险、医疗风险",
+    "意外险": "意外风险",
+    "寿险": "身故风险",
+    "年金险": "长寿风险",
+  }
+  setMainFieldIfMissing("可覆盖风险", CATEGORY_COVERAGE_RISKS[category])
+
+  // ── Enhanced 保单贷款 backfill from module key fields ──
+  const loanModuleFields = collectModuleKeyFields(mergedModules.get("保单贷款"))
+  const loanRatio = loanModuleFields.get("贷款比例")
+  const loanTerm = loanModuleFields.get("贷款期限")
+  const loanRate = loanModuleFields.get("贷款利率")
+  if (loanRatio || loanTerm) {
+    const loanParts = uniqueStrings([
+      loanRatio ? `贷款比例：${loanRatio}` : undefined,
+      loanTerm ? `贷款期限：${loanTerm}` : undefined,
+      loanRate ? `贷款利率：${loanRate}` : undefined,
+    ])
+    if (loanParts.length > 0) {
+      setMainFieldIfWeak("保单贷款", loanParts.join("；"))
+    }
   }
 
   const annuityFields = collectModuleKeyFields(mergedModules.get("年金给付规则"))
@@ -2169,7 +2283,22 @@ function buildMainFile(
     }
   }
 
-
+  // ── Auto-fill 产品别称：must always have value ──
+  // If LLM didn't extract explicit aliases, use 险种简称 + 险种名称 as fallback
+  if (!shortFieldLookup.has("产品别称") || isMissingFieldValue(shortFieldLookup.get("产品别称"))) {
+    const shortName = shortFieldLookup.get("险种简称")
+    const fullName = shortFieldLookup.get("险种名称")
+    const aliasParts = uniqueStrings([
+      shortName && shortName !== productName ? shortName : undefined,
+      fullName && fullName !== productName ? fullName : undefined,
+    ])
+    if (aliasParts.length > 0) {
+      shortFieldLookup.set("产品别称", aliasParts.join("、"))
+    } else {
+      // Last resort: use the product name itself
+      shortFieldLookup.set("产品别称", productName)
+    }
+  }
 
   // ── Section 1: 基础信息 table (固定 schema，业务必填字段) ─────────
   const allFields = PRODUCT_FIELDS[category] ?? []
@@ -2346,10 +2475,22 @@ function buildMainFile(
 
 // ── Top-level orchestrator ────────────────────────────────────────────────
 
-// 每批并发发送给 LLM 的 section 数量。
-// 设太高会导致内网模型过载/超时，设太低会拖慢总耗时。
-// 当前值 4 = 每批 4 个 section 同时调用 LLM，等全部返回后发下一批。
-const MAX_SECTION_PARALLEL = 4
+// 每批并发发送给 LLM 的 section 数量，可通过环境变量动态调整。
+// INGEST_SECTION_PARALLEL=1  → 串行（适合内网单路慢速模型，60-80s/次）
+// INGEST_SECTION_PARALLEL=4  → 默认（DeepSeek API 等外网高速模型）
+// INGEST_SECTION_PARALLEL=8  → 激进并发（内网高并发 GPU 集群）
+//
+// 内网 60-80s/次场景建议：
+//   - 若模型支持并发：INGEST_SECTION_PARALLEL=6~8（让更多请求同时进队列，
+//     但 LLM 接口自身会排队，总 wall-clock 时间 ≈ totalCalls/并发 × 单次耗时）
+//   - 若模型不支持并发（串行处理）：INGEST_SECTION_PARALLEL=1（避免无效等待）
+function getMaxSectionParallel(): number {
+  if (typeof process !== "undefined" && process.env?.INGEST_SECTION_PARALLEL) {
+    const v = parseInt(process.env.INGEST_SECTION_PARALLEL, 10)
+    if (!isNaN(v) && v >= 1 && v <= 32) return v
+  }
+  return 4
+}
 
 async function writeFullProductCatalogOutputs(ctx: ProductCatalogWriteContext): Promise<string[]> {
   const writtenPaths: string[] = []
@@ -2731,7 +2872,14 @@ export async function runProductCatalogExtraction(
   const sourceRefs = normalizeSourceRefs(options.sourceRefs?.length ? options.sourceRefs : [fileName])
   log.info("product name cleaned", { raw: rawProductName, clean: productName })
 
-  const activity = useActivityStore.getState()
+  // In the Node.js worker environment, Zustand stores are unavailable.
+  // Provide a no-op stub so activity-panel updates are silently skipped.
+  let activity: { updateItem: (...args: unknown[]) => void }
+  try {
+    activity = useActivityStore.getState()
+  } catch {
+    activity = { updateItem: () => {} }
+  }
   const allModules = PRODUCT_CATALOG_MODULES[category] ?? []
 
   if (allModules.length === 0) {
@@ -2849,10 +2997,12 @@ export async function runProductCatalogExtraction(
       })
 
       // Process chunks in batches to avoid overwhelming the internal model.
-      for (let i = 0; i < relevantSections.length; i += MAX_SECTION_PARALLEL) {
+      // Batch size is read fresh each group so env-var changes take effect without restart.
+      const maxParallel = getMaxSectionParallel()
+      for (let i = 0; i < relevantSections.length; i += maxParallel) {
         if (signal?.aborted) break
-        const batch = relevantSections.slice(i, i + MAX_SECTION_PARALLEL)
-        const batchEnd = Math.min(i + MAX_SECTION_PARALLEL, relevantSections.length)
+        const batch = relevantSections.slice(i, i + maxParallel)
+        const batchEnd = Math.min(i + maxParallel, relevantSections.length)
         heartbeatDetail = `[${completedGroups}/${totalGroups}] ${groupKey}: 章节 ${batchEnd}/${relevantSections.length}，模块 ${groupModules.length} 个`
         activity.updateItem(activityId, {
           detail: `${heartbeatDetail}...`,
@@ -2887,7 +3037,7 @@ export async function runProductCatalogExtraction(
     maxPossibleCalls,                                // 不做路由的最大调用数
     savedCalls: maxPossibleCalls - totalCalls,        // 关键词路由节省的调用数
     savingRate: `${Math.round((1 - totalCalls / maxPossibleCalls) * 100)}%`,
-    concurrency: MAX_SECTION_PARALLEL,               // 每批并发数
+    concurrency: getMaxSectionParallel(),              // 每批并发数（INGEST_SECTION_PARALLEL 环境变量控制）
   })
 
   // QA and 产品特色 have strict document-level provenance rules. Remove any
@@ -2993,7 +3143,25 @@ export async function runProductCatalogExtraction(
 // 并发数 10，每次只发几百字原文 + 字段列表。
 // ════════════════════════════════════════════════════════════════
 
-const REFINE_PARALLEL = 10
+function getRefineParallel(): number {
+  if (typeof process !== "undefined" && process.env?.REFINE_PARALLEL) {
+    const value = Number.parseInt(process.env.REFINE_PARALLEL, 10)
+    if (Number.isInteger(value) && value >= 1 && value <= 16) return value
+  }
+  return 4
+}
+
+const CATALOG_MODULE_NAMES = new Set(
+  Object.values(PRODUCT_CATALOG_MODULES).flat().map(module => module.moduleName),
+)
+
+function isLikelyCatalogModuleFile(fileName: string): boolean {
+  if (!fileName.endsWith(".md") || fileName.includes("-字段-")) return false
+  for (const moduleName of CATALOG_MODULE_NAMES) {
+    if (fileName.endsWith(`-${sanitizeFileNamePart(moduleName)}.md`)) return true
+  }
+  return false
+}
 
 interface RefineResult {
   totalModules: number
@@ -3053,22 +3221,28 @@ async function refineSingleModule(
   filePath: string,
   llmConfig: LlmConfig,
   signal?: AbortSignal,
-): Promise<number> {
+): Promise<{ fieldsUpdated: number; category?: InsuranceCategoryType; productName?: string }> {
   const fileName = filePath.split("/").pop() ?? filePath
   const content = await readFile(filePath)
+  const moduleMetadata = parseCatalogModuleMetadata(content)
+  const outcome = (fieldsUpdated: number) => ({
+    fieldsUpdated,
+    category: moduleMetadata?.category,
+    productName: moduleMetadata?.productName,
+  })
 
   // Parse frontmatter
   const fmMatch = content.match(/^---\r?\n([\s\S]*?)\r?\n---/)
   if (!fmMatch) {
     log.info("refine skip", { file: fileName, reason: "no frontmatter", contentStart: content.substring(0, 50) })
-    return 0
+    return outcome(0)
   }
   const fm = fmMatch[1]
   const moduleNameMatch = fm.match(/^module_name:\s*"?([^"\n]+?)"?\s*$/m)
   const categoryMatch = fm.match(/^insurance_category:\s*"?([^"\n]+?)"?\s*$/m)
   if (!moduleNameMatch) {
     log.info("refine skip", { file: fileName, reason: "no module_name in frontmatter" })
-    return 0
+    return outcome(0)
   }
   const moduleName = moduleNameMatch[1].trim()
   const category = isInsuranceCategory(categoryMatch?.[1]?.trim()) ? categoryMatch?.[1]?.trim() as InsuranceCategoryType : undefined
@@ -3079,7 +3253,7 @@ async function refineSingleModule(
     const existingPairs = parseKeyFieldsTable(content)
     if (existingPairs.size === 0) {
       log.info("refine skip", { file: fileName, reason: "no key fields in table", moduleName })
-      return 0
+      return outcome(0)
     }
     keyFields = [...existingPairs.keys()]
   }
@@ -3107,10 +3281,13 @@ async function refineSingleModule(
   for (const [k, v] of existingFields) {
     if (isMissingFieldValue(v)) addTargetField(k)
   }
+  for (const keyField of keyFields) {
+    addTargetField(keyField)
+  }
   const fieldHints = FIELD_EXTRACTION_HINTS[moduleName]
   if (fieldHints) {
     for (const hintedField of Object.keys(fieldHints)) {
-      addTargetField(hintedField, true)
+      addTargetField(hintedField)
     }
   }
   for (const extraField of extraRefineFieldsForModule(moduleName, category)) {
@@ -3118,14 +3295,14 @@ async function refineSingleModule(
   }
   if (!needsRefinement) {
     log.info("refine skip", { file: fileName, reason: "no empty fields", moduleName, fieldsCount: existingFields.size })
-    return 0
+    return outcome(0)
   }
 
   // Extract source text
   const sourceText = extractSourceText(content)
   if (!sourceText || sourceText.length < 20) {
     log.info("refine skip", { file: fileName, reason: "no source text", moduleName, srcLen: sourceText?.length ?? 0 })
-    return 0
+    return outcome(0)
   }
 
   const sourceExcerpt = buildRefineSourceExcerpt(sourceText, moduleName, targetFields, fieldHints)
@@ -3186,10 +3363,10 @@ ${sourceExcerpt}
       )
     })
   } catch {
-    return 0
+    return outcome(0)
   }
 
-  if (!response || signal?.aborted) return 0
+  if (!response || signal?.aborted) return outcome(0)
 
   // Parse LLM response: extract table rows directly (no section header required)
   const newFields = new Map<string, string>()
@@ -3207,7 +3384,7 @@ ${sourceExcerpt}
     parsedCount: newFields.size,
     sample: [...newFields.entries()].slice(0, 3).map(([k, v]) => `${k}=${v.substring(0, 20)}`),
   })
-  if (newFields.size === 0) return 0
+  if (newFields.size === 0) return outcome(0)
 
   // Merge: replace rows whose current value is empty or placeholder text.
   let updatedCount = 0
@@ -3240,7 +3417,7 @@ ${sourceExcerpt}
     await writeFile(filePath, updatedContent)
   }
 
-  return updatedCount
+  return outcome(updatedCount)
 }
 
 type CatalogFileEntry = { name: string; path: string; is_dir: boolean }
@@ -3505,6 +3682,7 @@ async function filterModuleFiles(
 ): Promise<CatalogFileEntry[]> {
   const moduleFiles: CatalogFileEntry[] = []
   for (const file of files) {
+    if (!isLikelyCatalogModuleFile(file.name)) continue
     try {
       const content = await readFile(file.path)
       const metadata = parseCatalogModuleMetadata(content)
@@ -3534,10 +3712,15 @@ async function refineSingleFieldGap(
   moduleFilesByKey: Map<string, CatalogFileEntry>,
   llmConfig: LlmConfig,
   signal?: AbortSignal,
-): Promise<number> {
+): Promise<{ fieldsUpdated: number; category?: InsuranceCategoryType; productName?: string }> {
   const fieldContent = await readFile(fieldFile.path)
   const metadata = parseCatalogFieldMetadata(fieldContent)
-  if (!metadata || metadata.evidenceModules.length === 0) return 0
+  if (!metadata || metadata.evidenceModules.length === 0) return { fieldsUpdated: 0 }
+  const outcome = (fieldsUpdated: number) => ({
+    fieldsUpdated,
+    category: metadata.category,
+    productName: metadata.productName,
+  })
 
   const orderedModules = orderEvidenceModules(metadata.fieldName, metadata.evidenceModules)
   const evidence: Array<{ moduleName: string; file: CatalogFileEntry; content: string; sourceText: string }> = []
@@ -3549,7 +3732,7 @@ async function refineSingleFieldGap(
     if (!sourceText || sourceText.length < 20) continue
     evidence.push({ moduleName, file: moduleFile, content, sourceText })
   }
-  if (evidence.length === 0) return 0
+  if (evidence.length === 0) return outcome(0)
 
   const sourceText = evidence
     .map(item => `## ${item.moduleName}\n\n${item.sourceText}`)
@@ -3610,10 +3793,10 @@ ${sourceExcerpt}
       )
     })
   } catch {
-    return 0
+    return outcome(0)
   }
 
-  if (!response || signal?.aborted) return 0
+  if (!response || signal?.aborted) return outcome(0)
   const rowRegex = /^\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|$/gm
   let rowMatch: RegExpExecArray | null
   let extractedValue = ""
@@ -3624,18 +3807,18 @@ ${sourceExcerpt}
     extractedValue = value
     break
   }
-  if (!extractedValue || isMissingFieldValue(extractedValue)) return 0
+  if (!extractedValue || isMissingFieldValue(extractedValue)) return outcome(0)
 
   const target = evidence[0]
   const updatedContent = markModuleHasValues(setKeyFieldRow(target.content, metadata.fieldName, extractedValue))
-  if (updatedContent === target.content) return 0
+  if (updatedContent === target.content) return outcome(0)
   await writeFile(target.file.path, updatedContent)
   log.info("field gap refined", {
     field: metadata.fieldName,
     moduleName: target.moduleName,
     productName: metadata.productName,
   })
-  return 1
+  return outcome(1)
 }
 
 async function refineFieldGapPages(
@@ -3644,9 +3827,20 @@ async function refineFieldGapPages(
   scope?: { category?: string; productName?: string },
   activityId?: string,
   signal?: AbortSignal,
-): Promise<{ attempted: number; refined: number }> {
+): Promise<{
+  attempted: number
+  refined: number
+  changedProducts: Array<{ category: InsuranceCategoryType; productName: string }>
+}> {
   const tree = (await listDirectory(catalogDir)) as CatalogFileEntry[]
-  const files = tree.filter(file => !file.is_dir && file.name?.endsWith(".md"))
+  const scopePrefix = scope?.category && scope.productName
+    ? `${scope.category}-${scope.productName}-`
+    : ""
+  const files = tree.filter(file =>
+    !file.is_dir
+    && (!scopePrefix || file.name.startsWith(scopePrefix))
+    && (file.name.includes("-字段-") || isLikelyCatalogModuleFile(file.name))
+  )
 
   const moduleFilesByKey = new Map<string, CatalogFileEntry>()
   const fieldFiles: CatalogFileEntry[] = []
@@ -3675,6 +3869,7 @@ async function refineFieldGapPages(
   const activity = activityId ? useActivityStore.getState() : null
   let refined = 0
   let attempted = 0
+  const changedProducts = new Map<string, { category: InsuranceCategoryType; productName: string }>()
   for (let i = 0; i < fieldFiles.length; i++) {
     if (signal?.aborted) break
     const file = fieldFiles[i]
@@ -3685,21 +3880,37 @@ async function refineFieldGapPages(
 
     try {
       const updated = await refineSingleFieldGap(file, moduleFilesByKey, llmConfig, signal)
-      if (updated > 0) refined += updated
+      if (updated.fieldsUpdated > 0) {
+        refined += updated.fieldsUpdated
+        if (updated.category && updated.productName) {
+          changedProducts.set(`${updated.category}\0${updated.productName}`, {
+            category: updated.category,
+            productName: updated.productName,
+          })
+        }
+      }
     } catch (err) {
       log.warn("failed to refine field gap", { file: file.name, error: String(err) })
     }
   }
 
-  return { attempted, refined }
+  return { attempted, refined, changedProducts: [...changedProducts.values()] }
 }
 
 async function rebuildMainFilesFromModules(
   catalogDir: string,
   scope?: { category?: string; productName?: string },
+  allowedProducts?: Set<string>,
 ): Promise<number> {
   const tree = (await listDirectory(catalogDir)) as CatalogFileEntry[]
-  const files = tree.filter(f => !f.is_dir && f.name?.endsWith(".md"))
+  const scopePrefix = scope?.category && scope.productName
+    ? `${scope.category}-${scope.productName}-`
+    : ""
+  const files = tree.filter(file =>
+    !file.is_dir
+    && (!scopePrefix || file.name.startsWith(scopePrefix))
+    && isLikelyCatalogModuleFile(file.name)
+  )
   const groups = new Map<string, {
     category: InsuranceCategoryType
     productName: string
@@ -3722,6 +3933,7 @@ async function rebuildMainFilesFromModules(
     if (scope?.productName && metadata.productName !== scope.productName) continue
 
     const key = `${metadata.category}\0${metadata.productName}`
+    if (allowedProducts && !allowedProducts.has(key)) continue
     let group = groups.get(key)
     if (!group) {
       group = {
@@ -3821,12 +4033,13 @@ export async function refineModuleFiles(
 
   const activity = useActivityStore.getState()
   let refined = 0, fieldsUpdated = 0, skipped = 0
+  const refineParallel = getRefineParallel()
 
-  for (let i = 0; i < files.length; i += REFINE_PARALLEL) {
+  for (let i = 0; i < files.length; i += refineParallel) {
     if (signal?.aborted) break
-    const batch = files.slice(i, i + REFINE_PARALLEL)
+    const batch = files.slice(i, i + refineParallel)
     activity.updateItem(activityId, {
-      detail: `精炼 ${Math.min(i + REFINE_PARALLEL, files.length)}/${files.length} 个模块...`,
+      detail: `精炼 ${Math.min(i + refineParallel, files.length)}/${files.length} 个模块...`,
     })
 
     const results = await Promise.allSettled(
@@ -3835,7 +4048,7 @@ export async function refineModuleFiles(
 
     for (const r of results) {
       if (r.status === "fulfilled") {
-        if (r.value > 0) { refined++; fieldsUpdated += r.value }
+        if (r.value.fieldsUpdated > 0) { refined++; fieldsUpdated += r.value.fieldsUpdated }
         else { skipped++ }
       } else { skipped++ }
     }
@@ -3856,7 +4069,7 @@ export async function refineModuleFiles(
   }
 
   let mainFilesRebuilt = 0
-  if (!signal?.aborted) {
+  if (!signal?.aborted && fieldsUpdated > 0) {
     activity.updateItem(activityId, { detail: "正在刷新产品主文件..." })
     try {
       mainFilesRebuilt = await rebuildMainFilesFromModules(catalogDir, { category, productName })
@@ -3909,12 +4122,14 @@ export async function refineAllProductModules(
   })
 
   let refined = 0, fieldsUpdated = 0, skipped = 0
+  const refineParallel = getRefineParallel()
+  const changedProducts = new Set<string>()
 
-  for (let i = 0; i < allFiles.length; i += REFINE_PARALLEL) {
+  for (let i = 0; i < allFiles.length; i += refineParallel) {
     if (signal?.aborted) break
-    const batch = allFiles.slice(i, i + REFINE_PARALLEL)
+    const batch = allFiles.slice(i, i + refineParallel)
     activity.updateItem(activityId, {
-      detail: `精炼模块 ${Math.min(i + REFINE_PARALLEL, allFiles.length)}/${allFiles.length}...`,
+      detail: `精炼模块 ${Math.min(i + refineParallel, allFiles.length)}/${allFiles.length}...`,
     })
 
     const results = await Promise.allSettled(
@@ -3923,7 +4138,13 @@ export async function refineAllProductModules(
 
     for (const r of results) {
       if (r.status === "fulfilled") {
-        if (r.value > 0) { refined++; fieldsUpdated += r.value }
+        if (r.value.fieldsUpdated > 0) {
+          refined++
+          fieldsUpdated += r.value.fieldsUpdated
+          if (r.value.category && r.value.productName) {
+            changedProducts.add(`${r.value.category}\0${r.value.productName}`)
+          }
+        }
         else { skipped++ }
       } else { skipped++ }
     }
@@ -3940,18 +4161,21 @@ export async function refineAllProductModules(
       fieldGapsAttempted = fieldResult.attempted
       fieldGapsRefined = fieldResult.refined
       fieldsUpdated += fieldResult.refined
+      for (const product of fieldResult.changedProducts) {
+        changedProducts.add(`${product.category}\0${product.productName}`)
+      }
     } catch (err) {
       log.warn("failed to refine field gaps", { error: String(err), catalogDir })
     }
   }
 
   let mainFilesRebuilt = 0
-  if (!signal?.aborted) {
+  if (!signal?.aborted && changedProducts.size > 0) {
     activity.updateItem(activityId, {
       detail: "正在刷新产品主文件的已有知识/知识缺口清单...",
     })
     try {
-      mainFilesRebuilt = await rebuildMainFilesFromModules(catalogDir)
+      mainFilesRebuilt = await rebuildMainFilesFromModules(catalogDir, undefined, changedProducts)
     } catch (err) {
       log.warn("failed to rebuild product main files after refinement", { error: String(err), catalogDir })
     }

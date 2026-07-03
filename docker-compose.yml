@@ -19,6 +19,8 @@ services:
       STATIC_DIR: "/app/dist"
       INGEST_WORKER_PATH: "/app/worker/ingest-worker.js"
       INGEST_WORKER_CONCURRENCY: "${INGEST_WORKER_CONCURRENCY:-2}"
+      INGEST_SECTION_PARALLEL: "${INGEST_SECTION_PARALLEL:-4}"
+      REFINE_PARALLEL: "${REFINE_PARALLEL:-4}"
       RUST_LOG: "info"
 
       # ── 主 LLM（必填）────────────────────────────────────────

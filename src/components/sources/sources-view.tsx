@@ -4,6 +4,7 @@ import { Plus, FileText, RefreshCw, BookOpen, Trash2, Folder, ChevronRight, Chev
 import { Button } from "@/components/ui/button"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { useWikiStore } from "@/stores/wiki-store"
+import { useActivityStore } from "@/stores/activity-store"
 import { listDirectory, readFile, writeFile, deleteFile, findRelatedWikiPages, fileExists } from "@/commands/fs"
 import type { FileNode } from "@/types/wiki"
 import { enqueueIngest, enqueueBatch } from "@/lib/ingest-queue"
@@ -429,6 +430,8 @@ export function SourcesView() {
   const [importError, setImportError] = useState<string | null>(null)
   const [ingestingPath, setIngestingPath] = useState<string | null>(null)
   const [deletingPath, setDeletingPath] = useState<string | null>(null)
+  const addActivity = useActivityStore((s) => s.addItem)
+  const updateActivity = useActivityStore((s) => s.updateItem)
   /** "files" = classic flat file tree; "hierarchy" = 5-level service hierarchy upload; "products" = insurance product catalog upload */
   const [viewMode, setViewMode] = useState<"files" | "hierarchy" | "products">("files")
   /**
@@ -621,6 +624,10 @@ export function SourcesView() {
         } = await import("@/commands/fs")
         const batch = await createProductIngestBatch({
           project_name: project.name,
+          // Pass the absolute project path so the server can bypass the
+          // name-based lookup, which fails when project.json has encoding
+          // corruption on the server filesystem.
+          project_path: project.path,
           product_name: productName.trim(),
           insurance_category: category,
           duplicate_policy: "merge",
@@ -662,6 +669,52 @@ export function SourcesView() {
             ? `已提交后台抽取：${importedPaths.length} 个文件，${errorCount} 个上传失败`
             : `✓ ${category} > ${productName}：已提交后台抽取`,
         )
+
+        // ── 往左下角活动面板注册一条任务，追踪后端 worker 进度 ──
+        const activityId = addActivity({
+          type: "ingest",
+          title: `${productName}（${category}）`,
+          status: "running",
+          detail: "已提交后台抽取，等待 worker 处理...",
+          filesWritten: [],
+        })
+        // 通过 SSE 监听后端 batch 事件，完成后更新活动状态
+        const projectName = project.name
+        const batchId = batch.batch_id
+        ;(async () => {
+          try {
+            const sse = new EventSource(
+              `/api/ingest/product-batches/events?project_name=${encodeURIComponent(projectName)}`
+            )
+            const cleanup = () => sse.close()
+            sse.addEventListener("batch", (e: MessageEvent<string>) => {
+              try {
+                const data = JSON.parse(e.data) as { batch_id?: string; status?: string; written_files?: string[]; error?: string }
+                if (data.batch_id !== batchId) return
+                if (data.status === "completed") {
+                  updateActivity(activityId, {
+                    status: "done",
+                    detail: `抽取完成，写入 ${data.written_files?.length ?? 0} 个文件`,
+                    filesWritten: data.written_files ?? [],
+                  })
+                  cleanup()
+                } else if (data.status === "failed") {
+                  updateActivity(activityId, {
+                    status: "error",
+                    detail: data.error ?? "Worker 处理失败",
+                  })
+                  cleanup()
+                } else if (data.status === "processing") {
+                  updateActivity(activityId, { detail: "Worker 正在抽取中..." })
+                }
+              } catch { /* ignore parse errors */ }
+            })
+            sse.onerror = () => cleanup()
+            // 超时保护：1 小时后关闭
+            setTimeout(cleanup, 3600_000)
+          } catch { /* SSE 不支持时静默失败 */ }
+        })()
+
         setTimeout(() => setImportStatus(null), 8000)
       } catch (err) {
         log.error("product upload failed", { dest: destDir, error: extractErrMsg(err) })
@@ -1411,18 +1464,36 @@ export function SourcesView() {
                   setImportStatus("正在精炼模块关键字段...")
                   setImportError(null)
                   try {
-                    const { refineAllProductModules } = await import("@/lib/product-catalog-extractor")
-                    const { useWikiStore } = await import("@/stores/wiki-store")
-                    const llmConfig = useWikiStore.getState().llmConfig
+                    const { createProductRefinementJob, getProductRefinementJob } = await import("@/commands/fs")
                     const { useActivityStore } = await import("@/stores/activity-store")
                     const actId = useActivityStore.getState().addItem({
                       type: "ingest",
                       title: "精炼模块关键字段",
-                      detail: "正在启动...",
+                      detail: "正在提交后台精炼任务...",
                       status: "running",
                       filesWritten: [],
                     })
-                    const result = await refineAllProductModules(project.path, llmConfig, actId)
+                    let job = await createProductRefinementJob({ project_name: project.name })
+                    setImportStatus("后台精炼已启动，可以继续浏览知识库")
+                    while (job.status === "queued" || job.status === "processing") {
+                      useActivityStore.getState().updateItem(actId, {
+                        detail: job.status === "queued" ? "后台排队中..." : "后台正在精炼缺失字段...",
+                      })
+                      await new Promise(resolve => window.setTimeout(resolve, 2000))
+                      job = await getProductRefinementJob(job.job_id)
+                    }
+                    if (job.status === "failed") {
+                      throw new Error(job.error || "后台精炼失败")
+                    }
+                    const result = job.summary ?? {
+                      totalModules: 0,
+                      refined: 0,
+                      fieldsUpdated: 0,
+                      skipped: 0,
+                      mainFilesRebuilt: 0,
+                      fieldGapsAttempted: 0,
+                      fieldGapsRefined: 0,
+                    }
                     useActivityStore.getState().updateItem(actId, { status: "done" })
                     const rebuildSuffix = result.mainFilesRebuilt > 0
                       ? `，刷新 ${result.mainFilesRebuilt} 个主文件`
@@ -1431,6 +1502,7 @@ export function SourcesView() {
                       ? `，字段缺口补抽 ${result.fieldGapsRefined ?? 0}/${result.fieldGapsAttempted} 个`
                       : ""
                     setImportStatus(`✓ 精炼完成：${result.refined}/${result.totalModules} 个模块更新${fieldGapSuffix}，补充 ${result.fieldsUpdated} 个字段${rebuildSuffix}`)
+                    useWikiStore.getState().bumpDataVersion()
                     await loadSources()
                   } catch (err) {
                     console.error("Refine failed:", err)

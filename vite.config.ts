@@ -30,10 +30,12 @@ export default defineConfig(async () => ({
     host: host || "127.0.0.1",
     hmr: host ? { protocol: "ws", host, port: 3001 } : undefined,
     watch: { ignored: ["**/src-tauri/**", "**/wiki-data/**", "**/.runtime/**"] },
-    // Web mode: proxy /api → FastAPI backend running on :8000
+    // Web mode: proxy /api → Rust backend (llm-wiki-server)
+    // Port is read from APP_PORT env var (default 8231) so it stays
+    // in sync with start-server.ps1 without needing to edit this file.
     proxy: {
       "/api": {
-        target: "http://127.0.0.1:8000",
+        target: `http://127.0.0.1:${process.env.APP_PORT ?? "8232"}`,
         changeOrigin: true,
       },
     },

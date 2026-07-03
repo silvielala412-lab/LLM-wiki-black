@@ -147,6 +147,14 @@ async fn main() -> anyhow::Result<()> {
             "/ingest/product-batches/events",
             get(handlers::ingest::batch_events),
         )
+        .route(
+            "/ingest/product-refinements",
+            post(handlers::ingest::create_refinement_job),
+        )
+        .route(
+            "/ingest/product-refinements/{job_id}",
+            get(handlers::ingest::get_refinement_job),
+        )
         // LLM / Embedding proxy (solves Mixed Content + CORS for HTTPS deployments)
         .route("/llm/stream", post(handlers::llm::stream_chat))
         .route(

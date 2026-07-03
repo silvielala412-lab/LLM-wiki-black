@@ -813,7 +813,31 @@ async function resolveProductCatalogExtractionSource(input: {
   const parts: string[] = []
   const cacheParts: string[] = [`manifest:${effectiveCacheContent}`]
   const sourceRefs: string[] = []
-  const files = manifest.files.filter((file) => file.path && isSupportedProductCatalogBundlePath(file.path))
+  const unsortedFiles = manifest.files.filter((file) => file.path && isSupportedProductCatalogBundlePath(file.path))
+
+  // ── Intelligent source ordering: authoritative docs first, rate tables last ──
+  // Insurance terms and product manuals should be processed BEFORE fee rate tables
+  // so the LLM sees correct age/coverage data from the terms first.
+  const SOURCE_FILE_PRIORITY: [RegExp, number][] = [
+    [/product_meta\.json$/i, 0],               // metadata first
+    [/保险条款|条款/i, 1],                      // terms document
+    [/产品说明书|说明书/i, 2],                  // product manual
+    [/投保须知|投保规则/i, 3],                  // underwriting rules
+    [/(?:QA|问答|Q&A|常见问题)/i, 4],           // Q&A docs
+    [/核保|理赔|服务/i, 5],                     // operational docs
+    [/费率表|费率/i, 9],                        // rate tables LAST
+  ]
+  function sourceFilePriority(name: string): number {
+    for (const [pattern, priority] of SOURCE_FILE_PRIORITY) {
+      if (pattern.test(name)) return priority
+    }
+    return 6  // unknown files go in the middle
+  }
+  const files = [...unsortedFiles].sort((a, b) => {
+    const nameA = a.name || a.path || ""
+    const nameB = b.name || b.path || ""
+    return sourceFilePriority(nameA) - sourceFilePriority(nameB)
+  })
 
   for (let i = 0; i < files.length; i++) {
     await yieldToBrowser()

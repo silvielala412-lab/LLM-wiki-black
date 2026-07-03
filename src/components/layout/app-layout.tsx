@@ -20,27 +20,33 @@ export function AppLayout({ onSwitchProject }: AppLayoutProps) {
   const project = useWikiStore((s) => s.project)
   const selectedFile = useWikiStore((s) => s.selectedFile)
   const activeView = useWikiStore((s) => s.activeView)
+  const dataVersion = useWikiStore((s) => s.dataVersion)
   const researchPanelOpen = useResearchStore((s) => s.panelOpen)
   const setFileTree = useWikiStore((s) => s.setFileTree)
   const [leftWidth, setLeftWidth] = useState(300)
   const [rightWidth, setRightWidth] = useState(400)
   const isDraggingLeft = useRef(false)
   const isDraggingRight = useRef(false)
+  const fileTreeRequestRef = useRef(0)
   const containerRef = useRef<HTMLDivElement>(null)
 
   const loadFileTree = useCallback(async () => {
     if (!project) return
+    const requestId = ++fileTreeRequestRef.current
     try {
       const tree = await listDirectory(normalizePath(project.path))
-      setFileTree(tree)
+      if (requestId === fileTreeRequestRef.current) setFileTree(tree)
     } catch (err) {
       console.error("Failed to load file tree:", err)
     }
   }, [project, setFileTree])
 
   useEffect(() => {
-    loadFileTree()
-  }, [loadFileTree])
+    const timer = window.setTimeout(() => {
+      void loadFileTree()
+    }, 120)
+    return () => window.clearTimeout(timer)
+  }, [loadFileTree, dataVersion])
 
   const startDrag = useCallback(
     (side: "left" | "right") => (e: React.MouseEvent) => {

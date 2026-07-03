@@ -2,7 +2,7 @@ version: "3.8"
 
 services:
   llm-wiki:
-    image: llm-wiki:0.5.0-linux-amd64
+    image: llm-wiki:0.5.1-linux-amd64
     container_name: llm-wiki
     restart: unless-stopped
     ports:
@@ -11,6 +11,10 @@ services:
       - "host.docker.internal:host-gateway"
     volumes:
       - ./data:/data:Z
+      # ── 可选：挂载新版 worker 目录以支持 section_parallel 参数 ──────
+      # 1. 将 worker-dist-patch-*.zip 解压到本目录下的 worker-patch 子目录
+      # 2. 取消下方注释，然后 docker-compose up -d --force-recreate
+      - ./worker-patch:/app/worker:ro
     environment:
       APP_HOST: "0.0.0.0"
       APP_PORT: "8231"
@@ -18,6 +22,15 @@ services:
       STATIC_DIR: "/app/dist"
       INGEST_WORKER_PATH: "/app/worker/ingest-worker.js"
       INGEST_WORKER_CONCURRENCY: "${INGEST_WORKER_CONCURRENCY:-2}"
+      # section 级 LLM 并发数全局默认值
+      # 1=串行(内网慢速模型), 4=默认, 6~10=内网高并发, 最大32
+      # 也可在 Python 创建批次时单独传 section_parallel 参数覆盖此值
+      INGEST_SECTION_PARALLEL: "${INGEST_SECTION_PARALLEL:-4}"
+      # 二次精炼独立限流，避免大知识库一次发出过多补缺请求
+      REFINE_PARALLEL: "${REFINE_PARALLEL:-4}"
+      # Node.js worker 堆内存上限（默认约512MB，大PDF+长上下文易OOM）
+      # exit code 134 = SIGABRT/OOM kill，加大此值可修复
+      NODE_OPTIONS: "--max-old-space-size=4096"
       RUST_LOG: "${RUST_LOG:-llm_wiki_server=info,tower_http=warn}"
 
       LLM_PROVIDER: "${LLM_PROVIDER:-custom}"

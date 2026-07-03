@@ -752,3 +752,12 @@ file: <binary>
 4. 所有文件成功上传后调用 `start`；不要在文件仍上传时提前启动。
 5. 轮询批次详情或监听 SSE，失败时记录 `error` 并调用 `retry`。
 6. `completed` 后，生成的 Markdown 会出现在现有 `wiki/product_catalog` 页面中，前端无需另做数据同步。
+
+### 18.6 大知识库后台精炼
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `POST` | `/api/ingest/product-refinements` | 创建全项目或单产品精炼任务；已有活动任务时返回原任务 |
+| `GET` | `/api/ingest/product-refinements/{job_id}` | 查询排队、处理、完成、失败状态及精炼统计 |
+
+精炼在服务端 worker 中执行，不再由浏览器读取全量 Markdown。默认只补缺失字段，只重建发生变化的产品；并发由独立的 `REFINE_PARALLEL` 控制。

@@ -337,15 +337,22 @@ export interface ProductIngestBatch {
   updated_at: string
   started_at?: string
   completed_at?: string
+  section_parallel?: number
 }
 
 export interface CreateProductIngestBatchInput {
   project_name: string
+  /** Optional: full absolute path to the project directory.
+   *  When provided, the server uses this path directly instead of
+   *  a name-based scan, which can fail when project.json has encoding
+   *  corruption (e.g. GBK bytes stored on a UTF-8 server). */
+  project_path?: string
   product_name: string
   insurance_category: string
   product_code?: string
   client_batch_id?: string
   duplicate_policy?: "reject" | "merge"
+  section_parallel?: number
 }
 
 export async function createProductIngestBatch(
@@ -405,6 +412,53 @@ export async function listProductIngestBatches(
 ): Promise<ProductIngestBatch[]> {
   const query = new URLSearchParams({ project_name: projectName, limit: String(limit) })
   return get<ProductIngestBatch[]>(`/ingest/product-batches?${query.toString()}`)
+}
+
+export type ProductRefinementJobStatus = "queued" | "processing" | "completed" | "failed"
+
+export interface ProductRefinementSummary {
+  totalModules: number
+  refined: number
+  fieldsUpdated: number
+  skipped: number
+  mainFilesRebuilt: number
+  fieldGapsAttempted: number
+  fieldGapsRefined: number
+}
+
+export interface ProductRefinementJob {
+  job_id: string
+  project_id: string
+  project_name: string
+  project_path: string
+  insurance_category?: string
+  product_name?: string
+  parallel: number
+  status: ProductRefinementJobStatus
+  summary?: ProductRefinementSummary
+  warnings: string[]
+  error?: string
+  created_at: string
+  updated_at: string
+  started_at?: string
+  completed_at?: string
+}
+
+export interface CreateProductRefinementJobInput {
+  project_name: string
+  insurance_category?: string
+  product_name?: string
+  parallel?: number
+}
+
+export async function createProductRefinementJob(
+  input: CreateProductRefinementJobInput,
+): Promise<ProductRefinementJob> {
+  return post<ProductRefinementJob>("/ingest/product-refinements", input)
+}
+
+export async function getProductRefinementJob(jobId: string): Promise<ProductRefinementJob> {
+  return get<ProductRefinementJob>(`/ingest/product-refinements/${encodeURIComponent(jobId)}`)
 }
 
 // ── Media URL helper (replaces Tauri convertFileSrc) ─────────────────────────

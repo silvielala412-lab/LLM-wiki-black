@@ -16,6 +16,25 @@ interface ProductIngestBatch {
   files: ProductBatchFile[]
 }
 
+interface ProductRefinementJob {
+  job_id: string
+  project_id: string
+  project_name: string
+  project_path: string
+  insurance_category?: string
+  product_name?: string
+}
+
+interface RefinementSummary {
+  totalModules: number
+  refined: number
+  fieldsUpdated: number
+  skipped: number
+  mainFilesRebuilt: number
+  fieldGapsAttempted?: number
+  fieldGapsRefined?: number
+}
+
 interface ProductBatchSummary {
   batch_id: string
   status: string
@@ -25,6 +44,7 @@ interface WorkerResult {
   written_files: string[]
   warnings: string[]
   error?: string
+  refinement?: RefinementSummary
 }
 
 class MemoryStorage implements Storage {
@@ -79,13 +99,15 @@ async function main(): Promise<void> {
   const resultPath = process.argv[3]
   const finalizeOnly = process.argv.includes("--finalize-only")
   const repairScopedFields = process.argv.includes("--repair-scoped-fields")
+  const refineMode = process.argv.includes("--refine")
   if (!batchPath || !resultPath) {
     throw new Error("Usage: ingest-worker <batch.json> <worker-result.json>")
   }
 
   installServerGlobals()
-  const batch = JSON.parse(await fs.readFile(batchPath, "utf8")) as ProductIngestBatch
-  if (!finalizeOnly && (!batch.manifest_path || batch.files.length === 0)) {
+  const payload = JSON.parse(await fs.readFile(batchPath, "utf8")) as ProductIngestBatch | ProductRefinementJob
+  const batch = payload as ProductIngestBatch
+  if (!refineMode && !finalizeOnly && (!batch.manifest_path || batch.files.length === 0)) {
     throw new Error("Batch has no product manifest or uploaded files")
   }
 
@@ -114,6 +136,30 @@ async function main(): Promise<void> {
 
   let writtenFiles: string[] = []
   const warnings: string[] = []
+  if (refineMode) {
+    const job = payload as ProductRefinementJob
+    const extractor = await import("@/lib/product-catalog-extractor")
+    const activityId = `server-refinement-${job.job_id}`
+    const refinement = job.insurance_category && job.product_name
+      ? await extractor.refineModuleFiles(
+          job.project_path,
+          job.insurance_category,
+          job.product_name,
+          llmConfig,
+          activityId,
+        )
+      : await extractor.refineAllProductModules(job.project_path, llmConfig, activityId)
+    if (refinement.fieldsUpdated > 0) {
+      try {
+        const { runConceptAggregator } = await import("@/lib/concept-aggregator")
+        await runConceptAggregator(job.project_path)
+      } catch (error) {
+        warnings.push(`Concept aggregation failed: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+    await writeResult(resultPath, { written_files: [], warnings, refinement })
+    return
+  }
   if (!finalizeOnly) {
     const folderContext = catalogModule.encodeProductCatalogFolderContext(
       batch.insurance_category as Parameters<typeof catalogModule.encodeProductCatalogFolderContext>[0],

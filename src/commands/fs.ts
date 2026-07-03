@@ -34,6 +34,8 @@ export {
   retryProductIngestBatch,
   getProductIngestBatch,
   listProductIngestBatches,
+  createProductRefinementJob,
+  getProductRefinementJob,
   convertFileSrc,
 } from "@/commands/api-client"
 
@@ -43,4 +45,8 @@ export type {
   ProductIngestBatchFile,
   ProductIngestBatchStatus,
   CreateProductIngestBatchInput,
+  ProductRefinementJob,
+  ProductRefinementJobStatus,
+  ProductRefinementSummary,
+  CreateProductRefinementJobInput,
 } from "@/commands/api-client"

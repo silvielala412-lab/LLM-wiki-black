@@ -2,16 +2,34 @@ import React, { useState, useEffect, useCallback, useRef } from "react"
 import { FileText, Users, Lightbulb, BookOpen, HelpCircle, GitMerge, BarChart3, ChevronRight, ChevronDown, Layout, Globe, ShieldCheck, BriefcaseBusiness, Network, FolderOpen, Package } from "lucide-react"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { useWikiStore } from "@/stores/wiki-store"
-import { readFile, listDirectory } from "@/commands/fs"
+import { readFile } from "@/commands/fs"
 import type { FileNode } from "@/types/wiki"
 import { normalizePath } from "@/lib/path-utils"
 import { SERVICE_HIERARCHY } from "@/lib/insurance-schema-registry"
 import { INSURANCE_CATEGORIES, parseProductModuleTitle } from "@/lib/product-catalog-modules"
-import { getQueueSummary } from "@/lib/ingest-queue"
 
 interface WikiPageInfo {
   path: string; title: string; type: string; domain: string; tags: string[]; origin?: string
   lineName?: string; versionName?: string
+}
+
+const PAGE_RENDER_BATCH = 100
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  mapper: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length)
+  let cursor = 0
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (cursor < items.length) {
+      const index = cursor++
+      results[index] = await mapper(items[index])
+    }
+  })
+  await Promise.all(workers)
+  return results
 }
 
 const TYPE_CONFIG: Record<string, { icon: typeof FileText; label: string; color: string; order: number }> = {
@@ -80,10 +98,8 @@ export function KnowledgeTree({ searchQuery = "" }: { searchQuery?: string }) {
   const project = useWikiStore((s) => s.project)
   const selectedFile = useWikiStore((s) => s.selectedFile)
   const setSelectedFile = useWikiStore((s) => s.setSelectedFile)
-  const setFileTree = useWikiStore((s) => s.setFileTree)
   const bumpDataVersion = useWikiStore((s) => s.bumpDataVersion)
   const fileTree = useWikiStore((s) => s.fileTree)
-  const dataVersion = useWikiStore((s) => s.dataVersion)
 
   const [pages, setPages] = useState<WikiPageInfo[]>([])
   const [groupMode, setGroupMode] = useState<"type" | "service" | "product">("type")
@@ -98,79 +114,58 @@ export function KnowledgeTree({ searchQuery = "" }: { searchQuery?: string }) {
   // Product catalog: list of files in wiki/product_catalog/
   const [productCatalogPages, setProductCatalogPages] = useState<WikiPageInfo[]>([])
   const [expandedProducts, setExpandedProducts] = useState<Set<string>>(new Set())
-  const queueWasActiveRef = useRef(false)
-
-  const loadProductCatalogPages = useCallback(async () => {
-    if (!project) return
-    const pp = normalizePath(project.path)
-    try {
-      const pcTree = await listDirectory(`${pp}/wiki/product_catalog`)
-      const pcInfos = flattenMdFiles(pcTree).map(f => parseInfo(f.path, f.name, ""))
-      setProductCatalogPages(pcInfos)
-      setPages(prev => [...prev.filter(p => !isProductCatalogPath(p.path)), ...pcInfos])
-    } catch {
-      setProductCatalogPages([])
-      setPages(prev => prev.filter(p => !isProductCatalogPath(p.path)))
-    }
-  }, [project])
-
+  const pageLoadRef = useRef(0)
   const loadPages = useCallback(async () => {
     if (!project) return
-    const pp = normalizePath(project.path)
+    const requestId = ++pageLoadRef.current
+    const pp = `${normalizePath(project.path)}/`
+    const wikiRoot = `${pp}wiki/`
+    const mdFiles = flattenMdFiles(fileTree).filter(file => normalizePath(file.path).startsWith(wikiRoot))
+    if (fileTree.length > 0 && mdFiles.length === 0) {
+      setPages([])
+      setProductCatalogPages([])
+      return
+    }
     try {
-      const wikiTree = await listDirectory(`${pp}/wiki`)
-      const mdFiles = flattenMdFiles(wikiTree)
-      const infos: WikiPageInfo[] = []
-      for (const f of mdFiles) {
-        if (isProductCatalogPath(f.path)) continue
-        if (f.name === "index.md" || f.name === "log.md") continue
-        if (!shouldRead(f.path)) { infos.push(parseInfo(f.path, f.name, "")); continue }
-        try { infos.push(parseInfo(f.path, f.name, await readFile(f.path))) }
-        catch { infos.push({ path: f.path, title: f.name.replace(".md",""), type:"other", domain:"general", tags:[] }) }
-      }
+      const metadataFiles = mdFiles.filter(f =>
+        !isProductCatalogPath(f.path) && f.name !== "index.md" && f.name !== "log.md"
+      )
+      const infos = await mapWithConcurrency(metadataFiles, 8, async (f) => {
+        if (!shouldRead(f.path)) return parseInfo(f.path, f.name, "")
+        try { return parseInfo(f.path, f.name, await readFile(f.path)) }
+        catch { return { path: f.path, title: f.name.replace(".md", ""), type: "other", domain: "general", tags: [] } }
+      })
+      if (requestId !== pageLoadRef.current) return
       const pcInfos = mdFiles.filter(f => isProductCatalogPath(f.path)).map(f => parseInfo(f.path, f.name, ""))
       setProductCatalogPages(pcInfos)
       setPages([...infos, ...pcInfos])
-    } catch { setPages([]) }
-  }, [project])
-
-  useEffect(() => { loadPages() }, [loadPages, fileTree, dataVersion])
-
-  useEffect(() => {
-    if (!project) return
-    const tick = () => {
-      const summary = getQueueSummary()
-      const active = summary.pending + summary.processing > 0
-      if (active || queueWasActiveRef.current) {
-        void loadProductCatalogPages()
-      }
-      queueWasActiveRef.current = active
+    } catch {
+      if (requestId === pageLoadRef.current) setPages([])
     }
-    tick()
-    const timer = window.setInterval(tick, 2500)
-    return () => window.clearInterval(timer)
-  }, [project, loadProductCatalogPages])
+  }, [project, fileTree])
+
+  useEffect(() => { void loadPages() }, [loadPages])
 
   useEffect(() => {
     if (!project) return
     const events = new EventSource(`/api/ingest/product-batches/events?project_name=${encodeURIComponent(project.name)}`)
     const refresh = (event: Event) => {
       const message = event as MessageEvent<string>
-      void (async () => {
-        try {
-          const batch = JSON.parse(message.data) as { status?: string }
-          if (batch.status !== "completed") return
-          await loadProductCatalogPages()
-          setFileTree(await listDirectory(normalizePath(project.path)))
-          bumpDataVersion()
-        } catch {
-          // A later event or normal page refresh will recover the view.
-        }
-      })()
+      try {
+        const batch = JSON.parse(message.data) as { status?: string }
+        if (batch.status === "completed") bumpDataVersion()
+      } catch {
+        // A later event or normal page refresh will recover the view.
+      }
     }
     events.addEventListener("batch", refresh)
-    return () => events.close()
-  }, [project, loadProductCatalogPages, setFileTree, bumpDataVersion])
+    events.addEventListener("refinement", refresh)
+    return () => {
+      events.removeEventListener("batch", refresh)
+      events.removeEventListener("refinement", refresh)
+      events.close()
+    }
+  }, [project, bumpDataVersion])
 
   const toggleCheck = useCallback((path: string, e: React.MouseEvent) => {
     e.stopPropagation()
@@ -183,10 +178,10 @@ export function KnowledgeTree({ searchQuery = "" }: { searchQuery?: string }) {
     const pp = normalizePath(project.path)
     const { cascadeDeleteWikiPage } = await import("@/lib/wiki-page-delete")
     for (const path of checkedPaths) { try { await cascadeDeleteWikiPage(pp, path) } catch {} }
-    setFileTree(await listDirectory(pp)); bumpDataVersion()
+    bumpDataVersion()
     if (checkedPaths.has(selectedFile ?? "")) setSelectedFile(null)
     setCheckedPaths(new Set()); setShowBulkConfirm(false); setIsDeleting(false)
-  }, [project, checkedPaths, selectedFile, setFileTree, bumpDataVersion, setSelectedFile])
+  }, [project, checkedPaths, selectedFile, bumpDataVersion, setSelectedFile])
 
   if (!project) return <div className="flex h-full items-center justify-center p-4 text-sm text-muted-foreground">No project open</div>
 
@@ -248,7 +243,7 @@ export function KnowledgeTree({ searchQuery = "" }: { searchQuery?: string }) {
                   <span className="flex-1 text-left font-medium">{cfg.label}</span>
                   <span className="text-xs text-muted-foreground">{items.length}</span>
                 </button>
-                {expanded && <div className="ml-3">{items.map(p=><PageRow key={p.path} page={p} selectedFile={selectedFile} checkedPaths={checkedPaths} setSelectedFile={setSelectedFile} toggleCheck={toggleCheck}/>)}</div>}
+                {expanded && <div className="ml-3"><PageRows pages={items} selectedFile={selectedFile} checkedPaths={checkedPaths} setSelectedFile={setSelectedFile} toggleCheck={toggleCheck}/></div>}
               </div>
             )
           })}
@@ -312,7 +307,7 @@ export function KnowledgeTree({ searchQuery = "" }: { searchQuery?: string }) {
                                   </button>
                                   {vnExpanded && items.length>0 && (
                                     <div className="ml-4">
-                                      {items.map(p=><PageRow key={p.path} page={p} selectedFile={selectedFile} checkedPaths={checkedPaths} setSelectedFile={setSelectedFile} toggleCheck={toggleCheck}/>)}
+                                      <PageRows pages={items} selectedFile={selectedFile} checkedPaths={checkedPaths} setSelectedFile={setSelectedFile} toggleCheck={toggleCheck}/>
                                     </div>
                                   )}
                                 </div>
@@ -391,6 +386,32 @@ function PageRow({ page, selectedFile, checkedPaths, setSelectedFile, toggleChec
   )
 }
 
+function PageRows({ pages, selectedFile, checkedPaths, setSelectedFile, toggleCheck }: {
+  pages: WikiPageInfo[]; selectedFile: string | null; checkedPaths: Set<string>
+  setSelectedFile: (path: string) => void; toggleCheck: (path: string, event: React.MouseEvent) => void
+}) {
+  const signature = `${pages.length}:${pages[0]?.path ?? ""}:${pages[pages.length - 1]?.path ?? ""}`
+  const [limit, setLimit] = useState(PAGE_RENDER_BATCH)
+  useEffect(() => setLimit(PAGE_RENDER_BATCH), [signature])
+
+  return (
+    <>
+      {pages.slice(0, limit).map(page => (
+        <PageRow key={page.path} page={page} selectedFile={selectedFile} checkedPaths={checkedPaths} setSelectedFile={setSelectedFile} toggleCheck={toggleCheck} />
+      ))}
+      {limit < pages.length && (
+        <button
+          type="button"
+          onClick={() => setLimit(current => Math.min(current + PAGE_RENDER_BATCH, pages.length))}
+          className="w-full px-2 py-1.5 text-left text-xs text-muted-foreground hover:text-foreground"
+        >
+          显示更多（剩余 {pages.length - limit}）
+        </button>
+      )}
+    </>
+  )
+}
+
 function OtherSection({ pages, selectedFile, checkedPaths, setSelectedFile, toggleCheck }: {
   pages:WikiPageInfo[]; selectedFile:string|null; checkedPaths:Set<string>
   setSelectedFile:(p:string)=>void; toggleCheck:(p:string,e:React.MouseEvent)=>void
@@ -404,25 +425,28 @@ function OtherSection({ pages, selectedFile, checkedPaths, setSelectedFile, togg
         <span className="flex-1 text-left font-medium text-muted-foreground">其他知识</span>
         <span className="text-xs text-muted-foreground">{pages.length}</span>
       </button>
-      {exp && <div className="ml-3">{pages.map(p=><PageRow key={p.path} page={p} selectedFile={selectedFile} checkedPaths={checkedPaths} setSelectedFile={setSelectedFile} toggleCheck={toggleCheck}/>)}</div>}
+      {exp && <div className="ml-3"><PageRows pages={pages} selectedFile={selectedFile} checkedPaths={checkedPaths} setSelectedFile={setSelectedFile} toggleCheck={toggleCheck}/></div>}
     </div>
   )
 }
 
 function RawSourcesSection({ searchQuery = "" }: { searchQuery?: string }) {
   const project = useWikiStore(s=>s.project)
+  const fileTree = useWikiStore(s=>s.fileTree)
   const setSelectedFile = useWikiStore(s=>s.setSelectedFile)
   const selectedFile = useWikiStore(s=>s.selectedFile)
   const [exp, setExp] = useState(false)
-  const [sources, setSources] = useState<FileNode[]>([])
-  useEffect(()=>{
-    if(!project) return
-    listDirectory(`${normalizePath(project.path)}/raw/sources`).then(t=>setSources(flattenAllFiles(t))).catch(()=>setSources([]))
-  },[project])
+  const sourceRoot = project ? `${normalizePath(project.path)}/raw/sources/` : ""
+  const sources = sourceRoot
+    ? flattenAllFiles(fileTree).filter(file => normalizePath(file.path).startsWith(sourceRoot))
+    : []
   const normalizedSearch = normalizeSearch(searchQuery)
   const visibleSources = sources.filter(source =>
     !normalizedSearch || [source.name, source.path].some(value => value.toLowerCase().includes(normalizedSearch))
   )
+  const sourceSignature = `${normalizedSearch}:${visibleSources.length}:${visibleSources[0]?.path ?? ""}`
+  const [visibleLimit, setVisibleLimit] = useState(PAGE_RENDER_BATCH)
+  useEffect(() => setVisibleLimit(PAGE_RENDER_BATCH), [sourceSignature])
   if(visibleSources.length===0) return null
   const isExpanded = !!normalizedSearch || exp
   return (
@@ -433,11 +457,18 @@ function RawSourcesSection({ searchQuery = "" }: { searchQuery?: string }) {
         <span className="flex-1 text-left font-medium text-muted-foreground">Raw Sources</span>
         <span className="text-xs text-muted-foreground">{visibleSources.length}</span>
       </button>
-      {isExpanded && <div className="ml-3">{visibleSources.map(f=>(
-        <button key={f.path} onClick={()=>setSelectedFile(f.path)} className={`flex w-full items-center gap-1.5 rounded-md px-2 py-1 text-left text-sm ${selectedFile===f.path?"bg-accent text-accent-foreground":"text-muted-foreground hover:bg-accent/50"}`}>
-          <span className="truncate">{f.name}</span>
-        </button>
-      ))}</div>}
+      {isExpanded && <div className="ml-3">
+        {visibleSources.slice(0, visibleLimit).map(f=>(
+          <button key={f.path} onClick={()=>setSelectedFile(f.path)} className={`flex w-full items-center gap-1.5 rounded-md px-2 py-1 text-left text-sm ${selectedFile===f.path?"bg-accent text-accent-foreground":"text-muted-foreground hover:bg-accent/50"}`}>
+            <span className="truncate">{f.name}</span>
+          </button>
+        ))}
+        {visibleLimit < visibleSources.length && (
+          <button type="button" onClick={() => setVisibleLimit(current => Math.min(current + PAGE_RENDER_BATCH, visibleSources.length))} className="w-full px-2 py-1.5 text-left text-xs text-muted-foreground hover:text-foreground">
+            显示更多（剩余 {visibleSources.length - visibleLimit}）
+          </button>
+        )}
+      </div>}
     </div>
   )
 }
@@ -528,6 +559,12 @@ function ProductCatalogSection({ pages, selectedFile, checkedPaths, setSelectedF
     )
   }
 
+  if (forceExpanded) {
+    return (
+      <PageRows pages={pages} selectedFile={selectedFile} checkedPaths={checkedPaths} setSelectedFile={setSelectedFile} toggleCheck={toggleCheck} />
+    )
+  }
+
   // Group by category → product
   const grouped = new Map<string, Map<string, WikiPageInfo[]>>()
   const unknown: WikiPageInfo[] = []
@@ -586,16 +623,7 @@ function ProductCatalogSection({ pages, selectedFile, checkedPaths, setSelectedF
 
                   {productExpanded && (
                     <div className="ml-4">
-                      {modulePages.map(p => (
-                        <PageRow
-                          key={p.path}
-                          page={p}
-                          selectedFile={selectedFile}
-                          checkedPaths={checkedPaths}
-                          setSelectedFile={setSelectedFile}
-                          toggleCheck={toggleCheck}
-                        />
-                      ))}
+                      <PageRows pages={modulePages} selectedFile={selectedFile} checkedPaths={checkedPaths} setSelectedFile={setSelectedFile} toggleCheck={toggleCheck} />
                     </div>
                   )}
                 </div>
@@ -608,7 +636,7 @@ function ProductCatalogSection({ pages, selectedFile, checkedPaths, setSelectedF
       {unknown.length > 0 && (
         <div className="mt-1 border-t pt-1">
           <div className="px-2 py-1 text-[11px] text-muted-foreground/60">其他产品文件 ({unknown.length})</div>
-          {unknown.map(p => <PageRow key={p.path} page={p} selectedFile={selectedFile} checkedPaths={checkedPaths} setSelectedFile={setSelectedFile} toggleCheck={toggleCheck} />)}
+          <PageRows pages={unknown} selectedFile={selectedFile} checkedPaths={checkedPaths} setSelectedFile={setSelectedFile} toggleCheck={toggleCheck} />
         </div>
       )}
     </div>

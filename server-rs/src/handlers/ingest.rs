@@ -31,7 +31,9 @@ const ALLOWED_EXTENSIONS: &[&str] = &[
 ];
 const MAX_FILE_BYTES: u64 = 200 * 1024 * 1024;
 const BATCHES_DIR: &str = ".llm-wiki/ingest-batches";
+const REFINEMENT_JOBS_DIR: &str = ".llm-wiki/refinement-jobs";
 const BATCH_FILE: &str = "batch.json";
+const REFINEMENT_JOB_FILE: &str = "job.json";
 const RESULT_FILE: &str = "worker-result.json";
 const PRODUCT_MANIFEST: &str = "__product_bundle__.json";
 
@@ -126,16 +128,30 @@ pub struct ProductIngestBatch {
     pub started_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<String>,
+    /// 单产品内 section 级 LLM 并发数（覆盖 INGEST_SECTION_PARALLEL 环境变量）。
+    /// 不传则以服务端环境变量为准，环境变量也未设则默认 4。
+    /// 范围 1~32。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub section_parallel: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct CreateProductBatchRequest {
+    /// Resolved project name for display / batch metadata.
     pub project_name: String,
+    /// Optional: absolute path to the project directory.
+    /// When provided, the server skips the name-based lookup in data_root
+    /// (which can fail when project.json has encoding corruption) and uses
+    /// this path directly — as long as it falls within an allowed data root.
+    #[serde(default)]
+    pub project_path: Option<String>,
     pub product_name: String,
     pub insurance_category: String,
     pub product_code: Option<String>,
     pub client_batch_id: Option<String>,
     pub duplicate_policy: Option<String>,
+    /// 覆盖服务端 INGEST_SECTION_PARALLEL 默认值，范围 1~32，不传则用服务端默认值。
+    pub section_parallel: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -153,6 +169,63 @@ pub struct ListBatchesQuery {
 #[derive(Debug, Deserialize)]
 pub struct BatchEventsQuery {
     pub project_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RefinementJobStatus {
+    Queued,
+    Processing,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RefinementSummary {
+    pub total_modules: usize,
+    pub refined: usize,
+    pub fields_updated: usize,
+    pub skipped: usize,
+    pub main_files_rebuilt: usize,
+    #[serde(default)]
+    pub field_gaps_attempted: usize,
+    #[serde(default)]
+    pub field_gaps_refined: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProductRefinementJob {
+    pub job_id: String,
+    pub project_id: String,
+    pub project_name: String,
+    pub project_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub insurance_category: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub product_name: Option<String>,
+    pub parallel: u32,
+    pub status: RefinementJobStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<RefinementSummary>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateRefinementJobRequest {
+    pub project_name: String,
+    pub insurance_category: Option<String>,
+    pub product_name: Option<String>,
+    pub parallel: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -174,6 +247,8 @@ struct WorkerResult {
     #[serde(default)]
     warnings: Vec<String>,
     error: Option<String>,
+    #[serde(default)]
+    refinement: Option<RefinementSummary>,
 }
 
 fn now() -> String {
@@ -182,6 +257,12 @@ fn now() -> String {
 
 fn emit_batch_event(state: &AppState, batch: &ProductIngestBatch) {
     if let Ok(payload) = serde_json::to_string(batch) {
+        let _ = state.ingest_events.send(payload);
+    }
+}
+
+fn emit_refinement_event(state: &AppState, job: &ProductRefinementJob) {
+    if let Ok(payload) = serde_json::to_string(job) {
         let _ = state.ingest_events.send(payload);
     }
 }
@@ -273,7 +354,21 @@ fn resolve_project(data_root: &Path, project_name: &str) -> ApiResult<(PathBuf, 
         if hidden {
             continue;
         }
-        if project_display_name(&path).eq_ignore_ascii_case(requested) {
+        // Primary match: against the display name in project.json
+        let display = project_display_name(&path);
+        if display.eq_ignore_ascii_case(requested) || display == requested {
+            matches.push(path.clone());
+            continue;
+        }
+        // Fallback match: against the actual directory name.
+        // This handles the case where project.json was written with a
+        // corrupted encoding (e.g. GBK bytes stored as UTF-8) so the
+        // display name doesn't match, but the directory name still does.
+        let dir_name = path
+            .file_name()
+            .and_then(|v| v.to_str())
+            .unwrap_or_default();
+        if dir_name == requested || dir_name.eq_ignore_ascii_case(requested) {
             matches.push(path);
         }
     }
@@ -286,9 +381,20 @@ fn resolve_project(data_root: &Path, project_name: &str) -> ApiResult<(PathBuf, 
             let id = ensure_project_identity(&path)?;
             Ok((path, id))
         }
-        _ => Err(IngestApiError::conflict(format!(
-            "Project name '{requested}' is ambiguous; project names must be globally unique"
-        ))),
+        _ => {
+            // Prefer exact name match to reduce ambiguity from fallbacks
+            if let Some(path) = matches
+                .iter()
+                .find(|p| project_display_name(p) == requested)
+                .cloned()
+            {
+                let id = ensure_project_identity(&path)?;
+                return Ok((path, id));
+            }
+            Err(IngestApiError::conflict(format!(
+                "Project name '{requested}' is ambiguous; project names must be globally unique"
+            )))
+        }
     }
 }
 
@@ -354,6 +460,67 @@ fn list_project_batches(project_path: &Path) -> ApiResult<Vec<ProductIngestBatch
     }
     batches.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
     Ok(batches)
+}
+
+fn refinement_job_file(project_path: &Path, job_id: &str) -> PathBuf {
+    project_path
+        .join(REFINEMENT_JOBS_DIR)
+        .join(job_id)
+        .join(REFINEMENT_JOB_FILE)
+}
+
+fn find_refinement_job_file(data_root: &Path, job_id: &str) -> ApiResult<PathBuf> {
+    if Uuid::parse_str(job_id).is_err() {
+        return Err(IngestApiError::bad_request("Invalid refinement job_id"));
+    }
+    for entry in fs::read_dir(data_root)
+        .map_err(IngestApiError::internal)?
+        .flatten()
+    {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let candidate = refinement_job_file(&entry.path(), job_id);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+    Err(IngestApiError::not_found(format!(
+        "Refinement job '{job_id}' was not found"
+    )))
+}
+
+fn read_refinement_job(path: &Path) -> ApiResult<ProductRefinementJob> {
+    let raw = fs::read(path).map_err(IngestApiError::internal)?;
+    serde_json::from_slice(&raw).map_err(IngestApiError::internal)
+}
+
+fn write_refinement_job(path: &Path, job: &ProductRefinementJob) -> ApiResult<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| IngestApiError::internal("Invalid refinement job path"))?;
+    fs::create_dir_all(parent).map_err(IngestApiError::internal)?;
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(job).map_err(IngestApiError::internal)?,
+    )
+    .map_err(IngestApiError::internal)
+}
+
+fn active_refinement_job(project_path: &Path) -> Option<ProductRefinementJob> {
+    let root = project_path.join(REFINEMENT_JOBS_DIR);
+    let entries = fs::read_dir(root).ok()?;
+    entries.flatten().find_map(|entry| {
+        let job = read_refinement_job(&entry.path().join(REFINEMENT_JOB_FILE)).ok()?;
+        let is_active = matches!(
+            job.status,
+            RefinementJobStatus::Queued | RefinementJobStatus::Processing
+        );
+        let is_recent = chrono::DateTime::parse_from_rfc3339(&job.updated_at)
+            .map(|updated| Utc::now().signed_duration_since(updated.with_timezone(&Utc)).num_seconds() < 120)
+            .unwrap_or(false);
+        (is_active && is_recent).then_some(job)
+    })
 }
 
 fn safe_relative_upload_path(
@@ -439,7 +606,32 @@ pub async fn create_batch(
         ));
     }
     let project_name = body.project_name.trim().to_string();
-    let (project_path, project_id) = resolve_project(&state.data_root, &project_name)?;
+    let (project_path, project_id) = if let Some(ref raw_path) = body.project_path {
+        // Direct path provided: validate it falls within an allowed data root
+        // then use it without doing a name-based scan (which can fail when
+        // project.json has encoding corruption).
+        let p = PathBuf::from(raw_path.replace('/', "\\"));
+        let is_allowed = state.allowed_data_roots.iter().any(|root| {
+            p.starts_with(root)
+        });
+        if !is_allowed {
+            return Err(IngestApiError::bad_request(format!(
+                "project_path '{}' is not within an allowed data root",
+                raw_path
+            )));
+        }
+        if !p.is_dir() {
+            return Err(IngestApiError::not_found(format!(
+                "project_path '{}' does not exist",
+                raw_path
+            )));
+        }
+        let id = ensure_project_identity(&p)?;
+        (p, id)
+    } else {
+        resolve_project(&state.data_root, &project_name)?
+    };
+
 
     let _store_guard = state.ingest_store_lock.lock().await;
     if let Some(client_batch_id) = body
@@ -457,6 +649,14 @@ pub async fn create_batch(
 
     let batch_id = Uuid::new_v4().to_string();
     let timestamp = now();
+    let section_parallel = match body.section_parallel {
+        Some(v) if v == 0 || v > 32 => {
+            return Err(IngestApiError::bad_request(
+                "section_parallel must be between 1 and 32",
+            ))
+        }
+        other => other,
+    };
     let batch = ProductIngestBatch {
         batch_id: batch_id.clone(),
         client_batch_id: body
@@ -479,6 +679,7 @@ pub async fn create_batch(
         updated_at: timestamp,
         started_at: None,
         completed_at: None,
+        section_parallel,
     };
     write_batch(&batch_file(&project_path, &batch_id), &batch)?;
     emit_batch_event(&state, &batch);
@@ -505,6 +706,87 @@ pub async fn get_batch(
     Ok(Json(read_batch(&path)?))
 }
 
+pub async fn create_refinement_job(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<CreateRefinementJobRequest>,
+) -> ApiResult<impl IntoResponse> {
+    let (project_path, project_id) = resolve_project(&state.data_root, &body.project_name)?;
+    let category = body
+        .insurance_category
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let product_name = body
+        .product_name
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if category.is_some() != product_name.is_some() {
+        return Err(IngestApiError::bad_request(
+            "insurance_category and product_name must be provided together",
+        ));
+    }
+    if let Some(value) = category.as_deref() {
+        if !ALLOWED_CATEGORIES.contains(&value) {
+            return Err(IngestApiError::bad_request(format!(
+                "Unsupported insurance_category '{value}'"
+            )));
+        }
+    }
+    if let Some(value) = product_name.as_deref() {
+        validate_name("product_name", value, 160)?;
+    }
+    let default_parallel = std::env::var("REFINE_PARALLEL")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| (1..=16).contains(value))
+        .unwrap_or(4);
+    let parallel = body.parallel.unwrap_or(default_parallel);
+    if !(1..=16).contains(&parallel) {
+        return Err(IngestApiError::bad_request(
+            "parallel must be between 1 and 16",
+        ));
+    }
+
+    let _store_guard = state.ingest_store_lock.lock().await;
+    if let Some(existing) = active_refinement_job(&project_path) {
+        return Ok((StatusCode::OK, Json(existing)));
+    }
+
+    let job_id = Uuid::new_v4().to_string();
+    let timestamp = now();
+    let job = ProductRefinementJob {
+        job_id: job_id.clone(),
+        project_id,
+        project_name: body.project_name.trim().to_string(),
+        project_path: normalized_path(&project_path),
+        insurance_category: category,
+        product_name,
+        parallel,
+        status: RefinementJobStatus::Queued,
+        summary: None,
+        warnings: Vec::new(),
+        error: None,
+        created_at: timestamp.clone(),
+        updated_at: timestamp,
+        started_at: None,
+        completed_at: None,
+    };
+    let path = refinement_job_file(&project_path, &job_id);
+    write_refinement_job(&path, &job)?;
+    emit_refinement_event(&state, &job);
+    drop(_store_guard);
+    tokio::spawn(run_refinement_worker(state, path));
+    Ok((StatusCode::ACCEPTED, Json(job)))
+}
+
+pub async fn get_refinement_job(
+    State(state): State<Arc<AppState>>,
+    AxumPath(job_id): AxumPath<String>,
+) -> ApiResult<Json<ProductRefinementJob>> {
+    let path = find_refinement_job_file(&state.data_root, &job_id)?;
+    let _store_guard = state.ingest_store_lock.lock().await;
+    Ok(Json(read_refinement_job(&path)?))
+}
+
 pub async fn batch_events(
     State(state): State<Arc<AppState>>,
     Query(query): Query<BatchEventsQuery>,
@@ -518,11 +800,24 @@ pub async fn batch_events(
             loop {
                 match receiver.recv().await {
                     Ok(payload) => {
-                        let matches_project = serde_json::from_str::<ProductIngestBatch>(&payload)
-                            .map(|batch| batch.project_name.eq_ignore_ascii_case(&project_name))
+                        let parsed = serde_json::from_str::<Value>(&payload).ok();
+                        let matches_project = parsed
+                            .as_ref()
+                            .and_then(|value| value.get("project_name"))
+                            .and_then(Value::as_str)
+                            .map(|name| name.eq_ignore_ascii_case(&project_name))
                             .unwrap_or(false);
                         if matches_project {
-                            let event = Event::default().event("batch").data(payload);
+                            let event_name = if parsed
+                                .as_ref()
+                                .and_then(|value| value.get("job_id"))
+                                .is_some()
+                            {
+                                "refinement"
+                            } else {
+                                "batch"
+                            };
+                            let event = Event::default().event(event_name).data(payload);
                             return Some((Ok::<Event, Infallible>(event), (receiver, project_name)));
                         }
                     }
@@ -874,10 +1169,11 @@ async fn run_batch_worker(state: Arc<AppState>, path: PathBuf) {
         .unwrap_or_else(|| Path::new("."))
         .join(RESULT_FILE);
     let _ = tokio::fs::remove_file(&result_path).await;
-    let port = std::env::var("APP_PORT").unwrap_or_else(|_| "8000".to_string());
+    let port = std::env::var("APP_PORT").unwrap_or_else(|_| "8232".to_string());
     let api_base =
         std::env::var("INGEST_API_BASE").unwrap_or_else(|_| format!("http://127.0.0.1:{port}"));
     let node = std::env::var("NODE_BINARY").unwrap_or_else(|_| "node".to_string());
+    info!(api_base = %api_base, "Worker API base resolved");
 
     info!(
         batch_id = %initial.batch_id,
@@ -885,15 +1181,25 @@ async fn run_batch_worker(state: Arc<AppState>, path: PathBuf) {
         product = %initial.product_name,
         "Starting server-side product ingestion"
     );
-    let status = Command::new(node)
+    let max_old_space_mb = std::env::var("NODE_MAX_OLD_SPACE_MB")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(8192); // default 8 GB — large PDFs with LLM calls need significant heap
+    let mut cmd = Command::new(node);
+    cmd.arg(format!("--max-old-space-size={max_old_space_mb}"))
         .arg(worker)
         .arg(&path)
         .arg(&result_path)
         .env("LLM_WIKI_API_BASE", api_base)
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .await;
+        .stderr(Stdio::inherit());
+    // Inject per-batch section parallelism. Batch-level value takes priority over
+    // the server-wide INGEST_SECTION_PARALLEL env var (which remains as fallback).
+    if let Some(sp) = initial.section_parallel {
+        cmd.env("INGEST_SECTION_PARALLEL", sp.to_string());
+        info!(batch_id = %initial.batch_id, section_parallel = sp, "Using per-batch section parallelism");
+    }
+    let status = cmd.status().await;
 
     match status {
         Ok(exit) if exit.success() => match tokio::fs::read(&result_path).await {
@@ -963,6 +1269,210 @@ async fn run_batch_worker(state: Arc<AppState>, path: PathBuf) {
                 ProductBatchStatus::Failed,
                 None,
                 Some(format!("Failed to launch ingestion worker: {err}")),
+            )
+            .await;
+        }
+    }
+}
+
+async fn finish_refinement_job(
+    state: &AppState,
+    path: &Path,
+    status: RefinementJobStatus,
+    result: Option<WorkerResult>,
+    error_message: Option<String>,
+) {
+    let _store_guard = state.ingest_store_lock.lock().await;
+    match read_refinement_job(path) {
+        Ok(mut job) => {
+            job.status = status;
+            job.updated_at = now();
+            job.completed_at = Some(job.updated_at.clone());
+            if let Some(result) = result {
+                job.summary = result.refinement;
+                job.warnings = result.warnings;
+                job.error = result.error.or(error_message);
+            } else {
+                job.error = error_message;
+            }
+            if let Err(err) = write_refinement_job(path, &job) {
+                error!(job_id = %job.job_id, error = %err.message, "Failed to persist refinement status");
+            } else {
+                emit_refinement_event(state, &job);
+            }
+        }
+        Err(err) => error!(error = %err.message, "Failed to read refinement job"),
+    }
+}
+
+async fn heartbeat_refinement_job(state: &AppState, path: &Path) {
+    let _store_guard = state.ingest_store_lock.lock().await;
+    if let Ok(mut job) = read_refinement_job(path) {
+        if job.status != RefinementJobStatus::Processing {
+            return;
+        }
+        job.updated_at = now();
+        if write_refinement_job(path, &job).is_ok() {
+            emit_refinement_event(state, &job);
+        }
+    }
+}
+
+async fn run_refinement_worker(state: Arc<AppState>, path: PathBuf) {
+    let initial = match read_refinement_job(&path) {
+        Ok(job) => job,
+        Err(err) => {
+            error!(error = %err.message, "Cannot start refinement worker");
+            return;
+        }
+    };
+    let _global_permit = match state.ingest_workers.clone().acquire_owned().await {
+        Ok(permit) => permit,
+        Err(_) => return,
+    };
+    let project_semaphore = state.project_ingest_semaphore(&initial.project_id).await;
+    let _project_permit = match project_semaphore.acquire_owned().await {
+        Ok(permit) => permit,
+        Err(_) => return,
+    };
+
+    {
+        let _store_guard = state.ingest_store_lock.lock().await;
+        if let Ok(mut job) = read_refinement_job(&path) {
+            job.status = RefinementJobStatus::Processing;
+            job.started_at = Some(now());
+            job.updated_at = job.started_at.clone().unwrap_or_else(now);
+            if let Err(err) = write_refinement_job(&path, &job) {
+                error!(job_id = %job.job_id, error = %err.message, "Failed to mark refinement processing");
+                return;
+            }
+            emit_refinement_event(&state, &job);
+        }
+    }
+
+    let worker = worker_path();
+    if !worker.is_file() {
+        finish_refinement_job(
+            &state,
+            &path,
+            RefinementJobStatus::Failed,
+            None,
+            Some(format!("Ingestion worker not found: {}", worker.display())),
+        )
+        .await;
+        return;
+    }
+    let result_path = path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(RESULT_FILE);
+    let _ = tokio::fs::remove_file(&result_path).await;
+    let port = std::env::var("APP_PORT").unwrap_or_else(|_| "8232".to_string());
+    let api_base =
+        std::env::var("INGEST_API_BASE").unwrap_or_else(|_| format!("http://127.0.0.1:{port}"));
+    let node = std::env::var("NODE_BINARY").unwrap_or_else(|_| "node".to_string());
+    info!(api_base = %api_base, "Refinement worker API base resolved");
+
+    info!(
+        job_id = %initial.job_id,
+        project = %initial.project_name,
+        category = ?initial.insurance_category,
+        product = ?initial.product_name,
+        parallel = initial.parallel,
+        "Starting server-side product refinement"
+    );
+    let mut command = Command::new(node);
+    command
+        .arg(worker)
+        .arg(&path)
+        .arg(&result_path)
+        .arg("--refine")
+        .env("LLM_WIKI_API_BASE", api_base)
+        .env("REFINE_PARALLEL", initial.parallel.to_string())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    let status = match command.spawn() {
+        Ok(mut child) => {
+            let wait = child.wait();
+            tokio::pin!(wait);
+            let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(30));
+            heartbeat.tick().await;
+            loop {
+                tokio::select! {
+                    result = &mut wait => break result,
+                    _ = heartbeat.tick() => heartbeat_refinement_job(&state, &path).await,
+                }
+            }
+        }
+        Err(err) => Err(err),
+    };
+
+    match status {
+        Ok(exit) if exit.success() => match tokio::fs::read(&result_path).await {
+            Ok(raw) => match serde_json::from_slice::<WorkerResult>(&raw) {
+                Ok(result) if result.error.is_none() => {
+                    finish_refinement_job(
+                        &state,
+                        &path,
+                        RefinementJobStatus::Completed,
+                        Some(result),
+                        None,
+                    )
+                    .await;
+                }
+                Ok(result) => {
+                    let message = result
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "Refinement worker failed".to_string());
+                    finish_refinement_job(
+                        &state,
+                        &path,
+                        RefinementJobStatus::Failed,
+                        Some(result),
+                        Some(message),
+                    )
+                    .await;
+                }
+                Err(err) => {
+                    finish_refinement_job(
+                        &state,
+                        &path,
+                        RefinementJobStatus::Failed,
+                        None,
+                        Some(format!("Invalid refinement result: {err}")),
+                    )
+                    .await;
+                }
+            },
+            Err(err) => {
+                finish_refinement_job(
+                    &state,
+                    &path,
+                    RefinementJobStatus::Failed,
+                    None,
+                    Some(format!("Refinement result missing: {err}")),
+                )
+                .await;
+            }
+        },
+        Ok(exit) => {
+            finish_refinement_job(
+                &state,
+                &path,
+                RefinementJobStatus::Failed,
+                None,
+                Some(format!("Refinement worker exited with {exit}")),
+            )
+            .await;
+        }
+        Err(err) => {
+            finish_refinement_job(
+                &state,
+                &path,
+                RefinementJobStatus::Failed,
+                None,
+                Some(format!("Failed to launch refinement worker: {err}")),
             )
             .await;
         }

@@ -1,0 +1,10 @@
+$env:APP_HOST = '127.0.0.1'
+$env:APP_PORT = '8232'
+$env:WIKI_DATA_PATH = 'D:\code\LLM Wiki\wiki-data'
+$env:STATIC_DIR = 'D:\code\LLM Wiki\dist'
+$env:INGEST_WORKER_PATH = 'D:\code\LLM Wiki\worker-dist\ingest-worker.js'
+$env:INGEST_WORKER_CONCURRENCY = '2'
+$env:INGEST_SECTION_PARALLEL = '4'
+$env:RUST_LOG = 'llm_wiki_server=info,tower_http=warn'
+# LLM from .env is fine
+& 'D:\code\LLM Wiki\server-rs\target\debug\llm-wiki-server.exe'
