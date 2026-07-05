@@ -379,8 +379,8 @@ LLM Wiki 是一个跨平台桌面应用，能将你的文档自动转化为有�
 git clone https://github.com/nashsu/llm_wiki.git
 cd llm_wiki
 npm install
-npm run tauri dev      # 开发模式
-npm run tauri build    # 生产构建
+npm run tauri:dev      # 开发模式
+npm run tauri:build    # 生产构建
 ```
 
 ### Chrome 扩展
@@ -388,7 +388,11 @@ npm run tauri build    # 生产构建
 1. 打开 `chrome://extensions`
 2. 启用「开发者模式」
 3. 点击「加载已解压的扩展程序」
-4. 选择 `extension/` 目录
+4. 选择 `extensions/browser/` 目录
+
+### 仓库目录结构
+
+应用代码按职责拆分到 `frontend/`、`backend/`、`desktop/` 和 `extensions/`。部署文件、文档、示例、维护脚本与历史临时材料分别存放在独立目录中。目录职责和构建路径详见 [仓库目录规范](docs/REPOSITORY_STRUCTURE.md)。
 
 ## 快速开始
 

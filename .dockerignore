@@ -1,34 +1,31 @@
-# Git
-.git
-.gitignore
-.gitattributes
+.git/
+.github/
+.codex/
+.vscode/
+.idea/
 
-# Tauri (not needed for web build)
-src-tauri/
-extension/
-
-# Python backend (replaced by Rust)
-server/
-
-# Dev artifacts
 node_modules/
 dist/
 worker-dist/
-server-rs/target/
-__pycache__/
-*.pyc
+backend/target/
+desktop/
+extensions/
+
+.runtime/
 wiki-data/
-mock_uploads/
 release/
-server-rs/*.log
+temp/
+tests/
+test-docs/
+
+.env
+.env.local
+*.local.ps1
+*.log
 *.tar
 *.tar.gz
 
-# Dev configs
-.env
-.env.local
-*.log
-
-# Docs
-*.md
+docs/
+examples/
+assets/
 LICENSE

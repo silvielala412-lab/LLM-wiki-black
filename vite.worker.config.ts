@@ -3,11 +3,11 @@ import { defineConfig } from "vite"
 
 export default defineConfig({
   resolve: {
-    alias: { "@": path.resolve(__dirname, "./src") },
+    alias: { "@": path.resolve(__dirname, "frontend/src") },
   },
   build: {
-    ssr: path.resolve(__dirname, "src/server-worker/ingest-worker.ts"),
-    outDir: "worker-dist",
+    ssr: path.resolve(__dirname, "backend/worker/ingest-worker.ts"),
+    outDir: path.resolve(__dirname, "worker-dist"),
     emptyOutDir: true,
     rollupOptions: {
       output: {

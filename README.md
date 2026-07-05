@@ -379,8 +379,8 @@ Download from [Releases](https://github.com/nashsu/llm_wiki/releases):
 git clone https://github.com/nashsu/llm_wiki.git
 cd llm_wiki
 npm install
-npm run tauri dev      # Development
-npm run tauri build    # Production build
+npm run tauri:dev      # Development
+npm run tauri:build    # Production build
 ```
 
 ### Chrome Extension
@@ -388,7 +388,11 @@ npm run tauri build    # Production build
 1. Open `chrome://extensions`
 2. Enable "Developer mode"
 3. Click "Load unpacked"
-4. Select the `extension/` directory
+4. Select the `extensions/browser/` directory
+
+### Repository Layout
+
+Application code is separated into `frontend/`, `backend/`, `desktop/`, and `extensions/`. Deployment files, documentation, examples, maintained scripts, and retired material live in their own top-level directories. See [Repository structure](docs/REPOSITORY_STRUCTURE.md) for ownership rules and build paths.
 
 ## Quick Start
 

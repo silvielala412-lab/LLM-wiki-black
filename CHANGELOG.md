@@ -126,7 +126,7 @@
 前端文件扫描（TypeScript 扫 md 文件）在 wiki > 100 个文件时明显卡顿。
 
 ### 技术实现
-- **`server-rs/`**：Rust Axum HTTP 服务，监听 8081 端口
+- **`backend/`**：Rust Axum HTTP 服务，监听 8081 端口
 - **向量检索**：LanceDB（1152维 embedding）
 - **BM25 Token 检索**：内存索引，CJK 双字/三字分词
 - **`/api/rag/retrieve`** 端点：向量 + BM25 基础混合检索
@@ -244,7 +244,7 @@
 
 | 文件 | 作用 |
 |------|------|
-| `src/lib/product-catalog-modules.ts` | 险种模块定义注册表（6险种 × 20-30模块） |
+| `frontend/src/lib/product-catalog-modules.ts` | 险种模块定义注册表（6险种 × 20-30模块） |
 
 ---
 
@@ -514,13 +514,13 @@ PDF → OCR 全文 → splitIntoSections(25000字/块, 500字重叠)
 
 | 文件 | 变更 |
 |------|------|
-| `src/lib/product-catalog-modules.ts` | 增加险种级模块白名单、`isModuleAllowedForCategory()`；补齐年金险字段；字段 schema 返回全字段 |
-| `src/lib/product-catalog-extractor.ts` | 生成 `product_catalog_field` 字段页；增加知识缺口/已有知识清单；精炼后重建主文件和字段页；寿险/年金险字段桥接；过滤占位文本和错误费用值 |
-| `src/lib/concept-aggregator.ts` | 概念页聚合模块实体 + 字段实体；跳过空值字段页和越域模块 |
-| `src/lib/embedding.ts` | embedding 跳过 `status: rejected` 页面和越域产品模块 |
-| `src/lib/search.ts` | 搜索跳过越域产品模块 |
-| `src/components/sources/sources-view.tsx` | 上传面板展示字段页 + 模块页数量，并说明未抽到值留空待精炼 |
-| `src/components/layout/knowledge-tree.tsx` | 产品树计数文案由“模块”改为“页” |
+| `frontend/src/lib/product-catalog-modules.ts` | 增加险种级模块白名单、`isModuleAllowedForCategory()`；补齐年金险字段；字段 schema 返回全字段 |
+| `frontend/src/lib/product-catalog-extractor.ts` | 生成 `product_catalog_field` 字段页；增加知识缺口/已有知识清单；精炼后重建主文件和字段页；寿险/年金险字段桥接；过滤占位文本和错误费用值 |
+| `frontend/src/lib/concept-aggregator.ts` | 概念页聚合模块实体 + 字段实体；跳过空值字段页和越域模块 |
+| `frontend/src/lib/embedding.ts` | embedding 跳过 `status: rejected` 页面和越域产品模块 |
+| `frontend/src/lib/search.ts` | 搜索跳过越域产品模块 |
+| `frontend/src/components/sources/sources-view.tsx` | 上传面板展示字段页 + 模块页数量，并说明未抽到值留空待精炼 |
+| `frontend/src/components/layout/knowledge-tree.tsx` | 产品树计数文案由“模块”改为“页” |
 
 **质量修复**：
 - 空字段值统一为空字符串，不再写入“未提及/未明确/证据片段中未提及”等占位文本。

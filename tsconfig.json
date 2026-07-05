@@ -1,7 +1,7 @@
 {
   "compilerOptions": {
     "baseUrl": ".",
-    "paths": { "@/*": ["./src/*"] }
+    "paths": { "@/*": ["./frontend/src/*"] }
   },
   "files": [],
   "references": [
